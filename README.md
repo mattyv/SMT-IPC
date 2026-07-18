@@ -392,6 +392,89 @@ At `gap=0` all three wait policies converge — nothing is ever idle long enough
 
 As the gap widens, BareSpin and Pause keep burning 100% of their core for a shrinking trickle of messages, while Blocking's consumer core goes idle between messages — parked-fraction climbs toward 1.0 — at the cost of the futex park/wake round trip added to each message's tail latency. Roughly: **spin/pause win on raw latency and burn a whole core doing it; Blocking frees on the order of 80%+ of that core back to the OS once the arrival rate is clearly sub-saturated, in exchange for a microsecond-scale wake tax per message.** Where exactly that crossover sits is workload- and machine-dependent — run the sweep and read the `parked-fraction` / latency columns together rather than trusting a single quoted number, since this box has no core isolation (see below).
 
+### Bursty arrival (`--bursty`)
+
+The gap sweep above models a *steady* arrival rate: every message is `gap_ns` after the last. Real feeds are often bursty instead — long quiet stretches punctuated by a run of back-to-back messages — and that shape stresses Blocking's park/wake path differently than a steady sub-saturated rate: ideally, only the *first* message of a burst should ever pay a wake cost, with the rest of the burst finding the consumer already awake and draining the queue at full speed. `./spsc_pipeline --bursty` runs a second sweep that models exactly this, alongside the default even sweep (run separately — one invocation runs one mode or the other, never both). The bursty mode is additive: it doesn't change or replace the even sweep, which stays the steady-state baseline.
+
+**The model.** A burst is `PipeCfg::BURST_LENS` (`{1, 4, 16, 64}`) messages published `PipeCfg::BURST_INTRA_GAP_NS` (`0`ns — back-to-back, as if the messages were already sitting in a socket buffer by the time the first one is observed) apart, followed by `PipeCfg::BURST_IDLE_GAP_NS` (`20000`ns — chosen to comfortably clear a futex park-entry + wake round trip, so Blocking reliably has time to actually park between bursts) before the next burst's first message. `burst_len=1` is the even-schedule anchor: a "burst" of one message *is* the even sweep, so that row is a live cross-check that the bursty codepath reduces to the already-validated one, not a separate implementation.
+
+**The closed-form schedule.** Message `n`'s deadline is computed by `sched_deadline(t_start, n, spec)`, a pure function of an `ArrivalSpec{burst_len, intra_gap_cycles, idle_gap_cycles}`:
+
+```
+pos       = n % burst_len       // this message's position within its burst
+burst_idx = n / burst_len       // which burst this message belongs to
+period    = (burst_len - 1) * intra_gap_cycles + idle_gap_cycles
+deadline  = t_start + burst_idx * period + pos * intra_gap_cycles
+```
+
+Same absolute-deadline, no-drift-accumulation discipline as the even sweep's `pace_until` schedule (see "Producer pacing" above) — a late burst never drags every subsequent burst's deadline later with it. With `burst_len=1`, `pos` is always 0 and `burst_idx == n`, so this reduces bit-for-bit to `t_start + n*gap_cycles`, the even sweep's original formula — asserted directly in `--test` as an equivalence anchor across every value in `GAP_NS`, and the even sweep's producer loop is now implemented by calling `sched_deadline` rather than duplicating the arithmetic.
+
+**Cold/warm attribution, consumer-observed.** Every sampled message's latency (still `t_done - pub_tsc`, no new timestamp — `pub_tsc` is stamped after `pace_until` returns, so an idle gap before publish is never inside the sample) is tagged cold or warm, and the tagging is *deliberately asymmetric* between wait policies:
+
+- **BareSpin/Pause**: cold iff the message's first `front()` poll found the queue empty (`had_to_wait`). There's no cheaper/more-expensive path inside a spin loop — every extra iteration costs the same tight re-poll — so `had_to_wait` is the only signal these policies need.
+- **Blocking**: cold iff `wait_blocking_impl` actually invoked `wait_fn` for this message — i.e. a real syscall entry was paid, whether that call resolved via a genuine park+wake or returned `EAGAIN` immediately (the value changed before the kernel actually parked the thread). `had_to_wait` alone is NOT enough: if the announce/re-check race closes before any syscall (the re-check's `front()` finds the message), the message is WARM even though `had_to_wait` was true. This is the same distinction "The futex conditional-wake protocol" section above draws between the outer check and the re-check — cold/warm attribution just makes it directly observable per message instead of only in aggregate wake-syscall counts.
+
+The EAGAIN sub-case is split out from a genuine park+wake via a new counter, `g_futex_eagain` (bumped in `real_futex_wait` on `errno==EAGAIN`, mirroring how `g_futex_backstop_fires` already tracks `ETIMEDOUT`) — printed per cell (`eagain N`) alongside the existing wake/backstop counts, diffed the same way around each pass.
+
+**Boundary semantics via the cross-tab.** Each cell also prints a 4-way cross-tab — cold/warm crossed with burst-head/non-head (`is_burst_head(seq, burst_len) = seq % burst_len == 0`) — as `xtab c/h=.. c/nh=.. w/h=.. w/nh=..`. In the even sweep (`burst_len=1`) every message is a head by definition, so `c/nh` and `w/nh` are always 0 there. In the bursty sweep this is what makes a mid-burst re-park visible: a `cold ∧ nonhead` count above the EAGAIN-driven noise floor means the consumer parked, was woken, and then had to park *again* before the next message in the same burst arrived — the burst wasn't fully absorbed by a single wake.
+
+#### Prediction (written before running the sweep)
+
+As `BURST_LEN` grows from 1 to 64, holding `BURST_IDLE_GAP_NS`/`BURST_INTRA_GAP_NS` fixed:
+
+- **Blocking's wakes-per-burst** (`futex-wake-syscalls` diffed per cell, divided by `SAMPLE_MSGS/BURST_LEN`) should fall toward **≈1** — one park+wake amortized over the whole burst, instead of one per message (`BURST_LEN` wakes) at the low end.
+- **Blocking's mean/p50 latency** should drift toward **Pause's** latency at the same `BURST_LEN`, since only the burst's first message pays the park/wake tax and the rest are drained at spin-loop speed once the consumer is awake.
+- **Cold p50** should stay in the microsecond range across all `BURST_LEN` values (it's dominated by the syscall round trip, not by which message in the burst triggered it) while **warm p50** should stay near the nanosecond-scale processing floor (a warm message paid no syscall at all).
+- **BareSpin/Pause** should be largely burst-insensitive on cold p50 specifically — a spin loop has no "amortizable" expensive path, so bursting messages together shouldn't change what a cold (had-to-wait) sample costs.
+- **The crossover** this predicts: Blocking becomes competitive with spin/pause once `wake_cost / BURST_LEN` drops below the latency budget the workload can tolerate — i.e. large bursts are exactly the regime where Blocking's fixed per-wake tax gets amortized away, even though it's a poor trade at `BURST_LEN=1` (the even sweep already shows this: Blocking's `gap=20000` row pays a full wake tax on essentially every message).
+
+#### Measured (this box, one `--bursty` run, no core isolation)
+
+Blocking, `wakes-per-burst` (target: → 1 as `BURST_LEN` grows) and p50 latency (ns) alongside Pause's p50 at the same `BURST_LEN`, for one representative tier:
+
+| tier | BURST_LEN | Blocking wakes-per-burst | Blocking p50 (ns) | Pause p50 (ns) | Blocking/Pause ratio |
+|---|---:|---:|---:|---:|---:|
+| SMT sibling | 1 (= gap=20000 row) | — | 1322.5 | 150.3 | 8.8× |
+| SMT sibling | 4  | 0.989 | 1352.5 | 320.6 | 4.2× |
+| SMT sibling | 16 | 0.999 | 2113.9 | 841.6 | 2.5× |
+| SMT sibling | 64 | 0.995 | 5289.8 | 3085.7 | 1.7× |
+| cross CCX | 1 (= gap=20000 row) | — | 3897.2 | 891.7 | 4.4× |
+| cross CCX | 4  | 0.999 | 2504.6 | 711.3 | 3.5× |
+| cross CCX | 16 | 1.003 | 2314.3 | 571.1 | 4.1× |
+| cross CCX | 64 | 0.971 | 3266.0 | 450.8 | 7.2× |
+
+Cold/warm split, Blocking, same run (ns):
+
+| tier | BURST_LEN | cold p50 | warm p50 | eagain | xtab (c/h, c/nh, w/h, w/nh) |
+|---|---:|---:|---:|---:|---|
+| SMT sibling | 4  | 1322.4 | 1372.5 | 3 | 24707, 25, 293, 74975 |
+| SMT sibling | 16 | 1342.5 | 2154.0 | 0 | 6240, 2, 10, 93748 |
+| SMT sibling | 64 | 1332.5 | 5339.9 | 0 | 1555, 0, 7, 98438 |
+| cross CCX | 4  | 3917.2 | 2414.5 | 2 | 24958, 7, 42, 74993 |
+| cross CCX | 16 | 2554.7 | 2294.2 | 1 | 6220, 27, 30, 93723 |
+| cross CCX | 64 | 2174.0 | 3286.1 | 1 | 1508, 8, 54, 98430 |
+
+`futex-backstop-fires` was 0 in every cell across the full `--bursty` run (all tiers, all policies, all `BURST_LEN`) — no missed wake.
+
+**Does the prediction hold?** The mechanism half holds cleanly; one prediction (warm ≈ ns) turned out to be ill-posed rather than wrong-in-fact. Details below, honestly — this box has no core isolation, so the tail-latency confounds (C6) are visibly present, but the headline amortization result does not depend on them.
+
+- **Wakes-per-burst → 1: yes, essentially perfectly.** Every Blocking cell sits at **0.97–1.00** — one park+wake per burst, no matter the burst length, versus the naive `BURST_LEN` wakes/burst a per-message park would cost. The amortization is not just "in the ballpark"; it is as clean as the mechanism allows. (An earlier draft reported ≈1.2 here — that was a metric bug: the wake tally was diffed over the whole pass, including the 20k warm-up messages, while the burst count divided only the 100k sample window, inflating the ratio by exactly 120000/100000 = 1.2. The counters are now snapshotted at the warm→sample boundary so every per-cell instrument covers the same window; see the `wakes_per_burst` helper and its `--test` case.)
+- **Blocking drifting toward Pause: yes, clearly.** The Blocking/Pause p50 ratio falls from 8.8× (`BURST_LEN=1`) to 1.7× (`BURST_LEN=64`) on the SMT-sibling tier — the predicted direction and a large effect. The cross-CCX tier is noisier (7.2× at `BURST_LEN=64`) — OS scheduling noise on that pair given no `isolcpus`/IRQ steering (see confound C6) — but the sibling tier, where the two threads share a core and jitter is lowest, shows the crossover cleanly.
+- **Cold p50 stays ~µs: yes.** Every cold p50 above is in the 1.3–3.9µs range, consistent with "dominated by the syscall round trip" regardless of `BURST_LEN` or tier.
+- **Warm p50 stays ~ns: no — and the reason is not noise, it is queueing.** Warm p50 is also in the microsecond range and, for Pause, *grows monotonically with `BURST_LEN`* (SMT-sibling Pause warm p50: 340.6 → 891.6 → 3135.8 ns at `BURST_LEN` 4 → 16 → 64). That is deterministic intra-burst **sojourn time**, not a wake cost and not scheduler jitter: with `BURST_INTRA_GAP_NS=0` a whole burst is published in one instant, so the *k*-th message of a burst sits in the queue while the consumer drains the *k*−1 ahead of it, and its end-to-end latency (`t_done − pub_tsc`) is ≈ *k* × per-message drain time (~100 ns/position — the numbers above are roughly linear in median burst position). The cross-tab proves the warm bucket *is* these mid-burst messages: at `BURST_LEN=64`, `w/nh=98438` of a warm count of 98445 — essentially 100% non-head. So "warm ≈ nanoseconds" was an **ill-posed prediction** under `t_done − pub_tsc`: for a spinner, "warm" just means the message was already queued when the consumer looked (the consumer was *behind*), so warm latency embeds sojourn/lateness by construction — it is not a "the wake was free" signal, and an isolated box would *not* remove it (it is queueing, not jitter). Measuring "the wake cost nothing" needs a consumer-side *noticed-at* timestamp — see the wake-only-timestamp item under Future work. The place the split **does** measure wake avoidance is Blocking at *short* gaps in the even sweep (`gap=250/1000`), where warm p50 lands *below* cold p50 because the re-check-closed-race path genuinely skips the syscall.
+- **BareSpin/Pause burst-insensitive on cold p50: yes.** SMT-sibling Pause cold p50 is 160.3 ns flat across `BURST_LEN=4/16/64` — a spin loop has no amortizable expensive path, so bunching messages doesn't change what a cold sample costs.
+
+Net: the amortization mechanism is real and now cleanly measured — Blocking pays essentially one wake per burst (wakes-per-burst ≈ 1.0), and its latency closes on Pause's as bursts lengthen. The warm-latency half of the prediction was simply ill-posed: warm p50 measures intra-burst queue sojourn, not wake cost, so it was never going to sit at nanoseconds under an end-to-end metric — that is a framing correction, not a confound to isolate away.
+
+**Confounds** (also called out as comments at the relevant code/README sites):
+
+- **C1 — warm latency grows with `BURST_LEN`, at the median as well as the tail.** This is intra-burst sojourn time (Little's law: a message's latency is dominated by how many already-published siblings sit ahead of it in the queue), the same phenomenon the even sweep's `gap=0` note describes, not wake cost. It dominates warm **p50**, not just p99, because with `BURST_INTRA_GAP_NS=0` the *median* warm sample is itself a mid-burst message (the cross-tab shows the warm bucket is ~100% non-head). This is deterministic queueing and does **not** shrink on an isolated box — it is a property of the arrival pattern, not of scheduler noise.
+- **C2 — EAGAIN contamination is bounded, not eliminated.** `g_futex_eagain` can be nonzero (see the table: a handful of events per cell, e.g. 3 at SMT-sibling `BURST_LEN=4`), meaning some "cold" Blocking samples paid a syscall that returned immediately rather than a full park+wake. Since the metric-window fix (MUST-FIX 1), `g_futex_eagain` is snapshotted at the warm→sample boundary just like the wake and backstop counts, so it now covers the *same* sample-only window as the cold/warm sample counts — the eagain figure and the cold count are directly comparable, and the contamination is a few parts in ten thousand.
+- **C3 — mid-burst re-parks are real but negligible.** A nonzero `cold ∧ nonhead` count (e.g. SMT-sibling `BURST_LEN=4`: `c/nh=25`) means the consumer parked, woke, and had to park *again* before the burst finished draining — the burst wasn't fully absorbed by a single wake. These are rare (tens of events out of ~25k bursts, ≈0.001 extra wakes/burst), which is why wakes-per-burst lands at ≈1.0 rather than measurably above it; they are reported so the effect is visible, not because it moves the headline number.
+- **C4 — `intra_gap=0` late-publish semantics.** With `BURST_INTRA_GAP_NS=0`, every non-head message's deadline equals its burst's start time (`sched_deadline`'s `pos * intra_gap_cycles` term is 0 for every `pos`), so `pace_until` finds it already "late" by construction as soon as the burst head has published — every non-head message reads as late-publish. Expect `late-publish ≈ SAMPLE_MSGS*(BURST_LEN-1)/BURST_LEN` (visible in the measured runs: e.g. `BURST_LEN=4` → ≈75000/100000), the same "saturated, not a bug" reading as the even sweep's `gap=0` note, just applied per-burst — `print_pass` prints this explanation on every bursty cell so it doesn't read as a pacing failure.
+- **C5 — `WARM_MSGS=20000` isn't a multiple of every `BURST_LEN`.** `20000/64 = 312.5`, so the sampled window can open mid-burst for the largest `BURST_LEN`. Per-message cold/warm/head tagging is unbiased regardless of where the window boundary falls (each message is tagged on its own merits), so this is documented rather than special-cased.
+- **C6 — cold p50 embeds real scheduler-wake latency on an unisolated box.** Without `isolcpus`/`nohz_full`/IRQ affinity steering, the OS scheduler can land other work on the producer's or consumer's CPU mid-run, and a park+wake's actual latency includes however long the scheduler takes to run the woken thread — compare cells *within this run* only, not against a different run or machine (same caveat as the even sweep — see "No-core-isolation caveat" below).
+
 ### The measured mwaitx detour
 
 An earlier phase of this project measured `mwaitx`/`monitorx` (the AMD hardware wait-on-address instructions, `WAITPKG`-adjacent) as a candidate for Blocking's park mechanism, on the theory that a hardware wait might beat a futex round trip for this sub-microsecond handoff. It didn't: on this Zen 5 box, `mwaitx` wake latency measured **~260ns p50**, against **~60ns for a plain spin** reacting to the same store — over 4× slower than just spinning — and imposed a **~350–480ns timeout floor** even in the best case. Both numbers rule it out for a handoff this latency-sensitive; a futex park/wake round trip, despite going through the kernel, is not meaningfully worse and is far simpler to reason about and to actually implement portably. `mwaitx`/`monitorx`/`CPUID`/`WAITPKG` accordingly do not appear anywhere in `spsc_pipeline.cpp` — this was evaluated and dropped, not overlooked.
@@ -399,7 +482,8 @@ An earlier phase of this project measured `mwaitx`/`monitorx` (the AMD hardware 
 ### Future work
 
 - **Spin-then-park hybrid.** Blocking here is a pure park-on-first-empty policy. Spinning briefly before falling back to a futex park (rather than parking on the very first empty poll) is very likely a better latency/utilization trade at the low end of the gap sweep — it would absorb short empty windows without paying the wake tax, while still freeing the core once the empty window looks sustained. Not implemented here, to keep this pass's three wait policies simple, orthogonal, and easy to reason about in isolation.
-- **Bursty / intermittent arrival.** The gap sweep models a *steady* arrival rate at each row. Real feeds are often bursty — long quiet stretches punctuated by bursts — which stresses the park/wake path differently than a steady sub-saturated rate (every burst potentially pays a wake cost on its first message, then runs saturated until the burst drains). Not modelled here.
+- **Poisson inter-arrival.** Both the even sweep and `--bursty` model deterministic schedules (a fixed gap, or a fixed burst shape at a fixed idle gap). A Poisson process — exponentially distributed inter-arrival times — would stress the park/wake path with a more realistic mix of very-short and very-long gaps at the same mean rate, which a fixed-gap or fixed-burst schedule structurally cannot produce. Not modelled here.
+- **Wake-only timestamp.** The cold/warm split added in this pass reuses the existing end-to-end `t_done - pub_tsc` latency sample for both buckets — it does not add a new timestamp isolating just the park→wake→re-check span from the rest of the message's processing/queueing time. A dedicated wake-latency timestamp (stamped right after `wait_fn` returns, before `check_seq`/`process_msg`) would let cold-sample latency be decomposed into "syscall/wake cost" vs. "everything else" instead of reading it as one combined number — useful for separating C1 (sojourn time) from genuine wake cost more precisely than the current per-cell aggregate allows.
 
 ### No-core-isolation caveat
 

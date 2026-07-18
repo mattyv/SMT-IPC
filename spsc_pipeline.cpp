@@ -144,9 +144,10 @@ using Queue = rigtorp::SPSCQueue<struct Msg>;
 // one message never causes coherence traffic on its neighbour's line.
 // ---------------------------------------------------------------------------
 struct alignas(64) Msg {
-  uint64_t seq;      // strictly increasing per-message sequence number
-  uint64_t pub_tsc;  // rdtsc_now() at the producer's FIRST try_emplace attempt
-  uint64_t payload[6]; // deterministic pseudo-random filler, see build_source_ring()
+  uint64_t seq;     // strictly increasing per-message sequence number
+  uint64_t pub_tsc; // rdtsc_now() at the producer's FIRST try_emplace attempt
+  uint64_t
+      payload[6]; // deterministic pseudo-random filler, see build_source_ring()
 };
 static_assert(sizeof(Msg) == 64, "Msg must occupy exactly one cache line");
 static_assert(alignof(Msg) == 64, "Msg must be 64B-aligned");
@@ -220,6 +221,31 @@ struct PipeCfg {
   // of messages and Blocking's parked-time fraction should approach 1.
   static constexpr uint64_t GAP_NS[] = {0, 250, 1000, 5000, 20000};
 
+  // --bursty sweep: burst lengths tested at a fixed idle/intra gap (below).
+  // 1 is the even-schedule anchor (see sched_deadline's equivalence case,
+  // asserted in run_self_tests) — a burst of length 1 IS the even sweep, so
+  // this row is a live cross-check that the bursty codepath reduces to the
+  // already-validated one. 64 is chosen to stay comfortably under
+  // QUEUE_CAPACITY (4096) so a single burst never risks backpressure purely
+  // from its own size, independent of how fast the consumer drains it.
+  static constexpr uint64_t BURST_LENS[] = {1, 4, 16, 64};
+
+  // --bursty sweep: gap between the last message of one burst and the first
+  // message of the next, nanoseconds. Deliberately >> a futex park entry +
+  // wake round trip (order-1us on this box, see the README's futex protocol
+  // section) so Blocking reliably has time to actually park between bursts
+  // rather than racing its own wake — the whole point of the bursty axis is
+  // to observe a clean park-drain-park cycle, not a partially-amortized one.
+  static constexpr uint64_t BURST_IDLE_GAP_NS = 20000;
+
+  // --bursty sweep: gap between messages WITHIN a burst, nanoseconds. 0 =
+  // back-to-back — the messages of one burst are modeled as already sitting
+  // in a socket/ring buffer by the time the first one is observed, so there
+  // is no pacing wait between them (this is also what makes every non-head
+  // message's deadline equal the burst's start time — see the late-publish
+  // note on the intra_gap=0 semantics in print_pass/README).
+  static constexpr uint64_t BURST_INTRA_GAP_NS = 0;
+
   // Two-phase pace_until() switches from _mm_pause to a bare spin once
   // within this many TSC cycles of the deadline. 128 cycles (~40-65ns on a
   // 2-3GHz TSC) approximates one PAUSE's ~64-cycle park window (see
@@ -276,6 +302,16 @@ struct alignas(128) ParkWord {
 inline std::atomic<uint64_t> g_futex_wake_syscalls{0};
 inline std::atomic<uint64_t> g_futex_backstop_fires{0};
 
+// Count of FUTEX_WAIT calls that returned EAGAIN (the kernel's value check
+// found the word already changed and returned immediately without ever
+// parking). This is a genuinely "cold" outcome for latency purposes — the
+// consumer still paid for a syscall entry/exit — but it is NOT a park+wake
+// round trip, so it's tracked separately from a backstop fire (a real park
+// that then times out) and from a normal wake. Mirrors g_futex_backstop_fires:
+// reset per pass by the caller diffing before/after snapshots (see
+// run_policy_sweep).
+inline std::atomic<uint64_t> g_futex_eagain{0};
+
 // ---------------------------------------------------------------------------
 // Raw futex(2) syscall wrapper. Using SYS_futex directly (not
 // std::condition_variable) is the point of this experiment: we want to
@@ -317,6 +353,8 @@ static void real_futex_wait(std::atomic<uint32_t> *addr, uint32_t expected,
   long rc = sys_futex(addr, FUTEX_WAIT_PRIVATE, expected, timeout);
   if (rc == -1 && errno == ETIMEDOUT)
     g_futex_backstop_fires.fetch_add(1, std::memory_order_relaxed);
+  else if (rc == -1 && errno == EAGAIN)
+    g_futex_eagain.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -431,20 +469,37 @@ static inline bool publish_and_maybe_wake(Q &q, const T &msg, ParkWord &pw,
 //     }                                  // we must not sleep on it
 //     wait_fn(&parked, 1, backstop);     // otherwise, actually park
 //   }
+//
+// `parked_out` (WP-A): set to true immediately before the FIRST call to
+// wait_fn for this invocation — i.e. the point where a real syscall entry is
+// actually paid, whether that call ultimately parks-and-wakes or returns
+// EAGAIN (see real_futex_wait's g_futex_eagain counter for that split). It is
+// NOT the same as "the message was found on a later poll": if the re-check
+// closes the race (front() sees the message on the second poll), wait_fn is
+// never called and parked_out stays false — that path is cheap (no syscall)
+// even though the outer had_to_wait signal was true. Left false by default so
+// callers that don't care (the existing --blocking-probe helpers) can ignore
+// it.
 // ---------------------------------------------------------------------------
 template <typename FrontFn>
-static inline auto wait_blocking_impl(FrontFn front, ParkWord &pw,
-                                      WaitFn wait_fn,
-                                      const struct timespec &backstop)
-    -> decltype(front()) {
+static inline auto
+wait_blocking_impl(FrontFn front, ParkWord &pw, WaitFn wait_fn,
+                   const struct timespec &backstop,
+                   bool *parked_out = nullptr) -> decltype(front()) {
   decltype(front()) m;
   while (!(m = front())) {
-    pw.v.store(1, std::memory_order_relaxed); // announce — see fence comment above
-    std::atomic_thread_fence(std::memory_order_seq_cst); // REQUIRED — Dekker pair
+    pw.v.store(1,
+               std::memory_order_relaxed); // announce — see fence comment above
+    std::atomic_thread_fence(
+        std::memory_order_seq_cst); // REQUIRED — Dekker pair
     if ((m = front())) {
-      pw.v.store(0, std::memory_order_relaxed); // race closed, undo the announce
+      pw.v.store(0,
+                 std::memory_order_relaxed); // race closed, undo the announce
       break;
     }
+    if (parked_out)
+      *parked_out =
+          true; // about to pay for a syscall entry — see comment above
     wait_fn(&pw.v, 1, &backstop);
   }
   return m;
@@ -454,13 +509,17 @@ static inline auto wait_blocking_impl(FrontFn front, ParkWord &pw,
 // synchronization needed: producer writes its own fields, consumer writes
 // its own, and they're only read after both threads are joined.
 struct PassMetrics {
-  std::vector<uint32_t> latency_cycles;      // t_done - pub_tsc, per sampled message
-  std::vector<uint32_t> inter_arrival_cycles; // pub_tsc[n] - pub_tsc[n-1], sampled window only
-  uint64_t waited_count = 0;      // sampled messages whose first front() poll was null
-  uint64_t sampled_count = 0;     // messages actually counted (n >= WARM_MSGS)
-  uint64_t backpressure_count = 0; // try_emplace failures (retried, not re-stamped)
-  uint64_t late_publish_count = 0; // deadline already passed when we reached publish
-  uint64_t parked_cycles = 0;      // TSC cycles spent inside wait_fn (Blocking only)
+  std::vector<uint32_t> latency_cycles; // t_done - pub_tsc, per sampled message
+  std::vector<uint32_t>
+      inter_arrival_cycles; // pub_tsc[n] - pub_tsc[n-1], sampled window only
+  uint64_t waited_count =
+      0; // sampled messages whose first front() poll was null
+  uint64_t sampled_count = 0; // messages actually counted (n >= WARM_MSGS)
+  uint64_t backpressure_count =
+      0; // try_emplace failures (retried, not re-stamped)
+  uint64_t late_publish_count =
+      0;                      // deadline already passed when we reached publish
+  uint64_t parked_cycles = 0; // TSC cycles spent inside wait_fn (Blocking only)
 
   // Consumer-side TSC stamps bracketing just the sampled (post-WARM_MSGS)
   // window, taken at the top of the n==WARM_MSGS iteration and at the
@@ -471,19 +530,54 @@ struct PassMetrics {
   // instead of approaching 1.0.
   uint64_t sampled_wall_start_tsc = 0;
   uint64_t sampled_wall_end_tsc = 0;
+
+  // Global futex counter snapshots taken at the SAME WARM->SAMPLE boundary
+  // as sampled_wall_start_tsc above (n == WARM_MSGS, consumer side). The
+  // caller (run_policy_sweep) diffs its own post-pass reading of the
+  // corresponding g_futex_* counter against these instead of a pre-run_pass
+  // snapshot, so every per-pass instrument -- wake/eagain/backstop counts,
+  // parked_fraction, and the cold/warm counts -- is measured over the exact
+  // same sample-only window. Before this, wake/eagain/backstop were diffed
+  // over the WHOLE pass (WARM_MSGS+SAMPLE_MSGS) while n_bursts and the
+  // cold/warm counts were sample-only, inflating wakes-per-burst by exactly
+  // (WARM_MSGS+SAMPLE_MSGS)/SAMPLE_MSGS -- see the README's MUST-FIX 1 note.
+  uint64_t wake_syscalls_at_sample_start = 0;
+  uint64_t backstop_fires_at_sample_start = 0;
+  uint64_t eagain_at_sample_start = 0;
+
+  // WP-A: cold/warm latency split, consumer-observed — see cold_tag's
+  // comment for the exact (and deliberately asymmetric) definition per wait
+  // policy. `latency_cycles` above is left untouched (same values, same
+  // order) so the existing even-sweep output/consumers stay comparable;
+  // these are an additional, parallel breakdown of the same samples.
+  std::vector<uint32_t> cold_latency_cycles;
+  std::vector<uint32_t> warm_latency_cycles;
+
+  // 4-way cross-tab: cold/warm crossed with burst-head/non-head (WP-B/C;
+  // burst_len=1 in the even sweep makes every message a head, so
+  // cold_nonhead/warm_nonhead are always 0 there — see is_burst_head).
+  uint64_t cold_head = 0;
+  uint64_t cold_nonhead = 0;
+  uint64_t warm_head = 0;
+  uint64_t warm_nonhead = 0;
 };
 
 // wait_for_message<P>: the consumer's per-message wait, specialized per
 // WaitPolicy at compile time (see the WaitPolicy comment above for why).
-// `count_waited` receives true/false for whether this call's queue was
-// initially empty, so the caller can fold it into PassMetrics only during
-// the sampled window (warm-up messages don't pollute waited-fraction).
+// `had_to_wait` receives true/false for whether this call's FIRST front()
+// poll found the queue empty, so the caller can fold it into PassMetrics
+// only during the sampled window (warm-up messages don't pollute
+// waited-fraction). `parked` (WP-A) is Blocking-specific: set true iff
+// wait_blocking_impl actually invoked wait_fn (a real syscall entry) for
+// this message; BareSpin/Pause never touch it, since a spin policy's "cold"
+// classification only ever needs had_to_wait (see cold_tag below).
 template <WaitPolicy P>
-static inline Msg *wait_for_message(Queue &q, ParkWord &pw, bool &had_to_wait);
+static inline Msg *wait_for_message(Queue &q, ParkWord &pw, bool &had_to_wait,
+                                    bool &parked);
 
 template <>
 inline Msg *wait_for_message<WaitPolicy::BareSpin>(Queue &q, ParkWord &,
-                                                    bool &had_to_wait) {
+                                                   bool &had_to_wait, bool &) {
   Msg *m = q.front();
   had_to_wait = (m == nullptr);
   while (!m) {
@@ -495,7 +589,7 @@ inline Msg *wait_for_message<WaitPolicy::BareSpin>(Queue &q, ParkWord &,
 
 template <>
 inline Msg *wait_for_message<WaitPolicy::Pause>(Queue &q, ParkWord &,
-                                                bool &had_to_wait) {
+                                                bool &had_to_wait, bool &) {
   Msg *m = q.front();
   had_to_wait = (m == nullptr);
   while (!m) {
@@ -507,14 +601,48 @@ inline Msg *wait_for_message<WaitPolicy::Pause>(Queue &q, ParkWord &,
 
 template <>
 inline Msg *wait_for_message<WaitPolicy::Blocking>(Queue &q, ParkWord &pw,
-                                                    bool &had_to_wait) {
+                                                   bool &had_to_wait,
+                                                   bool &parked) {
   had_to_wait = (q.front() == nullptr);
+  parked = false;
   struct timespec backstop {};
   backstop.tv_sec = PipeCfg::FUTEX_BACKSTOP_TIMEOUT_MS / 1000;
-  backstop.tv_nsec =
-      (PipeCfg::FUTEX_BACKSTOP_TIMEOUT_MS % 1000) * 1000000L;
+  backstop.tv_nsec = (PipeCfg::FUTEX_BACKSTOP_TIMEOUT_MS % 1000) * 1000000L;
   return wait_blocking_impl([&] { return q.front(); }, pw, real_futex_wait,
-                            backstop);
+                            backstop, &parked);
+}
+
+// ---------------------------------------------------------------------------
+// cold_tag (WP-A): pure classifier for whether a sampled message's latency
+// belongs in the "cold" or "warm" bucket, consumer-observed. Deliberately
+// asymmetric between spin policies and Blocking — see the WP-A plan this
+// implements:
+//   * BareSpin/Pause: cold iff the first front() poll returned null
+//     (had_to_wait). There is no cheaper/more-expensive path inside a spin
+//     loop — every extra iteration costs the same tight re-poll — so
+//     had_to_wait is the only signal available or needed.
+//   * Blocking: cold iff wait_blocking_impl actually invoked wait_fn for
+//     this message (`parked`), NOT merely had_to_wait. had_to_wait alone
+//     would misclassify the "re-check closes the race" case as cold even
+//     though no syscall was paid there — parked is the precise signal for
+//     "this message's tail paid for a syscall entry" (EAGAIN or a genuine
+//     park+wake, both cold; see real_futex_wait's g_futex_eagain split for
+//     which).
+// A message can have had_to_wait==true (queue observed empty) yet still be
+// WARM under Blocking, if the re-check closed the race before any syscall.
+// ---------------------------------------------------------------------------
+static inline bool cold_tag(bool had_to_wait, bool parked, bool is_blocking) {
+  if (is_blocking)
+    return parked;
+  return had_to_wait;
+}
+
+// is_burst_head (WP-B/WP-A): pure predicate — is sequence number `seq` the
+// first message of its burst, given a burst length `burst_len`? burst_len=1
+// makes every message a "head" (the even-sweep equivalence case: there are
+// no non-head messages when every burst is exactly one message long).
+static inline bool is_burst_head(uint64_t seq, uint64_t burst_len) {
+  return (seq % burst_len) == 0;
 }
 
 // ===========================================================================
@@ -536,7 +664,8 @@ static std::vector<Msg> build_source_ring() {
     m.seq = 0;     // overwritten per-publish
     m.pub_tsc = 0; // overwritten per-publish
     for (auto &p : m.payload) {
-      state = state * PipeCfg::MIX_CONST + 1; // simple, deterministic LCG-ish mix
+      state =
+          state * PipeCfg::MIX_CONST + 1; // simple, deterministic LCG-ish mix
       p = state;
     }
   }
@@ -584,6 +713,37 @@ static inline uint64_t ns_to_cycles(uint64_t ns) {
   return uint64_t(double(ns) * g_tsc_ghz);
 }
 
+// ---------------------------------------------------------------------------
+// ArrivalSpec / sched_deadline (WP-B): a pure closed-form generalization of
+// the even sweep's `t_start + n*gap_cycles` schedule to bursty arrival. A
+// burst is `burst_len` messages published `intra_gap_cycles` apart, followed
+// by `idle_gap_cycles` before the next burst's first message. burst_len=1
+// collapses this back to the plain even schedule (see the equivalence
+// anchor in run_self_tests): with only one message per "burst", intra_gap
+// never applies and every message is idle_gap_cycles after the last, i.e.
+// bit-identical to the pre-WP-B `t_start + n*gap_cycles` line.
+// ---------------------------------------------------------------------------
+struct ArrivalSpec {
+  uint64_t burst_len;        // messages per burst; 1 = even-schedule anchor
+  uint64_t intra_gap_cycles; // gap between messages WITHIN a burst
+  uint64_t idle_gap_cycles;  // gap between the last message of one burst and
+                             // the first message of the next
+};
+
+// Deadline for message n, given the schedule starts at t_start. Absolute
+// (not accumulated from the previous message's actual publish time) for the
+// same no-drift-accumulation reason as the even sweep's schedule: a late
+// burst never drags every subsequent burst's deadline later with it.
+static inline uint64_t sched_deadline(uint64_t t_start, uint64_t n,
+                                      const ArrivalSpec &s) {
+  uint64_t pos = n % s.burst_len; // this message's position within its burst
+  uint64_t burst_idx = n / s.burst_len; // which burst this message belongs to
+  // One full burst's wall-clock span: (burst_len-1) intra-gaps to publish
+  // the burst's own messages, plus the idle gap before the NEXT burst starts.
+  uint64_t period = (s.burst_len - 1) * s.intra_gap_cycles + s.idle_gap_cycles;
+  return t_start + burst_idx * period + pos * s.intra_gap_cycles;
+}
+
 // Two-phase busy-wait to an absolute TSC deadline. NEVER sleeps (a sleep's
 // wakeup granularity would swamp the sub-microsecond gaps this sweep cares
 // about). Phase 1 uses _mm_pause while comfortably far from the deadline (so
@@ -620,9 +780,9 @@ static inline bool pace_until(uint64_t deadline_tsc) {
 // the anchor cpu0, and the PRODUCER runs on the tier partner.
 // ===========================================================================
 struct Topology {
-  int base = -1;    // consumer's cpu (anchor)
-  int sibling = -1; // producer cpu for the SMT-sibling tier, or -1
-  int same_l3 = -1; // producer cpu for the same-CCX tier, or -1
+  int base = -1;     // consumer's cpu (anchor)
+  int sibling = -1;  // producer cpu for the SMT-sibling tier, or -1
+  int same_l3 = -1;  // producer cpu for the same-CCX tier, or -1
   int other_l3 = -1; // producer cpu for the cross-CCX tier, or -1
 };
 
@@ -678,18 +838,30 @@ static inline bool should_skip(WaitPolicy policy, bool is_sibling_tier) {
 // One pass: WARM_MSGS + SAMPLE_MSGS messages, one producer/consumer thread
 // pair, one (tier, policy, gap) cell of the sweep.
 // ===========================================================================
+// `burst_len`/`intra_gap_ns`/`idle_gap_ns` (WP-A/B/C): the producer's arrival
+// schedule, in ns (converted to an ArrivalSpec in cycles below), plus the
+// value that drives the consumer's cold/warm cross-tab head vs. non-head
+// split via is_burst_head. Defaults reproduce the pre-WP-B even sweep
+// exactly: burst_len=1 makes every message a head and intra_gap_ns is never
+// actually used by sched_deadline in that case (see its comment), so only
+// idle_gap_ns matters — callers pass the same `gap_ns` for both intra and
+// idle to get the historical single-gap sweep. WP-C's bursty sweep passes a
+// real burst_len with intra_gap_ns=PipeCfg::BURST_INTRA_GAP_NS and
+// idle_gap_ns=PipeCfg::BURST_IDLE_GAP_NS instead.
 template <WaitPolicy P>
 static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
-                            uint64_t gap_ns,
-                            const std::vector<Msg> &ring) {
+                            uint64_t intra_gap_ns, uint64_t idle_gap_ns,
+                            const std::vector<Msg> &ring,
+                            uint64_t burst_len = 1) {
   Queue q(PipeCfg::QUEUE_CAPACITY);
   ParkWord pw;
   const uint64_t total_msgs = PipeCfg::WARM_MSGS + PipeCfg::SAMPLE_MSGS;
-  const uint64_t gap_cycles = ns_to_cycles(gap_ns);
 
   PassMetrics metrics;
   metrics.latency_cycles.reserve(PipeCfg::SAMPLE_MSGS);
   metrics.inter_arrival_cycles.reserve(PipeCfg::SAMPLE_MSGS);
+  metrics.cold_latency_cycles.reserve(PipeCfg::SAMPLE_MSGS);
+  metrics.warm_latency_cycles.reserve(PipeCfg::SAMPLE_MSGS);
 
   std::atomic<bool> consumer_ready{false};
 
@@ -705,14 +877,26 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
       // side itself, rather than reusing the caller's wall-clock straddling
       // thread spin-up + WARM_MSGS — see parked_fraction's denominator
       // comment on PassMetrics below for why that distinction matters.
-      if (n == PipeCfg::WARM_MSGS)
+      if (n == PipeCfg::WARM_MSGS) {
         metrics.sampled_wall_start_tsc = rdtsc_now();
+        // See PassMetrics's wake_syscalls_at_sample_start comment: taken at
+        // the exact same boundary as sampled_wall_start_tsc, so the caller
+        // can diff its post-pass reading against these instead of a
+        // pre-run_pass (whole-pass) snapshot.
+        metrics.wake_syscalls_at_sample_start =
+            g_futex_wake_syscalls.load(std::memory_order_relaxed);
+        metrics.backstop_fires_at_sample_start =
+            g_futex_backstop_fires.load(std::memory_order_relaxed);
+        metrics.eagain_at_sample_start =
+            g_futex_eagain.load(std::memory_order_relaxed);
+      }
 
       bool had_to_wait = false;
+      bool parked = false; // WP-A: Blocking-only, see wait_for_message/cold_tag
       uint64_t wait_t0 = 0;
       if constexpr (P == WaitPolicy::Blocking)
         wait_t0 = rdtsc_now();
-      Msg *m = wait_for_message<P>(q, pw, had_to_wait);
+      Msg *m = wait_for_message<P>(q, pw, had_to_wait, parked);
       uint64_t wait_t1 = 0;
       if constexpr (P == WaitPolicy::Blocking)
         wait_t1 = rdtsc_now();
@@ -726,7 +910,8 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
 
       if (n >= PipeCfg::WARM_MSGS) {
         metrics.sampled_count++;
-        metrics.latency_cycles.push_back(uint32_t(t_done - pub_tsc));
+        uint32_t sample_latency = uint32_t(t_done - pub_tsc);
+        metrics.latency_cycles.push_back(sample_latency);
         if (had_to_wait)
           metrics.waited_count++;
         if constexpr (P == WaitPolicy::Blocking) {
@@ -737,6 +922,30 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
           if (had_to_wait)
             metrics.parked_cycles += (wait_t1 - wait_t0);
         }
+
+        // WP-A cold/warm tagging — same latency value (t_done - pub_tsc), no
+        // new timestamp: pub_tsc is stamped after pace_until returns, so any
+        // idle gap before publish is never inside the sample (see
+        // pace_until's comment). cold_tag is deliberately asymmetric between
+        // spin policies (had_to_wait only) and Blocking (parked, i.e. an
+        // actual wait_fn/syscall invocation) — see its comment.
+        bool is_blocking = (P == WaitPolicy::Blocking);
+        bool cold = cold_tag(had_to_wait, parked, is_blocking);
+        bool head = is_burst_head(m->seq, burst_len);
+        if (cold) {
+          metrics.cold_latency_cycles.push_back(sample_latency);
+          if (head)
+            metrics.cold_head++;
+          else
+            metrics.cold_nonhead++;
+        } else {
+          metrics.warm_latency_cycles.push_back(sample_latency);
+          if (head)
+            metrics.warm_head++;
+          else
+            metrics.warm_nonhead++;
+        }
+
         g_process_sink.fetch_add(sink, std::memory_order_relaxed);
       }
       q.pop();
@@ -753,10 +962,18 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
   while (!consumer_ready.load(std::memory_order_acquire))
     relax<true>();
 
+  // Even sweep constructs {1, gap_cycles, gap_cycles}: with burst_len=1,
+  // sched_deadline's pos is always 0 and burst_idx==n, so this reduces
+  // exactly to the pre-WP-B `t_start + n*gap_cycles` — the equivalence
+  // anchor asserted in run_self_tests. WP-C's bursty sweep passes a spec
+  // with intra_gap_cycles != idle_gap_cycles instead.
+  const ArrivalSpec spec{burst_len, ns_to_cycles(intra_gap_ns),
+                         ns_to_cycles(idle_gap_ns)};
+
   uint64_t t_start = rdtsc_now();
   uint64_t prev_pub_tsc = 0;
   for (uint64_t n = 0; n < total_msgs; n++) {
-    uint64_t deadline = t_start + n * gap_cycles;
+    uint64_t deadline = sched_deadline(t_start, n, spec);
     bool late = pace_until(deadline); // true iff we arrived past the deadline
 
     Msg msg = ring[n % PipeCfg::SOURCE_RING_ELEMS];
@@ -773,8 +990,8 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
       // original "first offered" timestamp regardless of how many retries
       // backpressure costs it.
       relax<true>(); // pp_core.hpp: _mm_pause — a bare-spin retry here would
-                      // port-starve the consumer on the sibling tier at
-                      // gap=0, where backpressure is expected and frequent.
+                     // port-starve the consumer on the sibling tier at
+                     // gap=0, where backpressure is expected and frequent.
     }
 
     if (n >= PipeCfg::WARM_MSGS) {
@@ -787,22 +1004,48 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
 
   consumer.join();
 
-  // The futex wake/backstop syscall counts are NOT diffed here: they're
-  // global counters shared across every pass, and run_policy_sweep already
-  // takes its own before/after snapshot around this call (see print_pass's
-  // wake_syscalls/backstop_fires parameters) — diffing them a second time
-  // in here would be redundant and easy to get out of sync with the real
-  // diff the caller does.
+  // The final (end-of-pass) futex wake/backstop/eagain counter reading is
+  // NOT taken here: they're global counters shared across every pass, and
+  // run_policy_sweep takes that reading itself right after this call
+  // returns, diffing it against metrics.wake_syscalls_at_sample_start etc.
+  // (the WARM->SAMPLE-boundary snapshot taken above, on the consumer
+  // thread) rather than against a pre-run_pass snapshot — see PassMetrics's
+  // comment and the README's MUST-FIX 1 note for why the window has to
+  // match n_bursts's SAMPLE_MSGS-only denominator.
   return metrics;
 }
 
+// wakes_per_burst: pure helper for the Blocking amortization headline
+// (n_bursts, wakes-per-burst — see print_pass). `total_msgs_in_window` MUST
+// be the exact same message count `wakes` was diffed over; the caller
+// controls that via the argument rather than this function reaching into
+// PipeCfg itself, so a caller that (re-)introduces a whole-pass window
+// (WARM_MSGS+SAMPLE_MSGS) instead of the sample-only window (SAMPLE_MSGS)
+// gets a silently wrong ratio again — see the README's MUST-FIX 1 note for
+// the exact bug this was pulled out of run_policy_sweep to make testable.
+static double wakes_per_burst(uint64_t wakes, uint64_t total_msgs_in_window,
+                              uint64_t burst_len) {
+  uint64_t n_bursts = burst_len ? total_msgs_in_window / burst_len : 0;
+  return n_bursts ? double(wakes) / double(n_bursts) : 0.0;
+}
+
+// `gap_ns` is the idle/steady-state gap (the even sweep's single gap, or
+// WP-C's BURST_IDLE_GAP_NS between bursts). `burst_len` defaults to 1 (the
+// even sweep — no per-burst line printed); WP-C's bursty sweep passes the
+// real burst length to get the amortization headline (n-bursts,
+// wakes-per-burst) and the intra_gap=0 late-publish explanatory note.
 static void print_pass(const char *tier_label, WaitPolicy policy,
                        uint64_t gap_ns, const PassMetrics &m,
-                       uint64_t wake_syscalls, uint64_t backstop_fires) {
+                       uint64_t wake_syscalls, uint64_t backstop_fires,
+                       uint64_t eagain_count, uint64_t burst_len = 1) {
   std::vector<uint32_t> lat = m.latency_cycles;
   std::sort(lat.begin(), lat.end());
   std::vector<uint32_t> ia = m.inter_arrival_cycles;
   std::sort(ia.begin(), ia.end());
+  std::vector<uint32_t> cold_lat = m.cold_latency_cycles;
+  std::sort(cold_lat.begin(), cold_lat.end());
+  std::vector<uint32_t> warm_lat = m.warm_latency_cycles;
+  std::sort(warm_lat.begin(), warm_lat.end());
 
   double waited_fraction =
       m.sampled_count ? double(m.waited_count) / double(m.sampled_count) : 0.0;
@@ -811,13 +1054,17 @@ static void print_pass(const char *tier_label, WaitPolicy policy,
   // count thread pin/spin-up and WARM_MSGS and understate parked_fraction.
   uint64_t sampled_wall_cycles =
       m.sampled_wall_end_tsc - m.sampled_wall_start_tsc;
-  double parked_fraction =
-      sampled_wall_cycles
-          ? double(m.parked_cycles) / double(sampled_wall_cycles)
-          : 0.0;
+  double parked_fraction = sampled_wall_cycles ? double(m.parked_cycles) /
+                                                     double(sampled_wall_cycles)
+                                               : 0.0;
 
-  printf("  %-14s %-9s gap=%6lluns\n", tier_label, policy_name(policy),
-         (unsigned long long)gap_ns);
+  if (burst_len > 1)
+    printf("  %-14s %-9s burst_len=%-4llu idle-gap=%6lluns\n", tier_label,
+           policy_name(policy), (unsigned long long)burst_len,
+           (unsigned long long)gap_ns);
+  else
+    printf("  %-14s %-9s gap=%6lluns\n", tier_label, policy_name(policy),
+           (unsigned long long)gap_ns);
   printf("    latency(ns)   min %8.1f  p50 %8.1f  p90 %8.1f  p99 %8.1f  "
          "p99.9 %9.1f  p99.99 %10.1f  max %10.1f\n",
          pct(lat, 0), pct(lat, 50), pct(lat, 90), pct(lat, 99), pct(lat, 99.9),
@@ -831,13 +1078,60 @@ static void print_pass(const char *tier_label, WaitPolicy policy,
          "parked-fraction %.4f\n",
          waited_fraction, (unsigned long long)m.backpressure_count,
          (unsigned long long)m.late_publish_count,
-         (unsigned long long)wake_syscalls,
-         (unsigned long long)backstop_fires, parked_fraction);
+         (unsigned long long)wake_syscalls, (unsigned long long)backstop_fires,
+         parked_fraction);
+  // WP-A: cold/warm latency split (see cold_tag) plus the 4-way cross-tab
+  // against burst-head/non-head (is_burst_head; always all-head in the even
+  // sweep, since run_pass's burst_len defaults to 1 there) and the EAGAIN
+  // count (a "cold but no genuine park+wake" sub-case of Blocking, split out
+  // from a real backstop-timeout park — see real_futex_wait).
+  printf("    cold n=%zu p50 %8.1f p99 %8.1f  |  warm n=%zu p50 %8.1f p99 "
+         "%8.1f  |  eagain %llu  |  xtab c/h=%llu c/nh=%llu w/h=%llu "
+         "w/nh=%llu\n",
+         cold_lat.size(), pct(cold_lat, 50), pct(cold_lat, 99), warm_lat.size(),
+         pct(warm_lat, 50), pct(warm_lat, 99), (unsigned long long)eagain_count,
+         (unsigned long long)m.cold_head, (unsigned long long)m.cold_nonhead,
+         (unsigned long long)m.warm_head, (unsigned long long)m.warm_nonhead);
   if (gap_ns == 0)
     printf("    note: at gap=0 the queue is saturated, so latency here is "
            "sojourn time through queue depth (Little's law), not wake\n"
            "          latency — see the README's \"SPSC pipeline\" section, "
            "\"The crossover: latency vs. core utilization\", for why.\n");
+  if (burst_len > 1) {
+    // WP-C: the amortization headline — how many bursts this pass covered,
+    // and how many FUTEX_WAKE syscalls it paid PER BURST (as opposed to per
+    // message). If Blocking's conditional-wake fast path is amortizing
+    // correctly, this should approach 1 as burst_len grows (one wake per
+    // burst, on the burst's first message, rather than one per message).
+    // wake_syscalls here is the SAMPLE-window delta (run_policy_sweep diffs
+    // against wake_syscalls_at_sample_start), so SAMPLE_MSGS is the matching
+    // window — same-window discipline the helper's comment insists on.
+    uint64_t n_bursts = PipeCfg::SAMPLE_MSGS / burst_len;
+    // wakes-per-burst is only meaningful for Blocking (the only policy that
+    // issues FUTEX_WAKE); for spin policies it is trivially 0 and would just
+    // be noise, so print n/a there.
+    if (policy == WaitPolicy::Blocking)
+      printf("    n-bursts %llu  wakes-per-burst %.4f\n",
+             (unsigned long long)n_bursts,
+             wakes_per_burst(wake_syscalls, PipeCfg::SAMPLE_MSGS, burst_len));
+    else
+      printf("    n-bursts %llu  wakes-per-burst n/a (spin policy)\n",
+             (unsigned long long)n_bursts);
+    // Explanatory note for the intra_gap=0 late-publish reading — same
+    // "saturated, not a bug" logic as the gap=0 note above, just applied
+    // per-burst instead of per-pass: with BURST_INTRA_GAP_NS=0, every
+    // non-head message in a burst shares its burst-head's deadline (see
+    // sched_deadline: pos*intra_gap_cycles == 0 for every pos), so
+    // pace_until finds it already "late" by construction as soon as the
+    // head has published. Expect late-publish to land near
+    // SAMPLE_MSGS*(burst_len-1)/burst_len — the non-head share of the
+    // sample — not near 0.
+    printf("    note: intra-burst gap is 0, so every non-head message's "
+           "deadline equals its burst's start time and reads \"late\" by\n"
+           "          construction (expect late-publish "
+           "~= SAMPLE_MSGS*(burst_len-1)/burst_len) — same logic as the "
+           "gap=0 note, applied per burst.\n");
+  }
 }
 
 // ===========================================================================
@@ -853,7 +1147,8 @@ inline WakeCall g_wake_call;
 
 static void stub_wake_recording(std::atomic<uint32_t> *addr, int n) {
   g_wake_call.count++;
-  g_wake_call.observed_parked_value_at_call = addr->load(std::memory_order_relaxed);
+  g_wake_call.observed_parked_value_at_call =
+      addr->load(std::memory_order_relaxed);
   (void)n;
 }
 static void stub_wake_should_not_be_called(std::atomic<uint32_t> *, int) {
@@ -894,8 +1189,9 @@ static void run() {
     g_wake_call = WakeCall{};
     bool woke = maybe_wake(pw, stub_wake_recording);
     if (!woke || g_wake_call.count != 1) {
-      fprintf(stderr, "FAIL maybe_wake(parked=1): woke=%d count=%d (want 1,1)\n",
-              woke, g_wake_call.count);
+      fprintf(stderr,
+              "FAIL maybe_wake(parked=1): woke=%d count=%d (want 1,1)\n", woke,
+              g_wake_call.count);
       exit(1);
     }
     if (g_wake_call.observed_parked_value_at_call != 0) {
@@ -913,7 +1209,8 @@ static void run() {
   }
 
   // wait_blocking_impl: message already visible on the OUTER check ->
-  // wait_fn must never be called at all.
+  // wait_fn must never be called at all. WP-A: parked_out must stay false —
+  // no syscall was ever entered for this message (cold_tag's WARM case).
   {
     ParkWord pw;
     int call = 0;
@@ -923,16 +1220,25 @@ static void run() {
       return &dummy; // visible immediately
     };
     struct timespec ts {};
-    int *m = wait_blocking_impl(front, pw, stub_wait_should_not_be_called, ts);
+    bool parked_out = false;
+    int *m = wait_blocking_impl(front, pw, stub_wait_should_not_be_called, ts,
+                                &parked_out);
     if (m == nullptr || *m != 42 || call != 1) {
       fprintf(stderr, "FAIL wait_blocking_impl immediate-visible path\n");
+      exit(1);
+    }
+    if (parked_out) {
+      fprintf(stderr, "FAIL wait_blocking_impl immediate-visible: "
+                      "parked_out=true, want false (no syscall entered)\n");
       exit(1);
     }
   }
 
   // wait_blocking_impl: empty on the outer check, but visible by the
   // RE-CHECK (the announce/park race window) -> wait_fn must be skipped,
-  // and parked must be left at 0 (the announce is undone).
+  // and parked must be left at 0 (the announce is undone). WP-A: parked_out
+  // must stay false — the re-check closed the race before any syscall was
+  // paid, so this message is WARM under cold_tag despite had_to_wait==true.
   {
     ParkWord pw;
     int call = 0;
@@ -943,10 +1249,13 @@ static void run() {
       return call >= 2 ? &dummy : nullptr;
     };
     struct timespec ts {};
-    int *m = wait_blocking_impl(front, pw, stub_wait_should_not_be_called, ts);
+    bool parked_out = false;
+    int *m = wait_blocking_impl(front, pw, stub_wait_should_not_be_called, ts,
+                                &parked_out);
     if (m == nullptr || *m != 7 || call != 2) {
-      fprintf(stderr, "FAIL wait_blocking_impl re-check-closes-race path: "
-                      "call=%d\n",
+      fprintf(stderr,
+              "FAIL wait_blocking_impl re-check-closes-race path: "
+              "call=%d\n",
               call);
       exit(1);
     }
@@ -955,11 +1264,17 @@ static void run() {
                       "re-check closed the race\n");
       exit(1);
     }
+    if (parked_out) {
+      fprintf(stderr, "FAIL wait_blocking_impl re-check-closes-race: "
+                      "parked_out=true, want false (no syscall entered)\n");
+      exit(1);
+    }
   }
 
   // wait_blocking_impl: empty on both outer check and re-check -> wait_fn
   // called exactly once, then the outer while loop re-polls and finds the
-  // message.
+  // message. WP-A: parked_out must be true — a real syscall entry happened
+  // (cold_tag's cold case for Blocking).
   {
     ParkWord pw;
     int call = 0;
@@ -972,12 +1287,56 @@ static void run() {
       return call >= 3 ? &dummy : nullptr;
     };
     struct timespec ts {};
-    int *m = wait_blocking_impl(front, pw, stub_wait_recording, ts);
+    bool parked_out = false;
+    int *m =
+        wait_blocking_impl(front, pw, stub_wait_recording, ts, &parked_out);
     if (m == nullptr || *m != 99 || g_wait_call.count != 1) {
       fprintf(stderr,
               "FAIL wait_blocking_impl genuine-park path: call=%d "
               "wait_count=%d\n",
               call, g_wait_call.count);
+      exit(1);
+    }
+    if (!parked_out) {
+      fprintf(stderr, "FAIL wait_blocking_impl genuine-park: parked_out=false, "
+                      "want true (a syscall was entered)\n");
+      exit(1);
+    }
+  }
+
+  // wait_blocking_impl: front() stays null across TWO full rounds of the
+  // outer while loop (outer-empty, re-check-empty, park+wake-stubbed-return,
+  // outer-empty AGAIN, re-check-empty AGAIN, park a second time, then
+  // finally visible) -> wait_fn called exactly twice, parked_out still true.
+  // This is the "mid-burst re-park" shape WP-C's cross-tab relies on (cold ^
+  // nonhead messages inside a burst): parked_out only needs to answer "was
+  // wait_fn ever invoked for THIS message", not "how many times".
+  {
+    ParkWord pw;
+    int call = 0;
+    static int dummy = 123;
+    g_wait_call = WaitCall{};
+    auto front = [&]() -> int * {
+      call++;
+      // Round 1: call 1 = outer (empty), call 2 = re-check (empty) -> park.
+      // Round 2: call 3 = outer (empty), call 4 = re-check (empty) -> park.
+      // Round 3: call 5 = outer loop's next front(), now visible.
+      return call >= 5 ? &dummy : nullptr;
+    };
+    struct timespec ts {};
+    bool parked_out = false;
+    int *m =
+        wait_blocking_impl(front, pw, stub_wait_recording, ts, &parked_out);
+    if (m == nullptr || *m != 123 || g_wait_call.count != 2) {
+      fprintf(stderr,
+              "FAIL wait_blocking_impl two-round-park path: call=%d "
+              "wait_count=%d (want 5,2)\n",
+              call, g_wait_call.count);
+      exit(1);
+    }
+    if (!parked_out) {
+      fprintf(stderr, "FAIL wait_blocking_impl two-round-park: "
+                      "parked_out=false, want true\n");
       exit(1);
     }
   }
@@ -1071,12 +1430,98 @@ static void run_self_tests() {
       uint64_t deadline = t_start + n * gap_cycles;
       uint64_t want = t_start + n * 1000;
       if (deadline != want) {
-        fprintf(stderr, "FAIL deadline schedule at n=%llu: got %llu want %llu\n",
+        fprintf(stderr,
+                "FAIL deadline schedule at n=%llu: got %llu want %llu\n",
                 (unsigned long long)n, (unsigned long long)deadline,
                 (unsigned long long)want);
         exit(1);
       }
     }
+    // sched_deadline (WP-B): exactness for a real burst schedule,
+    // burst_len=4, intra_gap=0, idle_gap=20000. period = 3*0 + 20000 =
+    // 20000. Messages 0-3 are burst 0 (all deadline t_start, since
+    // intra_gap=0 means no separation within a burst); messages 4-7 are
+    // burst 1, all at t_start+20000.
+    {
+      ArrivalSpec spec{/*burst_len=*/4, /*intra_gap_cycles=*/0,
+                       /*idle_gap_cycles=*/20000};
+      uint64_t want[8] = {t_start,         t_start,         t_start,
+                          t_start,         t_start + 20000, t_start + 20000,
+                          t_start + 20000, t_start + 20000};
+      for (uint64_t n = 0; n < 8; n++) {
+        uint64_t got = sched_deadline(t_start, n, spec);
+        if (got != want[n]) {
+          fprintf(stderr,
+                  "FAIL sched_deadline burst_len=4,intra=0 at n=%llu: got "
+                  "%llu want %llu\n",
+                  (unsigned long long)n, (unsigned long long)got,
+                  (unsigned long long)want[n]);
+          exit(1);
+        }
+      }
+    }
+
+    // sched_deadline: nonzero intra-gap, burst_len=3, intra=250, idle=5000.
+    // period = 2*250 + 5000 = 5500. Burst 0: n=0,1,2 at t_start, t_start+250,
+    // t_start+500. Burst 1 starts at t_start+5500: n=3,4,5 at t_start+5500,
+    // t_start+5750, t_start+6000.
+    {
+      ArrivalSpec spec{/*burst_len=*/3, /*intra_gap_cycles=*/250,
+                       /*idle_gap_cycles=*/5000};
+      uint64_t want[6] = {t_start,        t_start + 250,  t_start + 500,
+                          t_start + 5500, t_start + 5750, t_start + 6000};
+      for (uint64_t n = 0; n < 6; n++) {
+        uint64_t got = sched_deadline(t_start, n, spec);
+        if (got != want[n]) {
+          fprintf(stderr,
+                  "FAIL sched_deadline burst_len=3,intra=250 at n=%llu: got "
+                  "%llu want %llu\n",
+                  (unsigned long long)n, (unsigned long long)got,
+                  (unsigned long long)want[n]);
+          exit(1);
+        }
+      }
+    }
+
+    // sched_deadline EQUIVALENCE ANCHOR: burst_len=1 must reproduce
+    // t_start + n*G bit-for-bit for every gap in the real GAP_NS sweep — the
+    // guarantee that refactoring the even sweep's producer loop onto
+    // sched_deadline changed nothing observable.
+    for (uint64_t gap_ns : PipeCfg::GAP_NS) {
+      uint64_t g_cycles = ns_to_cycles(gap_ns);
+      ArrivalSpec spec{/*burst_len=*/1, /*intra_gap_cycles=*/g_cycles,
+                       /*idle_gap_cycles=*/g_cycles};
+      for (uint64_t n = 0; n < 5; n++) {
+        uint64_t got = sched_deadline(t_start, n, spec);
+        uint64_t want = t_start + n * g_cycles;
+        if (got != want) {
+          fprintf(stderr,
+                  "FAIL sched_deadline equivalence anchor: gap_ns=%llu "
+                  "n=%llu got %llu want %llu\n",
+                  (unsigned long long)gap_ns, (unsigned long long)n,
+                  (unsigned long long)got, (unsigned long long)want);
+          exit(1);
+        }
+      }
+    }
+
+    // sched_deadline: monotonic non-decreasing across a burst boundary
+    // (n=burst_len-1 -> n=burst_len), the point where period jumps in.
+    {
+      ArrivalSpec spec{/*burst_len=*/4, /*intra_gap_cycles=*/100,
+                       /*idle_gap_cycles=*/1000};
+      uint64_t d_last_in_burst = sched_deadline(t_start, 3, spec);
+      uint64_t d_first_next_burst = sched_deadline(t_start, 4, spec);
+      if (d_first_next_burst < d_last_in_burst) {
+        fprintf(stderr,
+                "FAIL sched_deadline: deadline went backwards across burst "
+                "boundary (n=3 -> %llu, n=4 -> %llu)\n",
+                (unsigned long long)d_last_in_burst,
+                (unsigned long long)d_first_next_burst);
+        exit(1);
+      }
+    }
+
     // Late-publish classification: exercises the REAL pace_until(), not a
     // hand-rolled `now > deadline` comparison duplicating its logic — a
     // prior version of this test compared two plain ints and never called
@@ -1106,7 +1551,8 @@ static void run_self_tests() {
 
   // should_skip: the one hard placement rule.
   if (!should_skip(WaitPolicy::BareSpin, /*is_sibling_tier=*/true)) {
-    fprintf(stderr, "FAIL should_skip: BareSpin must be skipped on sibling tier\n");
+    fprintf(stderr,
+            "FAIL should_skip: BareSpin must be skipped on sibling tier\n");
     exit(1);
   }
   if (should_skip(WaitPolicy::BareSpin, /*is_sibling_tier=*/false) ||
@@ -1116,6 +1562,99 @@ static void run_self_tests() {
       should_skip(WaitPolicy::Blocking, false)) {
     fprintf(stderr, "FAIL should_skip: an allowed combination was skipped\n");
     exit(1);
+  }
+
+  // cold_tag (WP-A): the deliberate spin-vs-Blocking asymmetry.
+  {
+    // Spin policies (is_blocking=false): had_to_wait is the only signal —
+    // parked is irrelevant and ignored either way.
+    if (cold_tag(/*had_to_wait=*/true, /*parked=*/false,
+                 /*is_blocking=*/false) != true ||
+        cold_tag(true, true, false) != true) {
+      fprintf(stderr, "FAIL cold_tag: spin had_to_wait=true must be cold "
+                      "regardless of parked\n");
+      exit(1);
+    }
+    if (cold_tag(/*had_to_wait=*/false, /*parked=*/false,
+                 /*is_blocking=*/false) != false ||
+        cold_tag(false, true, false) != false) {
+      fprintf(stderr, "FAIL cold_tag: spin had_to_wait=false must be warm "
+                      "regardless of parked\n");
+      exit(1);
+    }
+    // Blocking (is_blocking=true): parked is the only signal. had_to_wait
+    // alone (re-check closed the race, no syscall) must classify WARM.
+    if (cold_tag(/*had_to_wait=*/true, /*parked=*/false,
+                 /*is_blocking=*/true) != false) {
+      fprintf(stderr, "FAIL cold_tag: blocking had_to_wait=true, parked=false "
+                      "(re-check closed the race) must be WARM, not cold\n");
+      exit(1);
+    }
+    if (cold_tag(/*had_to_wait=*/true, /*parked=*/true, /*is_blocking=*/true) !=
+        true) {
+      fprintf(stderr, "FAIL cold_tag: blocking parked=true must be cold\n");
+      exit(1);
+    }
+    // had_to_wait=false, parked=true is not a reachable combination in
+    // practice (wait_for_message<Blocking> only sets parked inside the wait
+    // loop, which only runs when the initial front() was already null) but
+    // cold_tag is a pure function of its inputs and must still honor
+    // "parked wins" for is_blocking=true.
+    if (cold_tag(/*had_to_wait=*/false, /*parked=*/true,
+                 /*is_blocking=*/true) != true) {
+      fprintf(stderr, "FAIL cold_tag: blocking parked=true must be cold even "
+                      "if had_to_wait=false\n");
+      exit(1);
+    }
+  }
+
+  // is_burst_head (WP-B/WP-A): pure predicate on seq % burst_len.
+  {
+    // burst_len=1 -> every message is a head (even-sweep equivalence case).
+    for (uint64_t seq = 0; seq < 5; seq++)
+      if (!is_burst_head(seq, /*burst_len=*/1)) {
+        fprintf(stderr,
+                "FAIL is_burst_head: burst_len=1 must make seq=%llu "
+                "a head\n",
+                (unsigned long long)seq);
+        exit(1);
+      }
+    // burst_len=4 -> heads at 0,4,8; non-heads at 1,2,3,5,6,7.
+    bool want_head[8] = {true, false, false, false, true, false, false, false};
+    for (uint64_t seq = 0; seq < 8; seq++)
+      if (is_burst_head(seq, /*burst_len=*/4) != want_head[seq]) {
+        fprintf(stderr,
+                "FAIL is_burst_head: burst_len=4 seq=%llu got %d want %d\n",
+                (unsigned long long)seq, is_burst_head(seq, 4), want_head[seq]);
+        exit(1);
+      }
+  }
+
+  // wakes_per_burst (MUST-FIX 1): the ratio must be computed over the SAME
+  // message window the wake count was diffed over. These cases pin both the
+  // arithmetic and, critically, that the intended denominator is the
+  // sample-only window (SAMPLE_MSGS), not the whole pass — the exact bug this
+  // helper was extracted to prevent (whole-pass window inflates the ratio by
+  // (WARM+SAMPLE)/SAMPLE).
+  {
+    // Perfect amortization: one wake per burst. 100000 msgs / burst_len 4 =
+    // 25000 bursts; 25000 wakes -> exactly 1.0.
+    if (wakes_per_burst(25000, 100000, 4) != 1.0) {
+      fprintf(stderr, "FAIL wakes_per_burst: perfect-amortization case\n");
+      exit(1);
+    }
+    // Same wakes but the WRONG (whole-pass) window must NOT read 1.0 — it
+    // reads 25000 / (120000/4) = 25000/30000 ~= 0.833, proving the ratio is
+    // sensitive to the window mismatch this bug was about.
+    if (wakes_per_burst(25000, 120000, 4) >= 1.0) {
+      fprintf(stderr, "FAIL wakes_per_burst: whole-pass window must differ\n");
+      exit(1);
+    }
+    // Degenerate guards: burst_len 0 and a window smaller than a burst.
+    if (wakes_per_burst(5, 0, 0) != 0.0 || wakes_per_burst(5, 2, 4) != 0.0) {
+      fprintf(stderr, "FAIL wakes_per_burst: degenerate guards\n");
+      exit(1);
+    }
   }
 
   // pct() sanity — same values smt_pingpong.cpp's own self-test already
@@ -1184,8 +1723,8 @@ static int run_blocking_probe() {
     struct timespec ts {};
     ts.tv_sec = ProbeCfg::BACKSTOP_TIMEOUT_MS / 1000;
     ts.tv_nsec = (ProbeCfg::BACKSTOP_TIMEOUT_MS % 1000) * 1000000L;
-    int *m = wait_blocking_impl([&] { return q.front(); }, pw, real_futex_wait,
-                                ts);
+    int *m =
+        wait_blocking_impl([&] { return q.front(); }, pw, real_futex_wait, ts);
     bool ok = (*m == expected);
     q.pop();
     return ok;
@@ -1305,12 +1844,47 @@ static int run_blocking_probe() {
 }
 
 // ===========================================================================
-// WP5: the full sweep — 3 tiers x 3 policies (minus skips) x 5 gaps.
+// WP5/WP-C: the full sweep — 3 tiers x 3 policies (minus skips) x N cells.
+// A SweepCell is one (burst_len, intra_gap_ns, idle_gap_ns) row; the default
+// even sweep and the --bursty sweep are just two different cell lists fed
+// through the same counter-diff/run_pass/print_pass scaffolding, rather than
+// duplicated loops — see even_sweep_cells/bursty_sweep_cells below.
 // ===========================================================================
+struct SweepCell {
+  uint64_t burst_len;
+  uint64_t intra_gap_ns;
+  uint64_t idle_gap_ns; // also the value printed as "gap="/"idle-gap="
+};
+
+// The historical even sweep: one cell per PipeCfg::GAP_NS entry, burst_len=1
+// (every message is its own "burst" of length one — see sched_deadline's
+// equivalence case). intra_gap_ns is set equal to idle_gap_ns so
+// sched_deadline's period math reduces to the plain `t_start + n*gap`
+// schedule regardless of which of the two fields it happens to read.
+static std::vector<SweepCell> even_sweep_cells() {
+  std::vector<SweepCell> cells;
+  cells.reserve(std::size(PipeCfg::GAP_NS));
+  for (uint64_t gap_ns : PipeCfg::GAP_NS)
+    cells.push_back({/*burst_len=*/1, /*intra_gap_ns=*/gap_ns,
+                     /*idle_gap_ns=*/gap_ns});
+  return cells;
+}
+
+// --bursty sweep: one cell per PipeCfg::BURST_LENS entry, at the fixed
+// BURST_INTRA_GAP_NS/BURST_IDLE_GAP_NS from PipeCfg.
+static std::vector<SweepCell> bursty_sweep_cells() {
+  std::vector<SweepCell> cells;
+  cells.reserve(std::size(PipeCfg::BURST_LENS));
+  for (uint64_t burst_len : PipeCfg::BURST_LENS)
+    cells.push_back(
+        {burst_len, PipeCfg::BURST_INTRA_GAP_NS, PipeCfg::BURST_IDLE_GAP_NS});
+  return cells;
+}
+
 static void run_policy_sweep(WaitPolicy policy, const char *tier_label,
                              int consumer_cpu, int producer_cpu,
-                             bool is_sibling_tier,
-                             const std::vector<Msg> &ring) {
+                             bool is_sibling_tier, const std::vector<Msg> &ring,
+                             const std::vector<SweepCell> &cells) {
   if (consumer_cpu < 0 || producer_cpu < 0) {
     printf("  %-14s %-9s (no such pair)\n", tier_label, policy_name(policy));
     return;
@@ -1322,34 +1896,39 @@ static void run_policy_sweep(WaitPolicy policy, const char *tier_label,
            tier_label, policy_name(policy));
     return;
   }
-  for (uint64_t gap_ns : PipeCfg::GAP_NS) {
-    uint64_t wake_before =
-        g_futex_wake_syscalls.load(std::memory_order_relaxed);
-    uint64_t backstop_before =
-        g_futex_backstop_fires.load(std::memory_order_relaxed);
-
+  for (const SweepCell &cell : cells) {
     PassMetrics m;
     switch (policy) {
     case WaitPolicy::BareSpin:
-      m = run_pass<WaitPolicy::BareSpin>(consumer_cpu, producer_cpu, gap_ns,
-                                         ring);
+      m = run_pass<WaitPolicy::BareSpin>(consumer_cpu, producer_cpu,
+                                         cell.intra_gap_ns, cell.idle_gap_ns,
+                                         ring, cell.burst_len);
       break;
     case WaitPolicy::Pause:
-      m = run_pass<WaitPolicy::Pause>(consumer_cpu, producer_cpu, gap_ns,
-                                      ring);
+      m = run_pass<WaitPolicy::Pause>(consumer_cpu, producer_cpu,
+                                      cell.intra_gap_ns, cell.idle_gap_ns, ring,
+                                      cell.burst_len);
       break;
     case WaitPolicy::Blocking:
-      m = run_pass<WaitPolicy::Blocking>(consumer_cpu, producer_cpu, gap_ns,
-                                         ring);
+      m = run_pass<WaitPolicy::Blocking>(consumer_cpu, producer_cpu,
+                                         cell.intra_gap_ns, cell.idle_gap_ns,
+                                         ring, cell.burst_len);
       break;
     }
-    uint64_t wake_after =
-        g_futex_wake_syscalls.load(std::memory_order_relaxed);
+    // Diffed against the sample-window snapshot run_pass took at n ==
+    // WARM_MSGS (metrics.wake_syscalls_at_sample_start etc.), NOT a
+    // before-this-call snapshot -- so every count below is scoped to the
+    // same SAMPLE_MSGS-only window as n_bursts and the cold/warm counts
+    // (see PassMetrics's comment and the README's MUST-FIX 1 note).
+    uint64_t wake_after = g_futex_wake_syscalls.load(std::memory_order_relaxed);
     uint64_t backstop_after =
         g_futex_backstop_fires.load(std::memory_order_relaxed);
+    uint64_t eagain_after = g_futex_eagain.load(std::memory_order_relaxed);
 
-    print_pass(tier_label, policy, gap_ns, m, wake_after - wake_before,
-              backstop_after - backstop_before);
+    print_pass(tier_label, policy, cell.idle_gap_ns, m,
+               wake_after - m.wake_syscalls_at_sample_start,
+               backstop_after - m.backstop_fires_at_sample_start,
+               eagain_after - m.eagain_at_sample_start, cell.burst_len);
   }
 }
 
@@ -1361,8 +1940,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--blocking-probe") == 0) {
     return run_blocking_probe();
   }
-  if (argc != 1) {
-    fprintf(stderr, "usage: %s [--test | --blocking-probe]\n", argv[0]);
+  bool bursty = false;
+  if (argc == 2 && std::strcmp(argv[1], "--bursty") == 0) {
+    bursty = true;
+  } else if (argc != 1) {
+    fprintf(stderr, "usage: %s [--test | --blocking-probe | --bursty]\n",
+            argv[0]);
     return 1;
   }
 
@@ -1389,12 +1972,29 @@ int main(int argc, char **argv) {
   WaitPolicy policies[] = {WaitPolicy::BareSpin, WaitPolicy::Pause,
                            WaitPolicy::Blocking};
 
+  // WP-C: --bursty swaps the cell list (burst lengths at a fixed idle gap)
+  // in place of the default even sweep (gaps at burst_len=1); everything
+  // else — tiers, policies, should_skip, the counter-diff scaffolding —
+  // is unchanged and shared between the two modes.
+  const std::vector<SweepCell> cells =
+      bursty ? bursty_sweep_cells() : even_sweep_cells();
+
+  if (bursty) {
+    printf("--bursty: burst_len in {");
+    for (size_t i = 0; i < std::size(PipeCfg::BURST_LENS); i++)
+      printf("%s%llu", i ? "," : "",
+             (unsigned long long)PipeCfg::BURST_LENS[i]);
+    printf("}, intra-gap=%lluns, idle-gap=%lluns\n\n",
+           (unsigned long long)PipeCfg::BURST_INTRA_GAP_NS,
+           (unsigned long long)PipeCfg::BURST_IDLE_GAP_NS);
+  }
+
   for (const Tier &tier : tiers) {
     printf("=== tier: %s (cpu%d <-> cpu%d) ===\n", tier.label, topo.base,
            tier.producer_cpu);
     for (WaitPolicy policy : policies)
       run_policy_sweep(policy, tier.label, topo.base, tier.producer_cpu,
-                       tier.is_sibling, ring);
+                       tier.is_sibling, ring, cells);
     printf("\n");
   }
 
