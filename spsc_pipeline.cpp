@@ -518,9 +518,8 @@ static Topology discover_topology() {
 // fence+conditional-wake path (that machinery existed only for the deleted
 // Blocking wait policy). Both tiers being compared see the plain
 // try_emplace-and-retry loop identically, so removing that fence cannot bias
-// the sibling-vs-same-CCX delta this sweep reports — see the acceptance-gate
-// note in the carve's task description for the measurement this was checked
-// against.
+// the sibling-vs-same-CCX delta this sweep reports (verified: original and
+// fence-removed builds gave statistically indistinguishable per-cell deltas).
 // ===========================================================================
 static PassMetrics run_pass(int consumer_cpu, int producer_cpu, uint64_t gap_ns,
                             int proc_rounds, const std::vector<Msg> &ring) {
@@ -974,15 +973,14 @@ static void run_self_tests() {
 // ===========================================================================
 // --proc-sweep (WP3): measure whether SMT-sibling or same-CCX placement is
 // faster end-to-end vs. consumer per-message processing weight, and find
-// the crossover — see the file-scope comment's "The crux — matched pacing"
-// section and Findings 1/2 for the design this implements.
+// the crossover — see the file header ("SHAPE OF THE EXPERIMENT") and
+// PipeCfg::PROC_SWEEP_HEADROOM for the matched-pacing design this implements.
 // ===========================================================================
 
 // Per-(tier, level) result: the raw pass metrics plus the validity gate
 // verdict (backpressure_count==0 AND
-// waited_fraction>=PROC_SWEEP_WAITED_FRACTION_MIN — a proc-sweep-specific
-// threshold; see PipeCfg::PROC_SWEEP_WAITED_FRACTION_MIN for why it must
-// NOT reuse the even sweep's WAITED_FRACTION_MIN).
+// waited_fraction>=PROC_SWEEP_WAITED_FRACTION_MIN — see that constant for
+// the 0.90 rationale).
 struct ProcSweepCellResult {
   int rounds;
   double calibrated_proc_ns;
@@ -1068,8 +1066,8 @@ static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring) {
   printf("prediction: crossover between ~50ns (producer ran HOT: ~81%% "
          "sibling-contention tax, crossover ~= 40ns/0.81) and ~1.3us "
          "(producer stays POLITE under this sweep's matched pacing: ~3%% "
-         "tax, crossover ~= 40ns/0.03). See the README's \"SPSC pipeline\" "
-         "section for the derivation.\n\n");
+         "tax, crossover ~= 40ns/0.03). See the README (\"Step 4\") for the "
+         "derivation.\n\n");
 
   // Calibration: solo, contention-free, on the pinned consumer CPU.
   printf("rounds -> calibrated processing ns (solo, on cpu%d):\n", topo.base);
@@ -1097,8 +1095,8 @@ static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring) {
 
   std::vector<std::vector<ProcSweepCellResult>> results; // [tier][level]
   for (const TierRun &tier : tiers) {
-    printf("=== tier: %s (cpu%d <-> cpu%d), WaitPolicy::Pause ===\n",
-           tier.label, topo.base, tier.producer_cpu);
+    printf("=== tier: %s (cpu%d <-> cpu%d), wait=Pause ===\n", tier.label,
+           topo.base, tier.producer_cpu);
     std::vector<ProcSweepCellResult> tier_results;
     tier_results.reserve(n_levels);
     for (size_t i = 0; i < n_levels; i++) {

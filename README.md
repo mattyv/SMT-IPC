@@ -212,6 +212,10 @@ branch to keep this one focused on the placement result.)*
   within one run, not across runs or machines. Metrics derived from the pacing schedule
   (`waited-fraction`, `late-publish`) are the robust cross-run signals.
 - **TSC** calibrated against `steady_clock`, assumes invariant TSC (`constant_tsc nonstop_tsc`).
+- **Run the crossover at normal power, not low-power/throttled.** The result assumes the
+  paced producer stays *polite* — check the `proc_insitu_ratio` column reads ≈ 1. Under a
+  throttled clock the producer can't keep pace politely, runs hot (ratio ≈ 2+), and same-CCX
+  wins at every level — the crossover inverts. Not a fragile result, a wrong-conditions one.
 - **Not measured:** throughput/bandwidth, contention from third parties, and real-socket I/O
   (whose µs-scale syscalls would dominate every ns-scale result here).
 - **`mwaitx` was evaluated and dropped:** the consumer waits with `_mm_pause`, not the AMD
