@@ -1,2 +1,2 @@
-smt_pingpong
-*.o
+# Compiled benchmark binary
+/smt_pingpong

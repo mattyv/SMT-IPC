@@ -1,0 +1,10 @@
+build:
+  # Pinned (not floating "gcc") so a tag update upstream can't silently
+  # change the compiler this pipeline builds with.
+  image: gcc:14
+  stage: build
+  # x86-64-only: the benchmark uses <x86intrin.h> (__rdtsc, _mm_pause), so the
+  # runner executing this job must be an amd64 host.
+  script:
+    - g++ -O3 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
+    - ./smt_pingpong --test

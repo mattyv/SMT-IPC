@@ -151,7 +151,7 @@ The SMT-sibling pair only ever runs the **pause** variant: a bare spin on one si
 ## Build
 
 ```sh
-g++ -O2 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
+g++ -O3 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
 ```
 
 x86-64 Linux only (rdtsc, `_mm_pause`, sysfs topology).
@@ -164,7 +164,12 @@ x86-64 Linux only (rdtsc, `_mm_pause`, sysfs topology).
 
 # Explicit pair mode: name two logical CPUs; runs BOTH spin variants on that pair
 ./smt_pingpong 0 12
+
+# Self-check: pure-logic tests only (parse_list, pct) — no timing hardware needed
+./smt_pingpong --test
 ```
+
+Explicit mode validates both arguments (must be non-negative integers naming an online CPU) and exits non-zero immediately on bad input, rather than silently running a meaningless pair. If the two CPUs are SMT siblings, the bare-spin variant is skipped (one line explaining why) since a bare spin on a sibling is an invalid measurement — see "Why the sibling pair only runs pause" above. A pin failure inside either thread is fatal (`exit(1)`), not a logged warning: an unpinned pair means nothing, per the caveats below.
 
 Auto mode prints the calibrated TSC frequency, then one line per pair with the distribution:
 
@@ -209,7 +214,8 @@ A natural question: do the flag writes even need to be `std::atomic` — couldn'
   - SMT enabled (otherwise no sibling pair exists to measure),
   - turbo/boost **off** and `governor=performance` (so the core clock doesn't drift mid-run and smear the distribution),
   - ideally `isolcpus` / `nohz_full` / IRQ affinity steering work off both CPUs of the pair. Without that, expect the p99.99/max tail to be dominated by scheduler noise.
-- Pin failures are reported but non-fatal; TSC deltas remain valid, but the "pair" then means nothing — treat such runs as invalid.
+- Pin failures are fatal (the process exits immediately): an unpinned thread can migrate mid-run, so the "pair" would mean nothing, and the run is defined as invalid rather than merely warned about.
+- The sample array write (`(*samples)[i - 1] = ...`) happens between the two timed `rdtsc_now()` calls of the *next* iteration's window, not inside the one it records, but the store can still land late and overlap the very start of the next timed section on a busy store buffer. This is noise-level and accepted, not corrected for.
 
 ## What this does NOT measure
 

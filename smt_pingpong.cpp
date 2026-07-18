@@ -30,7 +30,7 @@
 // needs to do its store, so it would measure self-inflicted starvation rather
 // than handoff latency.
 //
-// build: g++ -O2 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
+// build: g++ -O3 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
 // run:   ./smt_pingpong          (auto-picks representative pairs from /sys)
 //        ./smt_pingpong 0 12     (explicit cpu pair, both variants)
 //
@@ -45,10 +45,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <climits> // INT_MAX
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <pthread.h>
 #include <sched.h>
@@ -196,6 +201,42 @@ static std::string slurp(const std::string &p) {
   return s;
 }
 
+// True iff `s` is non-empty and every character is an ASCII digit. Used to
+// validate a token before handing it to stoi, so malformed sysfs content
+// produces a clear fatal message instead of an uncaught std::invalid_argument.
+static bool is_all_digits(const std::string &s) {
+  return !s.empty() &&
+         std::all_of(s.begin(), s.end(),
+                      [](unsigned char c) { return std::isdigit(c) != 0; });
+}
+
+// Parse one CPU-number token, failing fast (loudly) if it isn't plain digits
+// or doesn't fit in an int. This is the single place malformed sysfs content
+// is caught, so a bad topology file becomes an explained exit(1) rather than
+// an uncaught exception. Uses strtol + an explicit range check (not stoi):
+// stoi throws std::out_of_range for a token like "99999999999", which would
+// otherwise escape uncaught.
+static int parse_uint_token(const std::string &tok) {
+  if (!is_all_digits(tok)) {
+    fprintf(stderr,
+            "fatal: malformed CPU-list token '%s' (expected digits) — is "
+            "sysfs topology data corrupt?\n",
+            tok.c_str());
+    exit(1);
+  }
+  errno = 0;
+  char *end = nullptr;
+  long v = strtol(tok.c_str(), &end, 10);
+  if (errno == ERANGE || v > INT_MAX) {
+    fprintf(stderr,
+            "fatal: CPU-list token '%s' is out of range — is sysfs topology "
+            "data corrupt?\n",
+            tok.c_str());
+    exit(1);
+  }
+  return int(v);
+}
+
 // Parse a Linux CPU list like "0,12" or "0-3,8-11" into a flat vector of ints.
 // Handles both comma-separated singletons and dash-separated ranges.
 static std::vector<int> parse_list(const std::string &s) {
@@ -206,10 +247,10 @@ static std::vector<int> parse_list(const std::string &s) {
     auto dash = tok.find('-');
     if (dash == std::string::npos) { // singleton, e.g. "12"
       if (!tok.empty())
-        out.push_back(std::stoi(tok));
+        out.push_back(parse_uint_token(tok));
     } else { // range, e.g. "0-3"
-      int lo = std::stoi(tok.substr(0, dash)),
-          hi = std::stoi(tok.substr(dash + 1));
+      int lo = parse_uint_token(tok.substr(0, dash)),
+          hi = parse_uint_token(tok.substr(dash + 1));
       for (int i = lo; i <= hi; i++)
         out.push_back(i);
     }
@@ -248,6 +289,72 @@ static std::vector<int> l3_peers_of(int cpu) {
 // Small membership helper for the pair-selection logic below.
 static bool contains(const std::vector<int> &v, int x) {
   return std::find(v.begin(), v.end(), x) != v.end();
+}
+
+// Pure format/range check for a CPU-id command-line argument, split out of
+// parse_cpu_arg() so it's unit-testable (parse_cpu_arg itself exits on
+// failure, which run_self_tests() can't observe). Accepts only a bare
+// sequence of ASCII digits — the leading isdigit check rejects "+5" and " 5",
+// which strtol alone would silently accept via its own sign/whitespace
+// skipping, inconsistent with is_all_digits()'s stricter token format.
+//
+// Critically, the v > INT_MAX check runs BEFORE any narrowing to int: strtol
+// returns a 64-bit long here, so a value like 2^32 would pass a naive
+// `v >= 0` check and then silently wrap to 0 on `int(v)`, turning
+// "./smt_pingpong 4294967296 1" into a bogus-but-plausible (0, 1) run instead
+// of a loud failure.
+static bool is_valid_cpu_number(const char *s, long *out) {
+  if (!std::isdigit(static_cast<unsigned char>(s[0])))
+    return false;
+  errno = 0;
+  char *end = nullptr;
+  long v = strtol(s, &end, 10);
+  if (*end != '\0' || errno == ERANGE || v < 0 || v > INT_MAX)
+    return false;
+  *out = v;
+  return true;
+}
+
+// Parse a required CPU-id command-line argument. Fails fast (exit 1) with an
+// explained message rather than silently misbehaving on garbage input: `atoi`
+// would map "abc" or "-3" to a number and let the run proceed on a bogus pair.
+static int parse_cpu_arg(const char *s, const std::vector<int> &online) {
+  long v;
+  if (!is_valid_cpu_number(s, &v)) {
+    fprintf(stderr, "error: '%s' is not a valid non-negative CPU number\n", s);
+    exit(1);
+  }
+  if (!contains(online, int(v))) {
+    fprintf(stderr, "error: cpu%ld is not an online CPU\n", v);
+    exit(1);
+  }
+  return int(v);
+}
+
+// Read /proc/cpuinfo and warn (loudly, non-fatally) if the invariant-TSC
+// flags aren't present. calibrate() assumes a constant-rate TSC regardless of
+// core boost/idle state; without it every ns figure this run prints is
+// unreliable, but the topology ORDERING result is still meaningful, so we
+// warn rather than abort.
+static void check_invariant_tsc() {
+  std::ifstream f("/proc/cpuinfo");
+  std::string line;
+  bool found_flags = false, constant = false, nonstop = false;
+  while (std::getline(f, line)) {
+    if (line.rfind("flags", 0) == 0) { // first CPU's flags line is representative
+      found_flags = true;
+      constant = line.find("constant_tsc") != std::string::npos;
+      nonstop = line.find("nonstop_tsc") != std::string::npos;
+      break;
+    }
+  }
+  if (!found_flags || !constant || !nonstop) {
+    fprintf(stderr,
+            "\n*** WARNING: constant_tsc/nonstop_tsc not found in "
+            "/proc/cpuinfo flags. ***\n"
+            "*** All ns figures below assume an invariant TSC and may be "
+            "unreliable. ***\n\n");
+  }
 }
 
 // ===========================================================================
@@ -289,8 +396,13 @@ static void bench(int cpu_a, int cpu_b, uint64_t iters,
   std::atomic<bool> ready{false};
 
   std::thread responder([&] {
-    if (!pin(cpu_b)) // pin failure is loud but non-fatal; TSC deltas still ok
+    if (!pin(cpu_b)) {
+      // Fatal, not just logged: an unpinned thread can migrate mid-run, so
+      // the "pair" no longer means anything and the README says such runs
+      // are invalid. Abrupt exit is fine for a benchmark tool.
       fprintf(stderr, "  ! pin cpu%d failed\n", cpu_b);
+      exit(1);
+    }
     ready.store(true, std::memory_order_release); // "I'm in position"
     for (uint64_t i = 1; i <= iters; i++) {
       // Wait to observe the initiator's store of `i` into `a`...
@@ -301,8 +413,11 @@ static void bench(int cpu_a, int cpu_b, uint64_t iters,
     }
   });
 
-  if (!pin(cpu_a))
+  if (!pin(cpu_a)) {
+    // Same reasoning as the responder's pin failure above: fatal, not logged.
     fprintf(stderr, "  ! pin cpu%d failed\n", cpu_a);
+    exit(1);
+  }
   while (!ready.load(std::memory_order_acquire)) // wait for responder ready
     relax<Pause>();
 
@@ -351,12 +466,91 @@ static double pct(const std::vector<uint32_t> &sorted, double p) {
 }
 
 // ---------------------------------------------------------------------------
+// Minimal, framework-free self-check: `./smt_pingpong --test`. Exercises the
+// pure-logic helpers (parse_list, pct) in isolation — no threads, no /sys, no
+// timing hardware needed, so it runs the same on any box / in CI.
+// ---------------------------------------------------------------------------
+static int run_self_tests() {
+  auto expect_vec = [](const char *what, const std::vector<int> &got,
+                        const std::vector<int> &want) {
+    if (got != want) {
+      fprintf(stderr, "FAIL %s\n", what);
+      exit(1);
+    }
+  };
+  // Exact rational arithmetic in every case exercised below (integer inputs,
+  // halves), so bit-for-bit equality is the right check — no float slop.
+  auto expect_eq = [](const char *what, double got, double want) {
+    if (got != want) {
+      fprintf(stderr, "FAIL %s: got %.6f want %.6f\n", what, got, want);
+      exit(1);
+    }
+  };
+
+  expect_vec("parse_list(\"0,12\")", parse_list("0,12"), {0, 12});
+  expect_vec("parse_list(\"0-3,8-11\")", parse_list("0-3,8-11"),
+             {0, 1, 2, 3, 8, 9, 10, 11});
+  expect_vec("parse_list(\"\")", parse_list(""), {});
+  expect_vec("parse_list(\"7\")", parse_list("7"), {7});
+
+  auto expect_bool = [](const char *what, bool got, bool want) {
+    if (got != want) {
+      fprintf(stderr, "FAIL %s\n", what);
+      exit(1);
+    }
+  };
+  long v = -1;
+  expect_bool("is_valid_cpu_number(\"5\")", is_valid_cpu_number("5", &v),
+              true);
+  expect_eq("is_valid_cpu_number(\"5\") value", double(v), 5.0);
+  expect_bool("is_valid_cpu_number(\"0\")", is_valid_cpu_number("0", &v),
+              true);
+  // The bug this guards against: strtol(2^32) fits in a 64-bit long and would
+  // pass a naive `v >= 0` check, then silently wrap to 0 when narrowed to
+  // int — this must be rejected before narrowing, not after.
+  expect_bool("is_valid_cpu_number(\"4294967296\") (2^32, overflows int)",
+              is_valid_cpu_number("4294967296", &v), false);
+  expect_bool("is_valid_cpu_number(\"+5\") (leading sign)",
+              is_valid_cpu_number("+5", &v), false);
+  expect_bool("is_valid_cpu_number(\" 5\") (leading space)",
+              is_valid_cpu_number(" 5", &v), false);
+  expect_bool("is_valid_cpu_number(\"-1\") (negative)",
+              is_valid_cpu_number("-1", &v), false);
+  expect_bool("is_valid_cpu_number(\"abc\") (non-numeric)",
+              is_valid_cpu_number("abc", &v), false);
+  expect_bool("is_valid_cpu_number(\"\") (empty)", is_valid_cpu_number("", &v),
+              false);
+  expect_bool("is_valid_cpu_number(\"12x\") (trailing junk)",
+              is_valid_cpu_number("12x", &v), false);
+
+  g_tsc_ghz = 1.0; // 1 cycle == 1 ns, so expected pct() values are exact
+  std::vector<uint32_t> sorted{10, 20, 30, 40};
+  expect_eq("pct(sorted, 0)", pct(sorted, 0), 10.0);
+  expect_eq("pct(sorted, 100)", pct(sorted, 100), 40.0);
+  expect_eq("pct(sorted, 50)", pct(sorted, 50), 25.0); // linear interpolation
+  expect_eq("pct({42}, 50)", pct(std::vector<uint32_t>{42}, 50), 42.0);
+  expect_eq("pct({}, 50)", pct(std::vector<uint32_t>{}, 50), 0.0);
+
+  printf("all tests passed\n");
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Run one labelled pair through warm-up + recorded pass, then print the
 // distribution. Templated on Pause so the caller picks the spin variant.
 // ---------------------------------------------------------------------------
 template <bool Pause> static void run(const char *label, int cpu_a, int cpu_b) {
   if (cpu_a < 0 || cpu_b < 0) { // topology didn't yield such a partner
     printf("%-30s (no such pair)\n", label);
+    return;
+  }
+  if (cpu_a == cpu_b) { // backstop for an auto-mode tier that degenerated to
+                        // the anchor CPU (explicit mode is already rejected
+                        // in main() before this point, so this should only
+                        // ever fire from auto-mode topology discovery)
+    fprintf(stderr,
+            "%-30s error: cpu%d == cpu%d, refusing to run a same-CPU pair\n",
+            label, cpu_a, cpu_b);
     return;
   }
   std::vector<uint32_t> s(Cfg::SAMPLE_ITERS); // pre-sized, pre-touched
@@ -380,15 +574,68 @@ template <bool Pause> static void run(const char *label, int cpu_a, int cpu_b) {
 }
 
 int main(int argc, char **argv) {
-  calibrate(); // establish g_tsc_ghz before any measurement
+  // Self-check mode: pure-logic tests only, no hardware/timing dependency.
+  if (argc == 2 && std::strcmp(argv[1], "--test") == 0)
+    return run_self_tests();
+
+  // Anything else must be either "no args" (auto mode) or "cpu_a cpu_b"
+  // (explicit mode) — argc == 2 (one CPU) or argc > 3 is a usage error, not a
+  // silent fall-through into auto mode.
+  if (argc != 1 && argc != 3) {
+    fprintf(stderr, "usage: %s [cpu_a cpu_b]\n", argv[0]);
+    return 1;
+  }
+
+  // Validate explicit-mode CPU args BEFORE calibrating/measuring anything, so
+  // a bad argument fails immediately rather than after paying for calibration.
+  int x = -1, y = -1;
+  if (argc == 3) {
+    auto online = online_cpus();
+    x = parse_cpu_arg(argv[1], online);
+    y = parse_cpu_arg(argv[2], online);
+    // Same-CPU pair is not a pair at all. Checked here (before calibrate())
+    // rather than left solely to run()'s guard: run()'s guard only warns and
+    // returns 0, which would print a nonsense "SMT siblings" line (siblings_of
+    // trivially contains the CPU itself) and exit 0 despite the README's
+    // promise of non-zero on bad input.
+    if (x == y) {
+      fprintf(stderr,
+              "error: cpu%d == cpu%d, refusing to run a same-CPU pair\n", x,
+              y);
+      return 1;
+    }
+  }
+
+  check_invariant_tsc(); // warn (non-fatally) before trusting any ns figure
+  calibrate();            // establish g_tsc_ghz before any measurement
   printf("TSC: %.4f GHz\n\n", g_tsc_ghz);
 
   // Explicit pair mode: user names two CPUs, we show both spin variants so the
   // PAUSE contribution is visible directly.
   if (argc == 3) {
-    int x = atoi(argv[1]), y = atoi(argv[2]);
     run<true>("explicit pair (pause)", x, y);
-    run<false>("explicit pair (bare-spin)", x, y);
+
+    // Bare spin on an SMT sibling starves the shared core's execution ports
+    // that the OTHER sibling needs to store its reply (see file header) — an
+    // invalid measurement, so skip it rather than run and mislabel it.
+    auto x_sibs = siblings_of(x);
+    if (x_sibs.empty()) {
+      // sysfs was unreadable, so we genuinely don't know whether x/y are
+      // siblings. Fail OPEN (warn, still run) rather than silently skipping a
+      // legitimate measurement just because /sys couldn't be read.
+      fprintf(stderr,
+              "warning: could not determine SMT sibling status for cpu%d "
+              "(sysfs unreadable) — if cpu%d/cpu%d are actually siblings, "
+              "the bare-spin variant below is invalid\n",
+              x, x, y);
+      run<false>("explicit pair (bare-spin)", x, y);
+    } else if (contains(x_sibs, y)) {
+      printf("explicit pair (bare-spin)     skipped: cpu%d/cpu%d are SMT "
+             "siblings — bare spin would starve the shared core's ports\n",
+             x, y);
+    } else {
+      run<false>("explicit pair (bare-spin)", x, y);
+    }
     return 0;
   }
 
@@ -414,11 +661,15 @@ int main(int argc, char **argv) {
       same_l3 = c;
       break;
     }
-  for (int c : cpus) // outside base's L3 entirely -> cross-CCX
-    if (!contains(l3, c)) {
-      other_l3 = c;
-      break;
-    }
+  if (!l3.empty()) // only search if we actually know base's L3 peers —
+    for (int c : cpus) // outside base's L3 entirely -> cross-CCX
+      if (!contains(l3, c)) {
+        other_l3 = c;
+        break;
+      }
+  // else: l3 is empty (sysfs didn't yield peers), so every cpu trivially
+  // satisfies "!contains(l3, c)" and the loop would pick cpus[0] == base
+  // itself — leave other_l3 at -1 instead of running a same-CPU "pair".
 
   printf("base cpu%d | SMT: %s | L3 peers: %zu\n\n", base,
          sibs.size() > 1 ? "on" : "off", l3.size());
