@@ -78,6 +78,9 @@
 // build: g++ -O3 -std=c++23 -pthread spsc_pipeline.cpp -o spsc_pipeline
 //        -I <path-to-rigtorp-SPSCQueue-include>   (prefer the CMake build)
 // run:   ./spsc_pipeline                 (full tier x policy x gap sweep)
+//        ./spsc_pipeline --bursty        (on/off bursty-arrival sweep)
+//        ./spsc_pipeline --proc-sweep    (sibling vs same-CCX placement across
+//                                          consumer processing weight)
 //        ./spsc_pipeline --test          (pure-logic self-check, no hardware)
 //        ./spsc_pipeline --blocking-probe (real futex round-trip + missed-
 //                                          wake stress test; no rdtsc/topology
@@ -282,6 +285,56 @@ struct PipeCfg {
   // out-of-scope committed code this file must not touch or depend on.
   static constexpr uint64_t INIT_SEED = 0xdeadbeefULL;
   static constexpr uint64_t MIX_CONST = 2654435761ull;
+
+  // --proc-sweep: processing-weight ladder, in process_msg_lanes rounds.
+  // Geometric x4 growth from 0 to 8192. At ~1.5ns/round on this box (see the
+  // calibrated-ns table --proc-sweep prints), this brackets {0, ~50, ~200,
+  // ~800, ~3000, ~12000} ns of per-message processing — comfortably spanning
+  // BOTH crossover bounds predicted by Finding 2: ~50ns (producer ran hot)
+  // and ~1.3us (producer stays polite under matched pacing). A ladder that
+  // stopped at the historical PROC_ROUNDS=24 (~tens of ns) would never reach
+  // the polite-producer regime and would falsely read "no crossover".
+  static constexpr int PROC_SWEEP_ROUNDS[] = {0, 32, 128, 512, 2048, 8192};
+
+  // Matched-pacing headroom multiplier (see proc_sweep_gap_ns): the
+  // producer's inter-arrival gap is this many times the calibrated
+  // per-message processing cost. 1.5x keeps the consumer at ~65%
+  // utilization (1/1.5), which does two things: keeps the queue near-empty
+  // so a message's latency reflects handoff+processing rather than
+  // Little's-law queueing delay, AND guarantees the producer's own
+  // bare-spin pacing tail lands strictly after the consumer has finished
+  // processing the PREVIOUS message — i.e. the producer stays a polite
+  // (non-hot) tenant on a shared sibling core, which is the regime Finding
+  // 2's ~1.3us crossover bound assumes.
+  static constexpr double PROC_SWEEP_HEADROOM = 1.5;
+
+  // Fixed ns folded into the matched-pacing gap on top of the calibrated
+  // processing time, covering handoff-detection + pop overhead that isn't
+  // part of process_msg_lanes itself (real, non-zero even at rounds=0, so
+  // the gap doesn't under-provision at the cheap end of the ladder and
+  // trigger spurious backpressure/queue buildup there).
+  static constexpr double PROC_SWEEP_HANDOFF_ALLOWANCE_NS = 150.0;
+
+  // Solo (single-thread, no contention) timed process_msg_lanes calls used
+  // to calibrate each proc-sweep level's real ns/call cost. 4096 gives a
+  // stable median without materially lengthening the sweep.
+  static constexpr int PROC_SWEEP_CALIB_ITERS = 4096;
+
+  // --proc-sweep validity-gate floor for waited-fraction (share of sampled
+  // messages whose first front() poll found the queue empty). Deliberately
+  // lower than the even sweep's WAITED_FRACTION_MIN=0.99: the reported
+  // statistic is the p50, which is arithmetically immune to <50%
+  // contamination, so a 0.90 floor (<=10% one-sided non-waited samples)
+  // keeps the reported median within the clean distribution's ~p44-p56 band
+  // (and in practice the decision cells run 0.97+, ~p51). It differs from
+  // 0.99 because proc-sweep's
+  // matched pacing runs ~300ns gaps, where 0.99 demands near-perfect OS
+  // isolation across 120k messages (i.e. it tests isolation, not
+  // saturation) rather than 5000-20000ns even-sweep gaps where 0.99 is a
+  // meaningful saturation signal. 0.90 still rejects genuinely contaminated
+  // cells (e.g. cross-CCX low-rounds rows run 0.26-0.67 waited-fraction with
+  // sojourn-inflated medians).
+  static constexpr double PROC_SWEEP_WAITED_FRACTION_MIN = 0.90;
 };
 
 // ===========================================================================
@@ -559,6 +612,14 @@ struct PassMetrics {
   uint64_t cold_nonhead = 0;
   uint64_t warm_head = 0;
   uint64_t warm_nonhead = 0;
+
+  // --proc-sweep only: in-situ TSC cycles spent inside the processing call
+  // itself (process_msg_lanes), per sampled message. Populated ONLY when
+  // run_pass's sweep_proc_rounds >= 0 — left empty (zero cost, zero
+  // behaviour change) for the default/--bursty/--blocking-probe paths. This
+  // splits the end-to-end latency delta between two placements into
+  // Δhandoff vs Δprocessing directly, rather than inferring it indirectly.
+  std::vector<uint32_t> proc_cycles;
 };
 
 // wait_for_message<P>: the consumer's per-message wait, specialized per
@@ -686,6 +747,45 @@ static inline uint64_t process_msg(const Msg &m) {
   return acc;
 }
 
+// ---------------------------------------------------------------------------
+// process_msg_lanes (--proc-sweep, Finding 1): a PORT-BOUND processing
+// kernel, deliberately distinct from process_msg above. process_msg's single
+// dependent accumulator chain (each round's multiply-add depends on the
+// previous round's result) is LATENCY-bound: the core is mostly waiting on
+// the multiply's own pipeline latency, not contending for execution ports,
+// so it's nearly immune to a noisy SMT sibling stealing port cycles —
+// sweeping process_msg's round count would falsely show no sibling-vs-
+// same-CCX crossover, because the thing being contended for (ports) is never
+// the bottleneck.
+//
+// process_msg_lanes instead runs SIX INDEPENDENT accumulator lanes, one per
+// payload word, with no cross-lane dependency: a superscalar core can issue
+// several lanes' multiply-adds in the same cycle, so throughput is bounded
+// by *port availability*, not by any single dependency chain's latency. That
+// makes it sensitive to a port-hungry SMT sibling in exactly the way
+// process_msg is not — which is the whole point of sweeping it instead.
+//
+// rounds=0 still depends on every payload word (each lane is seeded from its
+// own word before the round loop even runs), so it's non-degenerate and
+// distinguishable from rounds>=1 by construction, not by accident.
+// ---------------------------------------------------------------------------
+static inline uint64_t process_msg_lanes(const Msg &m, uint32_t rounds) {
+  uint64_t lane[6];
+  for (int k = 0; k < 6; k++)
+    lane[k] = m.payload[k] ^ PipeCfg::INIT_SEED;
+  for (uint32_t round = 0; round < rounds; round++) {
+    for (int k = 0; k < 6; k++)
+      lane[k] =
+          lane[k] * PipeCfg::MIX_CONST + m.payload[k]; // no cross-lane dep
+  }
+  // Fold all six lanes into one return value, same elision-guard discipline
+  // as process_msg (the caller feeds this into g_process_sink).
+  uint64_t acc = 0;
+  for (int k = 0; k < 6; k++)
+    acc += lane[k];
+  return acc;
+}
+
 // Fatal (not logged-and-continue) on a sequence gap: a gap means a message
 // was lost, duplicated, or reordered, which would silently invalidate every
 // latency sample in the pass. Same "invalid measurement is worse than no
@@ -770,6 +870,104 @@ static inline bool pace_until(uint64_t deadline_tsc) {
   return late_on_entry;
 }
 
+// A SweepCell is one (burst_len, intra_gap_ns, idle_gap_ns) row fed through
+// run_pass/print_pass; see the WP5/WP-C comment above even_sweep_cells below
+// for how the even sweep, --bursty, and --proc-sweep all share this shape.
+// Defined here (rather than down by even_sweep_cells) so proc_sweep_cells,
+// below, can build them too.
+struct SweepCell {
+  uint64_t burst_len;
+  uint64_t intra_gap_ns;
+  uint64_t idle_gap_ns; // also the value printed as "gap="/"idle-gap="
+};
+
+// ===========================================================================
+// --proc-sweep pure helpers (WP1): matched-pacing gap arithmetic, the
+// SweepCell builder, and the crossover finder. All pure functions of their
+// arguments — no hardware, no threads, no rdtsc — so they're exercised by
+// run_self_tests() directly, hardware-free and CI-safe.
+// ===========================================================================
+
+// The matched-pacing gap for a proc-sweep level whose calibrated per-message
+// processing cost is `proc_ns`. See PipeCfg::PROC_SWEEP_HEADROOM and
+// PROC_SWEEP_HANDOFF_ALLOWANCE_NS for the rationale; this function is just
+// the formula, kept separate and pure so it's independently testable
+// (monotonicity, exactness at proc_ns=0) without running a real pass.
+static inline double proc_sweep_gap_ns(double proc_ns) {
+  return PipeCfg::PROC_SWEEP_HEADROOM *
+         (proc_ns + PipeCfg::PROC_SWEEP_HANDOFF_ALLOWANCE_NS);
+}
+
+// Builds one SweepCell per calibrated-ns entry, via proc_sweep_gap_ns.
+// burst_len=1 and intra_gap_ns==idle_gap_ns==gap for every cell — the
+// proc-sweep is an even schedule at a level-specific gap, not a bursty one
+// (see sched_deadline's burst_len=1 equivalence case). The gap is rounded to
+// the nearest ns (SweepCell/run_pass both take integer ns).
+static std::vector<SweepCell>
+proc_sweep_cells(const std::vector<double> &calibrated_proc_ns) {
+  std::vector<SweepCell> cells;
+  cells.reserve(calibrated_proc_ns.size());
+  for (double proc_ns : calibrated_proc_ns) {
+    uint64_t gap = uint64_t(std::lround(proc_sweep_gap_ns(proc_ns)));
+    cells.push_back(
+        {/*burst_len=*/1, /*intra_gap_ns=*/gap, /*idle_gap_ns=*/gap});
+  }
+  return cells;
+}
+
+// find_crossover: pure bracket search over (proc_ns, delta_ns) points,
+// SORTED ascending by proc_ns, where delta_ns = sibling_p50 - sameccx_p50 at
+// that processing level. Cases:
+//   * fewer than 2 points -> not found (nothing to bracket).
+//   * any point with delta exactly 0 -> that point IS the crossover
+//     (bracket collapses to itself, interpolated_proc_ns = that point's
+//     proc_ns).
+//   * the first adjacent pair with delta going negative -> positive (sibling
+//     faster, then same-CCX faster) -> bracketed, linearly interpolated for
+//     delta=0 between them.
+//   * no such pair (all-negative, all-positive, or any other non-crossing
+//     shape) -> not found; the caller reports "no crossover in range" with
+//     whichever side won throughout.
+// ---------------------------------------------------------------------------
+struct CrossoverResult {
+  bool found = false;
+  double lo_proc_ns = 0, lo_delta = 0;
+  double hi_proc_ns = 0, hi_delta = 0;
+  double interpolated_proc_ns = 0;
+};
+
+static CrossoverResult
+find_crossover(const std::vector<std::pair<double, double>> &points) {
+  CrossoverResult r;
+  if (points.size() < 2)
+    return r;
+
+  for (const auto &p : points) {
+    if (p.second == 0.0) {
+      r.found = true;
+      r.lo_proc_ns = r.hi_proc_ns = r.interpolated_proc_ns = p.first;
+      r.lo_delta = r.hi_delta = 0.0;
+      return r;
+    }
+  }
+
+  for (size_t i = 0; i + 1 < points.size(); i++) {
+    double d0 = points[i].second, d1 = points[i + 1].second;
+    if (d0 < 0.0 && d1 > 0.0) {
+      r.found = true;
+      r.lo_proc_ns = points[i].first;
+      r.lo_delta = d0;
+      r.hi_proc_ns = points[i + 1].first;
+      r.hi_delta = d1;
+      double frac = -d0 / (d1 - d0); // where between lo and hi delta hits 0
+      r.interpolated_proc_ns =
+          r.lo_proc_ns + frac * (r.hi_proc_ns - r.lo_proc_ns);
+      return r;
+    }
+  }
+  return r; // no negative->positive crossing found
+}
+
 // ===========================================================================
 // Topology / placement (D5): partner selection copied from
 // smt_pingpong.cpp's auto-mode pair discovery (~lines 267-297) — same
@@ -847,11 +1045,21 @@ static inline bool should_skip(WaitPolicy policy, bool is_sibling_tier) {
 // idle to get the historical single-gap sweep. WP-C's bursty sweep passes a
 // real burst_len with intra_gap_ns=PipeCfg::BURST_INTRA_GAP_NS and
 // idle_gap_ns=PipeCfg::BURST_IDLE_GAP_NS instead.
+//
+// `sweep_proc_rounds` (--proc-sweep, the ONLY change to this function's
+// behaviour): -1 (the default) means "legacy path" — the consumer calls
+// process_msg exactly as before, metrics.proc_cycles stays empty, and
+// nothing about the default/--bursty/--blocking-probe output changes.
+// >=0 means "use process_msg_lanes with this many rounds instead" and
+// additionally records each sampled message's in-situ processing cycles
+// into metrics.proc_cycles. Every existing caller (even_sweep_cells,
+// bursty_sweep_cells paths) relies on the default and is therefore
+// byte-identical before and after this parameter's addition.
 template <WaitPolicy P>
-static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
-                            uint64_t intra_gap_ns, uint64_t idle_gap_ns,
-                            const std::vector<Msg> &ring,
-                            uint64_t burst_len = 1) {
+static PassMetrics
+run_pass(int consumer_cpu, int producer_cpu, uint64_t intra_gap_ns,
+         uint64_t idle_gap_ns, const std::vector<Msg> &ring,
+         uint64_t burst_len = 1, int sweep_proc_rounds = -1) {
   Queue q(PipeCfg::QUEUE_CAPACITY);
   ParkWord pw;
   const uint64_t total_msgs = PipeCfg::WARM_MSGS + PipeCfg::SAMPLE_MSGS;
@@ -861,6 +1069,8 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
   metrics.inter_arrival_cycles.reserve(PipeCfg::SAMPLE_MSGS);
   metrics.cold_latency_cycles.reserve(PipeCfg::SAMPLE_MSGS);
   metrics.warm_latency_cycles.reserve(PipeCfg::SAMPLE_MSGS);
+  if (sweep_proc_rounds >= 0)
+    metrics.proc_cycles.reserve(PipeCfg::SAMPLE_MSGS);
 
   std::atomic<bool> consumer_ready{false};
 
@@ -903,7 +1113,24 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
       check_seq(expected_seq, m->seq);
       expected_seq++;
 
-      uint64_t sink = process_msg(*m);
+      // --proc-sweep in-situ timing: an rdtsc pair bracketing ONLY the
+      // processing call itself, taken exclusively when sweep_proc_rounds>=0
+      // (the legacy path below skips both extra rdtsc_now() calls entirely,
+      // so default/--bursty/--blocking-probe timing is unaffected). This
+      // splits Δend-to-end directly into Δhandoff (everything before
+      // proc_t0) vs Δprocessing (proc_t1 - proc_t0) for a placement
+      // comparison — the constant per-message observer tax of the extra
+      // rdtsc pair is itself placement-independent, so it cancels out of
+      // any delta between tiers.
+      uint64_t proc_t0 = 0;
+      if (sweep_proc_rounds >= 0)
+        proc_t0 = rdtsc_now();
+      uint64_t sink = sweep_proc_rounds >= 0
+                          ? process_msg_lanes(*m, uint32_t(sweep_proc_rounds))
+                          : process_msg(*m);
+      uint64_t proc_t1 = 0;
+      if (sweep_proc_rounds >= 0)
+        proc_t1 = rdtsc_now();
       uint64_t t_done = rdtsc_now();
       uint64_t pub_tsc = m->pub_tsc;
 
@@ -911,6 +1138,8 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
         metrics.sampled_count++;
         uint32_t sample_latency = uint32_t(t_done - pub_tsc);
         metrics.latency_cycles.push_back(sample_latency);
+        if (sweep_proc_rounds >= 0)
+          metrics.proc_cycles.push_back(uint32_t(proc_t1 - proc_t0));
         if (had_to_wait)
           metrics.waited_count++;
         if constexpr (P == WaitPolicy::Blocking) {
@@ -1012,6 +1241,41 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu,
   // comment and the README's MUST-FIX 1 note for why the window has to
   // match n_bursts's SAMPLE_MSGS-only denominator.
   return metrics;
+}
+
+// ---------------------------------------------------------------------------
+// calibrate_proc_level_ns (--proc-sweep): the real x-axis value for one
+// proc-sweep level. Runs SOLO (no producer thread, no queue, no contention)
+// on the pinned consumer CPU: PROC_SWEEP_CALIB_ITERS timed process_msg_lanes
+// calls over the source ring, median (via pct(...,50), consistent with every
+// other percentile this file reports). This is deliberately NOT the same as
+// the in-situ proc_cycles collected during a real pass (those run under
+// producer/sibling contention, which is exactly the effect --proc-sweep is
+// trying to measure) — this calibration number is the CONTENTION-FREE
+// baseline used only to size the matched-pacing gap (proc_sweep_gap_ns), so
+// the gap doesn't itself depend on whatever contention the sweep is about to
+// go measure.
+// ---------------------------------------------------------------------------
+static double calibrate_proc_level_ns(int consumer_cpu, uint32_t rounds,
+                                      const std::vector<Msg> &ring) {
+  if (!pin(consumer_cpu)) {
+    fprintf(stderr, "fatal: pin cpu%d failed (--proc-sweep calibration)\n",
+            consumer_cpu);
+    exit(1);
+  }
+  std::vector<uint32_t> samples;
+  samples.reserve(PipeCfg::PROC_SWEEP_CALIB_ITERS);
+  uint64_t sink = 0; // elision guard, folded into g_process_sink below
+  for (int i = 0; i < PipeCfg::PROC_SWEEP_CALIB_ITERS; i++) {
+    const Msg &m = ring[i % PipeCfg::SOURCE_RING_ELEMS];
+    uint64_t t0 = rdtsc_now();
+    sink += process_msg_lanes(m, rounds);
+    uint64_t t1 = rdtsc_now();
+    samples.push_back(uint32_t(t1 - t0));
+  }
+  g_process_sink.fetch_add(sink, std::memory_order_relaxed);
+  std::sort(samples.begin(), samples.end());
+  return pct(samples, 50);
 }
 
 // wakes_per_burst: pure helper for the Blocking amortization headline
@@ -1345,6 +1609,12 @@ static void run() {
 
 } // namespace test_futex_logic
 
+// Forward declaration: proc_sweep_cell_valid is defined alongside the rest
+// of the --proc-sweep machinery (below), but its validity-gate logic is
+// pure and self-contained enough to unit-test directly from
+// run_self_tests() here. PassMetrics itself is already fully defined above.
+static bool proc_sweep_cell_valid(const PassMetrics &m);
+
 // ===========================================================================
 // WP3/WP4 pure-logic self-tests.
 // ===========================================================================
@@ -1400,6 +1670,211 @@ static void run_self_tests() {
     if (r3 == r1) {
       fprintf(stderr, "FAIL process_msg: result independent of payload\n");
       exit(1);
+    }
+  }
+
+  // process_msg_lanes (--proc-sweep, Finding 1): deterministic; depends on
+  // EACH of the 6 payload words individually (not just some of them, which
+  // would indicate a lane wired to the wrong word); rounds=0 != rounds=1;
+  // different round counts give different results.
+  {
+    Msg m{};
+    m.seq = 5;
+    for (int k = 0; k < 6; k++)
+      m.payload[k] = uint64_t(k + 1) * 999331;
+
+    uint64_t r1 = process_msg_lanes(m, 3);
+    uint64_t r2 = process_msg_lanes(m, 3);
+    if (r1 != r2) {
+      fprintf(stderr, "FAIL process_msg_lanes: not deterministic\n");
+      exit(1);
+    }
+
+    for (int k = 0; k < 6; k++) {
+      Msg mk = m;
+      mk.payload[k] += 1;
+      uint64_t rk = process_msg_lanes(mk, 3);
+      if (rk == r1) {
+        fprintf(stderr,
+                "FAIL process_msg_lanes: result independent of payload[%d]\n",
+                k);
+        exit(1);
+      }
+    }
+
+    uint64_t r_rounds0 = process_msg_lanes(m, 0);
+    uint64_t r_rounds1 = process_msg_lanes(m, 1);
+    uint64_t r_rounds2 = process_msg_lanes(m, 2);
+    if (r_rounds0 == r_rounds1 || r_rounds1 == r_rounds2 ||
+        r_rounds0 == r_rounds2) {
+      fprintf(stderr,
+              "FAIL process_msg_lanes: rounds=0/1/2 must all differ (got "
+              "%llu, %llu, %llu)\n",
+              (unsigned long long)r_rounds0, (unsigned long long)r_rounds1,
+              (unsigned long long)r_rounds2);
+      exit(1);
+    }
+  }
+
+  // proc_sweep_gap_ns (--proc-sweep, WP1): exact formula at known inputs,
+  // and monotonic non-decreasing in proc_ns.
+  {
+    // proc_ns=0 -> HEADROOM * HANDOFF_ALLOWANCE_NS exactly.
+    double want0 =
+        PipeCfg::PROC_SWEEP_HEADROOM * PipeCfg::PROC_SWEEP_HANDOFF_ALLOWANCE_NS;
+    if (proc_sweep_gap_ns(0.0) != want0) {
+      fprintf(stderr, "FAIL proc_sweep_gap_ns(0): got %.4f want %.4f\n",
+              proc_sweep_gap_ns(0.0), want0);
+      exit(1);
+    }
+    // proc_ns=1000 -> exact formula.
+    double want1000 = PipeCfg::PROC_SWEEP_HEADROOM *
+                      (1000.0 + PipeCfg::PROC_SWEEP_HANDOFF_ALLOWANCE_NS);
+    if (proc_sweep_gap_ns(1000.0) != want1000) {
+      fprintf(stderr, "FAIL proc_sweep_gap_ns(1000): got %.4f want %.4f\n",
+              proc_sweep_gap_ns(1000.0), want1000);
+      exit(1);
+    }
+    // Monotonic non-decreasing across the real ladder's expected ns range.
+    double prev = proc_sweep_gap_ns(0.0);
+    double sample_ns[] = {10, 50, 200, 800, 3000, 12000};
+    for (double ns : sample_ns) {
+      double g = proc_sweep_gap_ns(ns);
+      if (g < prev) {
+        fprintf(stderr,
+                "FAIL proc_sweep_gap_ns: not monotonic at ns=%.1f (got %.1f "
+                "< prev %.1f)\n",
+                ns, g, prev);
+        exit(1);
+      }
+      prev = g;
+    }
+  }
+
+  // proc_sweep_cells (--proc-sweep, WP1): each cell has burst_len=1 and
+  // intra_gap_ns==idle_gap_ns==round(proc_sweep_gap_ns(calibrated_ns)).
+  {
+    std::vector<double> calibrated = {0.0, 50.0, 1300.0};
+    std::vector<SweepCell> cells = proc_sweep_cells(calibrated);
+    if (cells.size() != calibrated.size()) {
+      fprintf(stderr, "FAIL proc_sweep_cells: wrong cell count\n");
+      exit(1);
+    }
+    for (size_t i = 0; i < cells.size(); i++) {
+      uint64_t want = uint64_t(std::lround(proc_sweep_gap_ns(calibrated[i])));
+      if (cells[i].burst_len != 1 || cells[i].intra_gap_ns != want ||
+          cells[i].idle_gap_ns != want) {
+        fprintf(stderr,
+                "FAIL proc_sweep_cells at i=%zu: burst_len=%llu "
+                "intra=%llu idle=%llu want gap=%llu\n",
+                i, (unsigned long long)cells[i].burst_len,
+                (unsigned long long)cells[i].intra_gap_ns,
+                (unsigned long long)cells[i].idle_gap_ns,
+                (unsigned long long)want);
+        exit(1);
+      }
+    }
+  }
+
+  // proc_sweep_cell_valid (--proc-sweep validity gate): backpressure!=0
+  // invalidates regardless of waited-fraction; waited-fraction just below
+  // PROC_SWEEP_WAITED_FRACTION_MIN is invalid, just above (with
+  // backpressure==0) is valid.
+  {
+    const double eps = 0.001;
+
+    // backpressure!=0 -> invalid even with a perfect waited-fraction.
+    {
+      PassMetrics m;
+      m.sampled_count = 1000;
+      m.waited_count = 1000; // waited_fraction == 1.0
+      m.backpressure_count = 1;
+      if (proc_sweep_cell_valid(m)) {
+        fprintf(stderr, "FAIL proc_sweep_cell_valid: backpressure!=0 must be "
+                        "invalid regardless of waited-fraction\n");
+        exit(1);
+      }
+    }
+
+    // waited-fraction just below the floor, backpressure==0 -> invalid.
+    {
+      PassMetrics m;
+      m.sampled_count = 1000;
+      m.waited_count =
+          uint64_t((PipeCfg::PROC_SWEEP_WAITED_FRACTION_MIN - eps) * 1000.0);
+      m.backpressure_count = 0;
+      if (proc_sweep_cell_valid(m)) {
+        fprintf(stderr,
+                "FAIL proc_sweep_cell_valid: waited-fraction just below "
+                "PROC_SWEEP_WAITED_FRACTION_MIN must be invalid\n");
+        exit(1);
+      }
+    }
+
+    // waited-fraction just above the floor, backpressure==0 -> valid.
+    {
+      PassMetrics m;
+      m.sampled_count = 1000;
+      m.waited_count =
+          uint64_t((PipeCfg::PROC_SWEEP_WAITED_FRACTION_MIN + eps) * 1000.0);
+      m.backpressure_count = 0;
+      if (!proc_sweep_cell_valid(m)) {
+        fprintf(stderr,
+                "FAIL proc_sweep_cell_valid: waited-fraction just above "
+                "PROC_SWEEP_WAITED_FRACTION_MIN (backpressure==0) must be "
+                "valid\n");
+        exit(1);
+      }
+    }
+  }
+
+  // find_crossover (--proc-sweep, WP1): the four required cases.
+  {
+    // <2 points -> not found.
+    if (find_crossover({}).found || find_crossover({{100.0, -5.0}}).found) {
+      fprintf(stderr, "FAIL find_crossover: <2 points must not be found\n");
+      exit(1);
+    }
+    // all-negative (sibling wins throughout) -> not found.
+    {
+      CrossoverResult r =
+          find_crossover({{0.0, -10.0}, {100.0, -5.0}, {1000.0, -1.0}});
+      if (r.found) {
+        fprintf(stderr,
+                "FAIL find_crossover: all-negative must not be found\n");
+        exit(1);
+      }
+    }
+    // clean neg->pos -> bracketed and linearly interpolated.
+    {
+      CrossoverResult r =
+          find_crossover({{0.0, -20.0}, {100.0, -10.0}, {200.0, 10.0}});
+      if (!r.found || r.lo_proc_ns != 100.0 || r.hi_proc_ns != 200.0) {
+        fprintf(stderr,
+                "FAIL find_crossover: neg->pos not bracketed correctly "
+                "(found=%d lo=%.1f hi=%.1f)\n",
+                r.found, r.lo_proc_ns, r.hi_proc_ns);
+        exit(1);
+      }
+      // delta goes -10 -> +10 linearly over [100,200] -> zero at 150.
+      if (std::fabs(r.interpolated_proc_ns - 150.0) > 1e-9) {
+        fprintf(stderr,
+                "FAIL find_crossover: interpolated_proc_ns=%.4f want 150.0\n",
+                r.interpolated_proc_ns);
+        exit(1);
+      }
+    }
+    // exact-zero at a sample point -> that point IS the crossover.
+    {
+      CrossoverResult r =
+          find_crossover({{0.0, -5.0}, {500.0, 0.0}, {1000.0, 5.0}});
+      if (!r.found || r.interpolated_proc_ns != 500.0) {
+        fprintf(stderr,
+                "FAIL find_crossover: exact-zero case not handled (found=%d "
+                "interp=%.4f)\n",
+                r.found, r.interpolated_proc_ns);
+        exit(1);
+      }
     }
   }
 
@@ -1844,16 +2319,13 @@ static int run_blocking_probe() {
 
 // ===========================================================================
 // WP5/WP-C: the full sweep — 3 tiers x 3 policies (minus skips) x N cells.
-// A SweepCell is one (burst_len, intra_gap_ns, idle_gap_ns) row; the default
-// even sweep and the --bursty sweep are just two different cell lists fed
+// SweepCell (moved up before the topology/proc-sweep helpers so --proc-sweep's
+// proc_sweep_cells can build them too) is one (burst_len, intra_gap_ns,
+// idle_gap_ns) row; the default even sweep, the --bursty sweep, and
+// --proc-sweep's matched-pacing sweep are all just different cell lists fed
 // through the same counter-diff/run_pass/print_pass scaffolding, rather than
-// duplicated loops — see even_sweep_cells/bursty_sweep_cells below.
+// duplicated loops — see even_sweep_cells/bursty_sweep_cells/proc_sweep_cells.
 // ===========================================================================
-struct SweepCell {
-  uint64_t burst_len;
-  uint64_t intra_gap_ns;
-  uint64_t idle_gap_ns; // also the value printed as "gap="/"idle-gap="
-};
 
 // The historical even sweep: one cell per PipeCfg::GAP_NS entry, burst_len=1
 // (every message is its own "burst" of length one — see sched_deadline's
@@ -1931,6 +2403,226 @@ static void run_policy_sweep(WaitPolicy policy, const char *tier_label,
   }
 }
 
+// ===========================================================================
+// --proc-sweep (WP3): measure whether SMT-sibling or same-CCX placement is
+// faster end-to-end vs. consumer per-message processing weight, and find
+// the crossover — see the file-scope comment's "The crux — matched pacing"
+// section and Findings 1/2 for the design this implements.
+// ===========================================================================
+
+// Per-(tier, level) result: the raw pass metrics plus the validity gate
+// verdict (backpressure_count==0 AND
+// waited_fraction>=PROC_SWEEP_WAITED_FRACTION_MIN — a proc-sweep-specific
+// threshold; see PipeCfg::PROC_SWEEP_WAITED_FRACTION_MIN for why it must
+// NOT reuse the even sweep's WAITED_FRACTION_MIN).
+struct ProcSweepCellResult {
+  int rounds;
+  double calibrated_proc_ns;
+  uint64_t gap_ns;
+  PassMetrics metrics;
+  bool valid;
+};
+
+static double proc_insitu_p50_ns(const PassMetrics &m) {
+  std::vector<uint32_t> pc = m.proc_cycles;
+  std::sort(pc.begin(), pc.end());
+  return pct(pc, 50);
+}
+
+static double waited_fraction_of(const PassMetrics &m) {
+  return m.sampled_count ? double(m.waited_count) / double(m.sampled_count)
+                         : 0.0;
+}
+
+static bool proc_sweep_cell_valid(const PassMetrics &m) {
+  return m.backpressure_count == 0 &&
+         waited_fraction_of(m) >= PipeCfg::PROC_SWEEP_WAITED_FRACTION_MIN;
+}
+
+static ProcSweepCellResult run_proc_sweep_cell(int rounds, double calibrated_ns,
+                                               uint64_t gap_ns,
+                                               int consumer_cpu,
+                                               int producer_cpu,
+                                               const std::vector<Msg> &ring) {
+  // Pause only (see the file-scope "Wait policy: Pause only" note): Blocking's
+  // µs-scale park/wake would swamp the ns-scale processing-weight signal this
+  // sweep is trying to isolate, and BareSpin is forbidden on the sibling tier
+  // for the same port-starvation reason should_skip already encodes for the
+  // even/bursty sweeps.
+  PassMetrics m = run_pass<WaitPolicy::Pause>(consumer_cpu, producer_cpu,
+                                              gap_ns, gap_ns, ring,
+                                              /*burst_len=*/1, rounds);
+  return {rounds, calibrated_ns, gap_ns, std::move(m),
+          proc_sweep_cell_valid(m)};
+}
+
+static void print_proc_sweep_cell(const ProcSweepCellResult &r) {
+  std::vector<uint32_t> lat = r.metrics.latency_cycles;
+  std::sort(lat.begin(), lat.end());
+  std::vector<uint32_t> ia = r.metrics.inter_arrival_cycles;
+  std::sort(ia.begin(), ia.end());
+  printf("  rounds=%-6d calib=%8.1fns gap=%7lluns  e2e p50 %9.1f  p99 "
+         "%9.1f  proc-insitu p50 %8.1f  waited-frac %.4f  backpressure "
+         "%llu  achieved-ia p50 %8.1f%s\n",
+         r.rounds, r.calibrated_proc_ns, (unsigned long long)r.gap_ns,
+         pct(lat, 50), pct(lat, 99), proc_insitu_p50_ns(r.metrics),
+         waited_fraction_of(r.metrics),
+         (unsigned long long)r.metrics.backpressure_count, pct(ia, 50),
+         r.valid ? "" : "  INVALID (wait-path contaminated)");
+}
+
+static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring) {
+  // Fail-fast: both a sibling and a same-CCX peer are required, or the
+  // headline question ("where does sibling vs same-CCX cross over?") has
+  // nothing to compare and is unanswerable on this box.
+  if (topo.sibling < 0 || topo.same_l3 < 0) {
+    fprintf(stderr,
+            "fatal: --proc-sweep requires BOTH an SMT-sibling AND a "
+            "same-CCX peer of cpu%d to be present; missing: %s%s%s"
+            "the question \"where does sibling-vs-same-CCX placement cross "
+            "over as processing weight grows?\" has nothing to compare "
+            "against without both tiers, so it is unanswerable on this "
+            "box.\n",
+            topo.base, topo.sibling < 0 ? "sibling " : "",
+            topo.same_l3 < 0 ? "same-CCX " : "",
+            (topo.sibling < 0) == (topo.same_l3 < 0) ? "" : "");
+    exit(1);
+  }
+
+  const size_t n_levels = std::size(PipeCfg::PROC_SWEEP_ROUNDS);
+
+  printf("=== --proc-sweep: crossover between processing weight and "
+         "placement ===\n\n");
+  // Both predicted bounds (Finding 2): ~50ns is where the crossover would
+  // sit if the producer ran hot (unpaced, ~81% sibling-contention tax, same
+  // regime sibling_noise.cpp measures: crossover ~= 40ns/0.81); ~1.3us is
+  // where it sits if the producer stays polite under this sweep's matched
+  // pacing (PAUSE-waiting through the consumer's processing window costs
+  // only ~3%, so crossover ~= 40ns/0.03). This sweep's ladder (see
+  // PipeCfg::PROC_SWEEP_ROUNDS) brackets both.
+  printf("prediction: crossover between ~50ns (producer ran HOT: ~81%% "
+         "sibling-contention tax, crossover ~= 40ns/0.81) and ~1.3us "
+         "(producer stays POLITE under this sweep's matched pacing: ~3%% "
+         "tax, crossover ~= 40ns/0.03). See the README's \"SPSC pipeline\" "
+         "section for the derivation.\n\n");
+
+  // Calibration: solo, contention-free, on the pinned consumer CPU.
+  printf("rounds -> calibrated processing ns (solo, on cpu%d):\n", topo.base);
+  std::vector<double> calibrated;
+  calibrated.reserve(n_levels);
+  for (int rounds : PipeCfg::PROC_SWEEP_ROUNDS) {
+    double ns = calibrate_proc_level_ns(topo.base, uint32_t(rounds), ring);
+    calibrated.push_back(ns);
+    printf("  rounds=%-6d  %9.1f ns\n", rounds, ns);
+  }
+  printf("\n");
+
+  const std::vector<SweepCell> cells = proc_sweep_cells(calibrated);
+
+  struct TierRun {
+    const char *label;
+    int producer_cpu;
+  };
+  std::vector<TierRun> tiers = {{"SMT sibling", topo.sibling},
+                                {"same L3/CCX", topo.same_l3}};
+  // Cross-CCX is a 3rd REFERENCE line only (not part of the crossover
+  // computation below), and only if this box actually has one.
+  if (topo.other_l3 >= 0)
+    tiers.push_back({"cross CCX", topo.other_l3});
+
+  std::vector<std::vector<ProcSweepCellResult>> results; // [tier][level]
+  for (const TierRun &tier : tiers) {
+    printf("=== tier: %s (cpu%d <-> cpu%d), WaitPolicy::Pause ===\n",
+           tier.label, topo.base, tier.producer_cpu);
+    std::vector<ProcSweepCellResult> tier_results;
+    tier_results.reserve(n_levels);
+    for (size_t i = 0; i < n_levels; i++) {
+      ProcSweepCellResult r = run_proc_sweep_cell(
+          PipeCfg::PROC_SWEEP_ROUNDS[i], calibrated[i], cells[i].idle_gap_ns,
+          topo.base, tier.producer_cpu, ring);
+      print_proc_sweep_cell(r);
+      tier_results.push_back(std::move(r));
+    }
+    results.push_back(std::move(tier_results));
+    printf("\n");
+  }
+
+  // SUMMARY: sibling vs same-CCX only (tiers[0]/tiers[1] by construction
+  // above; cross-CCX, if present, is tiers[2] and is a reference line only,
+  // not part of this comparison or the crossover search).
+  printf("SUMMARY (sibling vs same-CCX; delta_ns = sibling_p50 - "
+         "sameccx_p50; proc_insitu_ratio = sibling/sameccx in-situ "
+         "processing p50):\n");
+  printf("  %-8s %14s %14s %12s %12s\n", "rounds", "sibling_p50", "sameccx_p50",
+         "delta_ns", "proc_ratio");
+  std::vector<std::pair<double, double>> crossover_points; // (proc_ns, delta)
+  bool any_invalid = false;
+  for (size_t i = 0; i < n_levels; i++) {
+    const ProcSweepCellResult &sib = results[0][i];
+    const ProcSweepCellResult &sc = results[1][i];
+
+    std::vector<uint32_t> sib_lat = sib.metrics.latency_cycles;
+    std::sort(sib_lat.begin(), sib_lat.end());
+    std::vector<uint32_t> sc_lat = sc.metrics.latency_cycles;
+    std::sort(sc_lat.begin(), sc_lat.end());
+    double sib_p50 = pct(sib_lat, 50), sc_p50 = pct(sc_lat, 50);
+    double delta = sib_p50 - sc_p50;
+
+    double sib_proc = proc_insitu_p50_ns(sib.metrics);
+    double sc_proc = proc_insitu_p50_ns(sc.metrics);
+    double ratio = sc_proc != 0.0 ? sib_proc / sc_proc : 0.0;
+
+    bool row_valid = sib.valid && sc.valid;
+    printf("  rounds=%-6d %14.1f %14.1f %12.1f %12.4f%s\n", sib.rounds, sib_p50,
+           sc_p50, delta, ratio, row_valid ? "" : "  (excluded: INVALID)");
+    if (row_valid)
+      crossover_points.push_back({sib.calibrated_proc_ns, delta});
+    else
+      any_invalid = true;
+  }
+
+  if (any_invalid)
+    printf("\nnote: at least one rounds level had an INVALID (wait-path "
+           "contaminated) cell in sibling or same-CCX and was excluded from "
+           "the crossover computation below.\n");
+
+  if (crossover_points.size() < 2) {
+    printf("\ncrossover: not determinable — fewer than 2 valid (rounds, "
+           "delta) points to bracket a sign change.\n");
+  } else {
+    CrossoverResult cr = find_crossover(crossover_points);
+    if (cr.found) {
+      printf("\ncrossover: bracketed between proc_ns=%.1f (delta=%.1f) and "
+             "proc_ns=%.1f (delta=%.1f); linear-interpolated crossover at "
+             "proc_ns ~= %.1f\n",
+             cr.lo_proc_ns, cr.lo_delta, cr.hi_proc_ns, cr.hi_delta,
+             cr.interpolated_proc_ns);
+    } else {
+      bool all_neg = std::all_of(
+          crossover_points.begin(), crossover_points.end(),
+          [](const std::pair<double, double> &p) { return p.second < 0.0; });
+      bool all_pos = std::all_of(
+          crossover_points.begin(), crossover_points.end(),
+          [](const std::pair<double, double> &p) { return p.second > 0.0; });
+      const char *who = all_neg   ? "sibling"
+                        : all_pos ? "same-CCX"
+                                  : "neither consistently";
+      printf("\ncrossover: none found through proc_ns up to %.1f — %s wins "
+             "throughout the measured range (no sign change in delta_ns).\n",
+             crossover_points.back().first, who);
+    }
+  }
+
+  printf("\nSCOPE NOTE: the message source here is emulated in-memory by "
+         "design (build_source_ring + rigtorp::SPSCQueue) so this sweep "
+         "isolates placement and processing weight from I/O — a real socket's "
+         "microsecond-scale recv() would dominate end-to-end latency and put "
+         "this question in a different regime entirely; this result answers "
+         "\"given a message is already in hand, does placement or processing "
+         "weight decide who's faster\", not \"is this fast enough for a real "
+         "feed\".\n");
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--test") == 0) {
     run_self_tests();
@@ -1940,10 +2632,15 @@ int main(int argc, char **argv) {
     return run_blocking_probe();
   }
   bool bursty = false;
+  bool proc_sweep = false;
   if (argc == 2 && std::strcmp(argv[1], "--bursty") == 0) {
     bursty = true;
+  } else if (argc == 2 && std::strcmp(argv[1], "--proc-sweep") == 0) {
+    proc_sweep = true;
   } else if (argc != 1) {
-    fprintf(stderr, "usage: %s [--test | --blocking-probe | --bursty]\n",
+    fprintf(stderr,
+            "usage: %s [--test | --blocking-probe | --bursty | "
+            "--proc-sweep]\n",
             argv[0]);
     return 1;
   }
@@ -1957,6 +2654,11 @@ int main(int argc, char **argv) {
          topo.base, topo.sibling, topo.same_l3, topo.other_l3);
 
   auto ring = build_source_ring();
+
+  if (proc_sweep) {
+    run_proc_sweep(topo, ring);
+    return 0;
+  }
 
   struct Tier {
     const char *label;
