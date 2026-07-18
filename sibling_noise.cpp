@@ -36,7 +36,9 @@
 //   throughput is expected to drop ~1.3-2x, and — unlike a latency-bound
 //   design — that shows cleanly in the MEDIAN, not just the tail.
 //
-//   TENANT (runs on cpu_sib), three states, each its own pass:
+//   TENANT (runs on cpu_tenant — cpu_sib, cpu_hot's SMT sibling, by default;
+//   or a same-CCX non-sibling core under --same-ccx, see below), three
+//   states, each its own pass:
 //     (a) idle — no tenant thread spawned at all.
 //     (b) hot  — a genuinely port-bound independent-ops loop (multiple
 //                independent chains, the same "many independent lanes"
@@ -64,21 +66,27 @@
 // robust signal here; tails remain OS-jitter-sensitive without core
 // isolation (same caveat as smt_pingpong.cpp).
 //
+// CONTROL MODE: --same-ccx pins the tenant to a same-CCX, DIFFERENT physical
+// core instead of cpu_hot's SMT sibling (shares L3 only, not ports/L1/L2/
+// store buffer). Everything else — victim workload, 3 tenant states,
+// interleaved repeats, reporting — is identical. Since the L1-resident,
+// port-bound victim never touches L3 traffic, the control's prediction is
+// idle ~= noop ~= hot: no shared on-core resource for the tenant to steal, so
+// clustering here (vs. the default run's idle~=noop<<hot) is what isolates
+// the sibling-mode slowdown to on-core contention rather than "a busy
+// neighbor somewhere on the chip."
+//
 // build: g++ -O3 -std=c++23 -pthread sibling_noise.cpp -o sibling_noise
-// run:   ./sibling_noise         (auto-selects cpu_hot / cpu_sib)
-//        ./sibling_noise --test  (pure-logic self-check, no timing hardware)
+// run:   ./sibling_noise             (auto-selects cpu_hot / SMT sibling)
+//        ./sibling_noise --same-ccx  (control: cpu_hot / same-CCX non-sibling)
+//        ./sibling_noise --test      (pure-logic self-check, no timing hw)
 // ============================================================================
 
-// pp_core.hpp declares l3_peers_of()/contains() (static, internal linkage)
-// for smt_pingpong.cpp's same-CCX peer selection. This experiment's design
-// no longer needs a same-CCX peer (no ping-pong, no responder — see header
-// comment above), so those two helpers go unused in this translation unit.
-// Silenced locally rather than touching pp_core.hpp, which is shared,
-// already-reviewed, and out of scope for this rewrite.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
+// pp_core.hpp declares l3_peers_of()/contains() (static, internal linkage),
+// used below to select the --same-ccx control's tenant CPU: the same "same
+// L3, not a sibling" selection smt_pingpong.cpp's auto mode uses for its
+// "same L3 / CCX" tier.
 #include "pp_core.hpp"
-#pragma GCC diagnostic pop
 
 // ---------------------------------------------------------------------------
 // Tuning knobs specific to this experiment. Kept together, same discipline as
@@ -180,6 +188,36 @@ static std::atomic<uint64_t> g_victim_sink{0};
 static std::atomic<uint64_t> g_tenant_sink{0};
 
 // ---------------------------------------------------------------------------
+// Tenant CPU placement, selected by --same-ccx. Factored into small pure
+// functions (rather than inlined in main()) so run_self_tests() can exercise
+// the selection logic directly, without /sys or process args.
+// ---------------------------------------------------------------------------
+
+// Default placement: the first CPU in `sibs` (cpu_hot's SMT-sibling list,
+// from siblings_of()) that isn't cpu_hot itself. Returns -1 if cpu_hot has no
+// distinct sibling (SMT off, or unreadable topology).
+static int choose_sibling_cpu(int cpu_hot, const std::vector<int> &sibs) {
+  for (int c : sibs)
+    if (c != cpu_hot)
+      return c;
+  return -1;
+}
+
+// --same-ccx placement: the first CPU that shares cpu_hot's L3 (`l3_peers`,
+// from l3_peers_of()) but is NOT one of cpu_hot's SMT siblings (`sibs`) — i.e.
+// same CCX, distinct physical core. This mirrors smt_pingpong.cpp auto mode's
+// "same L3 / CCX" tier selection (its `same_l3` loop) exactly, so both tools
+// agree on what "same-CCX, non-sibling" means. Returns -1 if no such CPU
+// exists (e.g. a single-core-per-CCX topology, or unreadable sysfs).
+static int choose_same_ccx_cpu(const std::vector<int> &l3_peers,
+                               const std::vector<int> &sibs) {
+  for (int c : l3_peers)
+    if (!contains(sibs, c))
+      return c;
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
 // One timed "chunk" of the victim's throughput-bound workload: CHUNK_PASSES
 // full passes over `buf`, each pass updating N_LANES independent
 // accumulators with no cross-lane or cross-iteration dependency. Factored
@@ -213,8 +251,8 @@ static inline void tenant_step(uint64_t *buf,
 }
 
 // "Bad tenant": genuinely port-bound independent-lanes loop pinned to
-// cpu_sib. Runs until `stop` is observed, then publishes its accumulators to
-// the sink so the compiler can't prove the whole loop is dead.
+// cpu_tenant. Runs until `stop` is observed, then publishes its accumulators
+// to the sink so the compiler can't prove the whole loop is dead.
 static void tenant_hot(int cpu, std::atomic<bool> &ready,
                        std::atomic<bool> &stop) {
   if (!pin(cpu)) {
@@ -239,8 +277,10 @@ static void tenant_hot(int cpu, std::atomic<bool> &ready,
   g_tenant_sink.store(sink, std::memory_order_relaxed);
 }
 
-// "Polite tenant": present on the sibling, but PAUSE yields the shared
-// execution ports back to the other hardware thread every iteration.
+// "Polite tenant": present on cpu_tenant, but PAUSE yields the shared
+// execution ports back to the other hardware thread every iteration (this
+// only matters under the default SMT-sibling placement — under --same-ccx
+// the two cores don't share ports at all, so PAUSE has nothing to yield).
 static void tenant_noop(int cpu, std::atomic<bool> &ready,
                         std::atomic<bool> &stop) {
   if (!pin(cpu)) {
@@ -256,7 +296,7 @@ enum class TenantMode { Idle, Noop, Hot };
 
 // ---------------------------------------------------------------------------
 // Run one pass of the victim (warm-up + SAMPLE_ITERS timed chunks, all on
-// cpu_hot) with the given tenant state live on cpu_sib for the whole pass.
+// cpu_hot) with the given tenant state live on cpu_tenant for the whole pass.
 // Appends this pass's samples (raw TSC-cycle deltas) to `out`.
 //
 // Tenant lifecycle: spawn, pin, signal ready; we wait for that ready before
@@ -264,7 +304,7 @@ enum class TenantMode { Idle, Noop, Hot };
 // BOTH the warm-up and the timed section. The tenant's `stop` flag is set,
 // and it is joined, only AFTER the victim's timed pass completes.
 // ---------------------------------------------------------------------------
-static void run_pass(TenantMode mode, int cpu_hot, int cpu_sib,
+static void run_pass(TenantMode mode, int cpu_hot, int cpu_tenant,
                      std::vector<uint32_t> &out) {
   std::atomic<bool> ready{false}, stop{false};
   std::thread tenant;
@@ -273,10 +313,10 @@ static void run_pass(TenantMode mode, int cpu_hot, int cpu_sib,
   if (has_tenant) {
     if (mode == TenantMode::Hot)
       tenant =
-          std::thread(tenant_hot, cpu_sib, std::ref(ready), std::ref(stop));
+          std::thread(tenant_hot, cpu_tenant, std::ref(ready), std::ref(stop));
     else
       tenant =
-          std::thread(tenant_noop, cpu_sib, std::ref(ready), std::ref(stop));
+          std::thread(tenant_noop, cpu_tenant, std::ref(ready), std::ref(stop));
     while (!ready.load(std::memory_order_acquire)) // wait: tenant in position
       _mm_pause();
   }
@@ -400,6 +440,39 @@ static int run_self_tests() {
     return 1;
   }
 
+  // choose_sibling_cpu: picks the first sibling that isn't cpu_hot itself,
+  // or -1 when the only "sibling" is cpu_hot (SMT off / degenerate list).
+  if (choose_sibling_cpu(0, {0, 4}) != 4) {
+    fprintf(stderr, "FAIL choose_sibling_cpu: expected 4\n");
+    return 1;
+  }
+  if (choose_sibling_cpu(0, {0}) != -1) {
+    fprintf(stderr, "FAIL choose_sibling_cpu: expected -1 (no sibling)\n");
+    return 1;
+  }
+  if (choose_sibling_cpu(0, {}) != -1) {
+    fprintf(stderr, "FAIL choose_sibling_cpu: expected -1 (empty list)\n");
+    return 1;
+  }
+
+  // choose_same_ccx_cpu: picks the first L3 peer that ISN'T also an SMT
+  // sibling (i.e. a distinct physical core sharing only L3), skipping
+  // siblings even if they appear first in the L3 peer list.
+  if (choose_same_ccx_cpu({0, 4, 1, 5}, {0, 4}) != 1) {
+    fprintf(stderr,
+            "FAIL choose_same_ccx_cpu: expected 1 (first non-sibling peer)\n");
+    return 1;
+  }
+  if (choose_same_ccx_cpu({0, 4}, {0, 4}) != -1) {
+    fprintf(stderr, "FAIL choose_same_ccx_cpu: expected -1 (every L3 peer is a "
+                    "sibling)\n");
+    return 1;
+  }
+  if (choose_same_ccx_cpu({}, {0, 4}) != -1) {
+    fprintf(stderr, "FAIL choose_same_ccx_cpu: expected -1 (no L3 peers)\n");
+    return 1;
+  }
+
   printf("all tests passed\n");
   return 0;
 }
@@ -407,8 +480,14 @@ static int run_self_tests() {
 int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--test") == 0)
     return run_self_tests();
-  if (argc != 1) {
-    fprintf(stderr, "usage: %s (no args; auto-selects cpus)\n", argv[0]);
+
+  // --same-ccx is the only other accepted flag: the control placement (see
+  // file header). No args at all keeps the exact default behavior.
+  bool same_ccx = false;
+  if (argc == 2 && std::strcmp(argv[1], "--same-ccx") == 0) {
+    same_ccx = true;
+  } else if (argc != 1) {
+    fprintf(stderr, "usage: %s [--same-ccx] (auto-selects cpus)\n", argv[0]);
     return 1;
   }
 
@@ -416,9 +495,9 @@ int main(int argc, char **argv) {
   calibrate();
   printf("TSC: %.4f GHz\n\n", g_tsc_ghz);
 
-  // Auto-select cpu_hot (first online CPU) and its SMT sibling. Unlike the
-  // retired design, no same-CCX peer is needed at all — there is no
-  // ping-pong and no responder.
+  // Auto-select cpu_hot (first online CPU). Unlike the retired design, no
+  // ping-pong / responder core is needed — only cpu_hot (victim) and
+  // cpu_tenant (chosen below, per placement mode) ever matter.
   auto cpus = online_cpus();
   if (cpus.empty()) {
     fprintf(stderr, "need >=1 online cpu\n");
@@ -427,37 +506,69 @@ int main(int argc, char **argv) {
   int cpu_hot = cpus[0];
   auto sibs = siblings_of(cpu_hot);
 
-  int cpu_sib = -1;
-  for (int c : sibs) // an SMT sibling that isn't cpu_hot itself
-    if (c != cpu_hot) {
-      cpu_sib = c;
-      break;
+  int cpu_tenant;
+  const char *placement_label;
+  if (!same_ccx) {
+    // Default placement: cpu_hot's SMT sibling — shares the physical core
+    // (ports, L1, L2, store buffer). Fail fast: this experiment measures
+    // sibling contention, so with SMT off (or a topology report claiming no
+    // sibling) there is no shared physical core to contend for, and the
+    // whole premise is void. This guard only gates the default mode — under
+    // --same-ccx a missing SMT sibling is irrelevant, since the tenant never
+    // uses it.
+    cpu_tenant = choose_sibling_cpu(cpu_hot, sibs);
+    if (cpu_tenant == -1) {
+      fprintf(stderr,
+              "fatal: cpu%d has no SMT sibling (is SMT disabled?) — this "
+              "experiment is meaningless without a sibling hardware thread "
+              "to host the tenant\n",
+              cpu_hot);
+      return 1;
     }
-
-  // Fail fast: this experiment measures sibling contention. With SMT off (or
-  // a topology report claiming no sibling), there is no shared physical core
-  // to contend for, so the whole premise is void.
-  if (cpu_sib == -1) {
-    fprintf(stderr,
-            "fatal: cpu%d has no SMT sibling (is SMT disabled?) — this "
-            "experiment is meaningless without a sibling hardware thread to "
-            "host the tenant\n",
-            cpu_hot);
-    return 1;
+    placement_label = "SMT sibling, shares core";
+  } else {
+    // Control placement: a same-CCX (same L3), DIFFERENT physical core — the
+    // same selection smt_pingpong.cpp auto mode uses for its "same L3 / CCX"
+    // tier. Fail fast if no such core exists (single-core-per-CCX topology,
+    // or unreadable sysfs): --same-ccx has nothing meaningful to measure
+    // without a distinct same-CCX core.
+    auto l3 = l3_peers_of(cpu_hot);
+    cpu_tenant = choose_same_ccx_cpu(l3, sibs);
+    if (cpu_tenant == -1) {
+      fprintf(stderr,
+              "fatal: cpu%d has no same-CCX non-sibling core available — "
+              "--same-ccx requires a distinct physical core sharing L3 with "
+              "cpu%d (is this a single-core-per-CCX topology, or is sysfs "
+              "unreadable?)\n",
+              cpu_hot, cpu_hot);
+      return 1;
+    }
+    placement_label = "same-CCX core, shares L3 only";
   }
 
-  printf("cpu pair: hot=cpu%d (victim)  sibling=cpu%d (tenant)\n", cpu_hot,
-         cpu_sib);
+  printf("victim: cpu%d (hot)\n", cpu_hot);
+  printf("tenant: cpu%d (%s)\n", cpu_tenant, placement_label);
   printf("R=%d repeats, %llu samples/pass, %llu warm-up chunks/pass\n\n",
          NoiseCfg::R, (unsigned long long)NoiseCfg::SAMPLE_ITERS,
          (unsigned long long)NoiseCfg::WARM_ITERS);
 
-  printf("PREDICTION: in the MEDIAN, idle ~= noop << hot — a busy sibling "
-         "steals issue ports (~1.3-2x slowdown expected); a polite pause "
-         "sibling yields ports so it should look ~= idle; mere tenant "
-         "presence adds only minor static-partition overhead. The median is "
-         "the robust signal; tails remain OS-jitter-sensitive without core "
-         "isolation.\n\n");
+  if (!same_ccx) {
+    printf("PREDICTION: in the MEDIAN, idle ~= noop << hot — a busy sibling "
+           "steals issue ports (~1.3-2x slowdown expected); a polite pause "
+           "sibling yields ports so it should look ~= idle; mere tenant "
+           "presence adds only minor static-partition overhead. The median "
+           "is the robust signal; tails remain OS-jitter-sensitive without "
+           "core isolation.\n\n");
+  } else {
+    printf("PREDICTION (control): idle ~= noop ~= hot, all clustered — a "
+           "tenant on a separate physical core shares only L3 with the "
+           "victim, and the victim's traffic is L1-resident (see BUF_ELEMS), "
+           "so it never touches L3 at all. With no on-core resource (issue "
+           "ports / L1 / L2 / store buffer) for the tenant to contend for, "
+           "there should be nothing here to slow the victim down — this is "
+           "the control that isolates the default run's slowdown to on-core "
+           "contention, not just chip-wide business.\n\n");
+  }
 
   StateResult idle{"idle (no tenant)", TenantMode::Idle, {}, {}};
   StateResult noop{"noop (pause-spin)", TenantMode::Noop, {}, {}};
@@ -470,7 +581,7 @@ int main(int argc, char **argv) {
   for (int r = 0; r < NoiseCfg::R; r++) {
     for (StateResult *sr : states) {
       std::vector<uint32_t> pass_samples;
-      run_pass(sr->mode, cpu_hot, cpu_sib, pass_samples);
+      run_pass(sr->mode, cpu_hot, cpu_tenant, pass_samples);
 
       std::vector<uint32_t> sorted_pass =
           pass_samples; // pct() needs sorted input

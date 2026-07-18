@@ -101,12 +101,14 @@ flowchart LR
 
 AMD Zen box, 12c/24t, TSC ~1.996 GHz, **SMT on but no core isolation, boost/governor not locked** — treat absolutes as noisy; the *ordering* is the robust result, and compare rows only within one run.
 
-| Pair (variant) | min | p50 | p99 | p99.9 |
-|---|---:|---:|---:|---:|
-| SMT sibling (pause) | ~30 | ~50 | ~70 | ~70 |
-| same L3/CCX (pause) | ~60 | ~90 | ~120 | ~140 |
-| cross CCX (pause) | ~200 | ~711 | ~922 | ~2294 |
-| cross CCX (bare-spin) | ~240 | ~741 | ~912 | ~2174 |
+| Pair (variant) | min | p50 | p99 | p99.9 | p99.99 | max |
+|---|---:|---:|---:|---:|---:|---:|
+| SMT sibling (pause) | ~30 | ~50 | ~70 | ~70 | ~400 | ~27600 |
+| same L3/CCX (pause) | ~60 | ~90 | ~120 | ~140 | ~1400 | ~88600 |
+| cross CCX (pause) | ~200 | ~711 | ~922 | ~2294 | ~6360 | ~80500 |
+| cross CCX (bare-spin) | ~240 | ~741 | ~912 | ~2174 | ~7380 | ~91000 |
+
+The p99.99/max columns are the "late" tail — and on this un-isolated box they are dominated by OS scheduler jitter (the spin loop getting preempted), not hardware. They swing wildly run-to-run; read them as "the tail is microseconds-to-tens-of-microseconds without core isolation," not as a stable hardware number. The p50–p99.9 columns are the robust part.
 
 - **The topology ordering holds at every percentile**: sibling < same-CCX < cross-CCX. The CCX crossing is the big cliff (~8× the same-CCX median).
 - **pause vs bare-spin is roughly a wash on this box**: at both cross-core tiers the two variants sit within a few percent of each other — PAUSE's added detection latency and bare-spin's load-unit pressure / exit mispredict roughly cancel. (The gap is power-state dependent; under a locked governor pause can phase-lock to a larger multiple. Only compare the two within one run.)
@@ -120,15 +122,17 @@ AMD Zen box, 12c/24t, TSC ~1.996 GHz, **SMT on but no core isolation, boost/gove
 
 `smt_pingpong`'s sibling row uses the sibling as the *cooperative* ping-pong responder, so it never measures a genuinely noisy tenant. This experiment isolates that variable: 100% of the timed **victim** work runs on `cpu_hot` — a throughput-bound, high-ILP block (8 independent accumulator lanes over a 4KB L1-resident buffer) that saturates the core's integer-multiply pipes. A **tenant** on the SMT sibling runs one of three states per pass: **idle** (no thread), **noop** (`_mm_pause`, yields ports), **hot** (the same 8-lane shape, genuinely contending for ports). Passes are interleaved across 8 repeats to spread thermal/scheduler drift; per-repeat median spread is the significance check. (A dependent/latency-bound victim — pointer chase, single accumulator — is what SMT coexists with well, so it must be port-bound to be sensitive.)
 
-**Result** (same box; `hot=cpu0`, `sibling=cpu12`; 40k samples/state over 8 repeats):
+**Result** (same box; victim on `cpu0`; 40k samples/state over 8 repeats; ns/chunk):
 
-| Tenant | median (ns/chunk) | vs idle |
-|---|---:|---:|
-| idle | 370.7 | — |
-| noop (pause) | 380.7 | +3% |
-| hot (busy) | 671.2 | **1.81×** |
+| Tenant | median | p99 | p99.9 | max | vs idle |
+|---|---:|---:|---:|---:|---:|
+| idle | 370.7 | 390.7 | 1102 | 4839 | — |
+| noop (pause) | 380.7 | 390.7 | 441 | 4879 | +3% |
+| hot (busy) | 671.2 | 711.3 | 731 | 18565 | **1.81×** |
 
-A busy sibling nearly doubles the work in the median; a polite pausing sibling is indistinguishable from none. Per-repeat median spread is ~10 ns against a ~300 ns between-state gap, so the ordering is real, not noise — tails stay OS-jitter-sensitive without core isolation. Note "idle" means *no tenant thread spawned*, not a quiesced core (that needs root `isolcpus`/offlining) — the kernel can still land other work there.
+A busy sibling nearly doubles the work in the median; a polite pausing sibling is indistinguishable from none. Per-repeat median spread is ~10 ns against a ~300 ns between-state gap, so the ordering is real, not noise. (The `max` column is OS-jitter, not the effect — the median/p99 is the signal without core isolation.) "Idle" means *no tenant thread spawned*, not a quiesced core (that needs root `isolcpus`/offlining) — the kernel can still land other work there.
+
+**Control — is it really *on-core* contention?** `--same-ccx` reruns with the tenant on a same-CCX *different physical core* (shares only L3, not ports/L1/L2). The port-bound victim is L1-resident, so it never touches L3 — and the result confirms it: **idle 370.7 / noop 370.7 / hot 370.7, all identical.** A busy neighbor core costs the victim nothing. The ~1.8× is specifically on-core execution-port contention between SMT siblings, not chip-wide business — which is exactly why "just pin your thread" isn't enough: a hog on your *sibling* hurts, a hog on the *next core over* doesn't.
 
 ---
 
