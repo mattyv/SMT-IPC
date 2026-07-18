@@ -295,3 +295,112 @@ The obvious middle path: leave SMT **on**, pin the hot thread to one hardware th
 3. **Even a perfectly idle sibling isn't identical to SMT-off in BIOS.** With SMT enabled, some core structures are statically partitioned or differently configured (store buffer, ROB entries, some queues — the details are µarch-specific; Zen recombines more gracefully than older Intel). An idle/offlined sibling recovers *nearly* all of it. "Nearly" is the gap BIOS SMT-off closes.
 
 So the hybrid is real: **isolate + offline the sibling on your hot cores, keep SMT everywhere else.** You give up a sliver of determinism versus global SMT-off, and in exchange the rest of the machine keeps its throughput. Firms that run dedicated single-purpose boxes flip SMT off globally not because the hybrid doesn't work, but because on a machine with *no* cold path there's nothing to trade — global-off is simpler and closes the last gap for free.
+
+## SPSC pipeline
+
+`smt_pingpong` and `sibling_noise` both keep every CPU involved **fully busy** the whole time — neither has a notion of "core idle waiting for work." Real pipelines aren't always busy: when messages arrive slowly, spinning to catch the next one wastes an entire core (or, on an SMT sibling, half a physical core) for nothing. `spsc_pipeline.cpp` asks: at what arrival rate does it stop being worth it to spin, and how much latency do you pay to let the consumer sleep instead?
+
+### The pipeline shape
+
+One producer thread, one consumer thread, one [`rigtorp::SPSCQueue<Msg>`](https://github.com/rigtorp/SPSCQueue) between them (pinned to a specific commit — see `CMakeLists.txt` — so upstream can't silently change what this builds against):
+
+```mermaid
+flowchart LR
+  P["Producer thread<br/>(paced publisher)"] -->|try_emplace, one 64B Msg| Q[["rigtorp::SPSCQueue&lt;Msg&gt;"]]
+  Q -->|front / pop| C["Consumer thread<br/>(wait policy under test)"]
+  C -.->|"parked / wake (Blocking only)"| P
+
+  classDef hot fill:#1f6feb,color:#fff,stroke:#0d1117;
+  class P,C hot;
+```
+
+Each `Msg` is exactly one 64B cache line (`seq`, `pub_tsc`, 6 payload words) so publishing one message can never generate coherence traffic on a neighbour's line. The consumer is anchored on `cpu0`; the producer runs on a partner selected by the same sysfs topology discovery `smt_pingpong` uses — SMT sibling, same-CCX, or cross-CCX. Unlike `smt_pingpong`, the roles are fixed and asymmetric: the consumer is the latency-critical side under measurement, the producer just needs to hit its pacing schedule.
+
+Latency is end-to-end: `t_done` (consumer finishes processing) minus `pub_tsc` (stamped once, at the producer's *first* `try_emplace` attempt for that message — a backpressure retry never re-stamps it, so a message queued behind a full ring doesn't get to lie about when it was first offered).
+
+### The three wait policies
+
+| Policy | Consumer behaviour when the queue is empty | Cost model |
+|---|---|---|
+| **BareSpin** | Tight re-poll of `front()`, no `PAUSE` | Zero detection latency, burns 100% of the core, hammers the load unit |
+| **Pause** | Re-poll with `_mm_pause` each iteration | Slightly higher detection latency (PAUSE's own park window), still burns 100% of the core, but yields shared execution ports to an SMT sibling |
+| **Blocking** | Parks on a futex once the queue is observed empty; producer wakes it conditionally | Consumer core goes idle between messages, at the cost of a park/wake round trip added to that message's tail latency |
+
+`WaitPolicy` is a template parameter, not a runtime enum tested per iteration — same reasoning as `pp_core.hpp`'s `relax<bool Pause>()`: the compiler specializes a dedicated wait loop per policy so the hot loop never spends a branch on which policy it's running.
+
+**BareSpin is skipped on the SMT-sibling tier.** Producer and consumer there are two hardware threads of the *same physical core*; a bare spin on one thread saturates the shared core's execution ports the other thread needs to issue its own store/load, so the row would measure self-inflicted starvation, not handoff latency (identical reasoning to why `smt_pingpong`'s sibling pair only runs the pause variant). Blocking on the sibling tier is the marquee row instead: a parked consumer frees the *entire* logical CPU, easing port pressure on the physical core rather than adding to it.
+
+### The futex conditional-wake protocol
+
+Blocking's "sleep the consumer" mechanism is a hand-rolled eventcount on one 32-bit word (`ParkWord::v`) plus the raw `futex(2)` syscall — not `std::condition_variable`, because the point is to measure the actual kernel park/wake cost, not whatever a condvar's internal mutex adds on top.
+
+The producer never syscalls unconditionally on every publish (that would defeat the point of the fast path): `maybe_wake()` does one relaxed load of `parked`, and only pays for `FUTEX_WAKE` on a hit. This is why `futex-wake-syscalls` should sit near 0 at `gap=0` (the queue is essentially never observed empty, so the fast path almost never fires) and climb toward the sample count as the gap widens (the consumer is parked before almost every message).
+
+**The missed-wake hazard.** The producer must never publish a message, observe "nobody is parked," and skip the wake — while the consumer is mid-way through announcing that it's about to park. Without an ordering fix, this interleaving is possible even though each individual store is a normal atomic write:
+
+```
+consumer: front() sees empty -> parked.store(1) -> re-checks front(), STILL sees
+          empty (producer's queue-index store hasn't drained from its store
+          buffer yet) -> calls futex_wait
+producer: try_emplace() succeeds (queue-index store enters store buffer)
+          -> parked.load() executes EARLY, before that store drains, and
+          observes parked==0 -> skips the wake
+```
+
+Result: the message is fully published, the consumer is genuinely parked, and nobody wakes it — masked only by the deadlock-insurance backstop timeout (`FUTEX_BACKSTOP_TIMEOUT_MS`), not by correctness.
+
+**The fix is a textbook Dekker/StoreLoad fence pair — two `std::atomic_thread_fence(seq_cst)` calls, one on each thread, each sitting between that thread's own store and its own subsequent load:**
+
+```
+producer: queue-index store (try_emplace)
+          atomic_thread_fence(seq_cst)     <- drains the store before the load
+          parked.load(relaxed)
+consumer: parked.store(1, relaxed)
+          atomic_thread_fence(seq_cst)     <- drains the store before the load
+          front() re-check (a load of the queue index)
+```
+
+Two seq_cst fences on different threads are totally ordered against each other — that ordering is exactly what `memory_order_seq_cst` guarantees for fences, independent of what memory order the *stores themselves* use. Whichever fence lands second in that total order is guaranteed to see everything the other thread wrote before its own fence, so at least one side of the race above always sees the other's write. This is a standard guarantee, not an x86 store-buffer accident.
+
+It would be tempting to use a `seq_cst` *store* on the consumer's side instead of a relaxed store + fence (fewer lines, and it's what an earlier version of this code did) — but a seq_cst store paired against a seq_cst-fenced load on another thread is **not** formally guaranteed to give StoreLoad ordering by the C++ standard. That pairing happened to work on x86 only because GCC compiles a seq_cst store to `xchg`, which is itself a full barrier — a compiler-codegen accident, not a standard guarantee, and not something to depend on. The two-fence version above is formally watertight and, on x86, compiles to the *same* barrier either way — so fixing this cost nothing measurable.
+
+**On the test coverage for this fence.** `--blocking-probe`'s MISSED-WAKE STRESS test exercises the park/wake protocol under randomized producer-side jitter (`nanosleep`-based delays straddling the announce/re-check/park window) and checks for zero backstop fires across 10k rounds. This is honest **protocol smoke coverage** — it round-trips the park/wake path, the EAGAIN path, spurious wakes, and sequence integrity under stress — but it is **not a regression test for the fence itself**. The race window the fence closes is a few nanoseconds wide (the store-buffer drain window), and `nanosleep` is itself a barrier with microsecond-scale granularity — several orders of magnitude too coarse to reliably land a jitter delay inside a few-ns window. When this fence was deliberately removed during review to check whether the probe would catch it, the stress test still passed 3/3 with zero backstop fires. The fence's correctness rests on the analytic Dekker argument above, not on any test result; the probe is there to catch protocol regressions (a broken re-check, a wrong clear-before-wake ordering, an EAGAIN path that actually sleeps), which are much larger-scale bugs it *can* reliably catch.
+
+### Producer pacing
+
+The producer runs an absolute-deadline schedule: message `n`'s target publish time is `t_start + n * gap_cycles`, computed fresh from `t_start` every iteration rather than accumulated by adding `gap_cycles` to the previous message's actual publish time. This means a late message never drags every subsequent message's deadline later with it — a producer that falls behind catches back up to the original schedule rather than free-running at a slower effective rate.
+
+`pace_until(deadline)` is a two-phase busy-wait (never a real sleep — a sleep's wakeup granularity would swamp the sub-microsecond gaps this sweep cares about):
+
+1. **Pause-coarse**: while more than `PACE_TAIL_CYCLES` from the deadline, spin with `_mm_pause` — core-friendly, doesn't hammer the load unit or starve a sibling for no reason.
+2. **Bare-tail**: once within `PACE_TAIL_CYCLES` of the deadline, drop to a bare re-check spin — trades core-friendliness for the tightest possible deadline detection right at the end, since a PAUSE's own latency risks overshooting a deadline that close.
+
+`pace_until` returns whether the deadline had *already* passed on entry (`late_on_entry`), which is the honest "late-publish" signal — comparing a *post-pacing* timestamp to the deadline would be trivially always-true, since the function only returns once `now >= deadline`. At `gap=0` the deadline is fixed at `t_start` for every message, so every message is legitimately "late" (saturated: no pacing possible) — that's the expected, correct reading of `late-publish ≈ SAMPLE_MSGS` at that row, not a bug.
+
+### The arrival-rate sweep and what the metrics mean
+
+`PipeCfg::GAP_NS` sweeps `{0, 250, 1000, 5000, 20000}` ns of producer inter-message gap, from saturated (back-to-back) to clearly sub-saturated. Per `(tier, policy, gap)` cell:
+
+- **waited-fraction** — the share of sampled messages whose *first* `front()` poll found the queue empty. Near 0 at `gap=0` (the queue is rarely empty), approaching 1 as the gap widens past what the consumer can keep the queue topped up against.
+- **parked-fraction** — the share of the sampled window's wall time the consumer spent inside the wait function (Blocking only). Measured over the *sampled* window specifically (consumer-stamped TSC marks at the start of message `WARM_MSGS` and the end of the last message), not the pass's full wall time — the full-pass window also includes thread pin/spin-up and the `WARM_MSGS` warm-up run, which would inflate the denominator and cap a fully-parked pass around 0.83 instead of letting it approach 1.0.
+- **futex-wake-syscalls** — real `FUTEX_WAKE` syscalls issued (diffed around the pass from a global counter). Near 0 at `gap=0` (queue rarely empty, so the conditional fast path rarely fires), rising toward the sample count as the gap grows.
+- **futex-backstop-fires** — the deadlock-insurance timeout firing. Should be exactly 0 in every real pass; a nonzero count here is a missed-wake smoking gun, not a normal outcome.
+
+### The crossover: latency vs. core utilization
+
+At `gap=0` all three wait policies converge — nothing is ever idle long enough for Blocking's park path to matter, and its wake-syscall count is near 0. **Read this row's latency number as queue-depth sojourn time (Little's law: mean latency ≈ mean queue depth / arrival rate), not as a measurement of wake cost** — the queue is saturated, so a message's latency is dominated by how many messages are ahead of it, not by how it was woken.
+
+As the gap widens, BareSpin and Pause keep burning 100% of their core for a shrinking trickle of messages, while Blocking's consumer core goes idle between messages — parked-fraction climbs toward 1.0 — at the cost of the futex park/wake round trip added to each message's tail latency. Roughly: **spin/pause win on raw latency and burn a whole core doing it; Blocking frees on the order of 80%+ of that core back to the OS once the arrival rate is clearly sub-saturated, in exchange for a microsecond-scale wake tax per message.** Where exactly that crossover sits is workload- and machine-dependent — run the sweep and read the `parked-fraction` / latency columns together rather than trusting a single quoted number, since this box has no core isolation (see below).
+
+### The measured mwaitx detour
+
+An earlier phase of this project measured `mwaitx`/`monitorx` (the AMD hardware wait-on-address instructions, `WAITPKG`-adjacent) as a candidate for Blocking's park mechanism, on the theory that a hardware wait might beat a futex round trip for this sub-microsecond handoff. It didn't: on this Zen 5 box, `mwaitx` wake latency measured **~260ns p50**, against **~60ns for a plain spin** reacting to the same store — over 4× slower than just spinning — and imposed a **~350–480ns timeout floor** even in the best case. Both numbers rule it out for a handoff this latency-sensitive; a futex park/wake round trip, despite going through the kernel, is not meaningfully worse and is far simpler to reason about and to actually implement portably. `mwaitx`/`monitorx`/`CPUID`/`WAITPKG` accordingly do not appear anywhere in `spsc_pipeline.cpp` — this was evaluated and dropped, not overlooked.
+
+### Future work
+
+- **Spin-then-park hybrid.** Blocking here is a pure park-on-first-empty policy. Spinning briefly before falling back to a futex park (rather than parking on the very first empty poll) is very likely a better latency/utilization trade at the low end of the gap sweep — it would absorb short empty windows without paying the wake tax, while still freeing the core once the empty window looks sustained. Not implemented here, to keep this pass's three wait policies simple, orthogonal, and easy to reason about in isolation.
+- **Bursty / intermittent arrival.** The gap sweep models a *steady* arrival rate at each row. Real feeds are often bursty — long quiet stretches punctuated by bursts — which stresses the park/wake path differently than a steady sub-saturated rate (every burst potentially pays a wake cost on its first message, then runs saturated until the burst drains). Not modelled here.
+
+### No-core-isolation caveat
+
+Same caveat as `smt_pingpong` and `sibling_noise`: this box runs with no `isolcpus`/`nohz_full`/IRQ affinity steering, so the OS scheduler and other work can land on either the producer's or consumer's CPU mid-run. Absolute latency numbers, especially in the tail (p99.9+), are environment-sensitive; compare rows *within one run* on this machine, not across runs or machines. `late-publish` and `waited-fraction` are the more robust cross-run signals since they're derived from the pacing schedule itself rather than raw tail latency.
