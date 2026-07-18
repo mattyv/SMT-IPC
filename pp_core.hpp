@@ -179,9 +179,9 @@ static std::string slurp(const std::string &p) {
 // validate a token before handing it to stoi, so malformed sysfs content
 // produces a clear fatal message instead of an uncaught std::invalid_argument.
 static bool is_all_digits(const std::string &s) {
-  return !s.empty() &&
-         std::all_of(s.begin(), s.end(),
-                      [](unsigned char c) { return std::isdigit(c) != 0; });
+  return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) {
+    return std::isdigit(c) != 0;
+  });
 }
 
 // Parse one CPU-number token, failing fast (loudly) if it isn't plain digits
@@ -275,7 +275,8 @@ static void check_invariant_tsc() {
   std::string line;
   bool found_flags = false, constant = false, nonstop = false;
   while (std::getline(f, line)) {
-    if (line.rfind("flags", 0) == 0) { // first CPU's flags line is representative
+    if (line.rfind("flags", 0) ==
+        0) { // first CPU's flags line is representative
       found_flags = true;
       constant = line.find("constant_tsc") != std::string::npos;
       nonstop = line.find("nonstop_tsc") != std::string::npos;
@@ -391,8 +392,8 @@ static double pct(const std::vector<uint32_t> &sorted, double p) {
   if (sorted.empty())
     return 0;
   double idx = p / 100.0 * (sorted.size() - 1); // fractional rank
-  size_t lo = size_t(idx);                       // lower sample index
-  double frac = idx - lo;                         // interpolation weight
+  size_t lo = size_t(idx);                      // lower sample index
+  double frac = idx - lo;                       // interpolation weight
   double v =
       sorted[lo] +
       (lo + 1 < sorted.size() ? frac * (sorted[lo + 1] - sorted[lo]) : 0);

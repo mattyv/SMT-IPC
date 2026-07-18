@@ -97,7 +97,7 @@ static int parse_cpu_arg(const char *s, const std::vector<int> &online) {
 // ---------------------------------------------------------------------------
 static int run_self_tests() {
   auto expect_vec = [](const char *what, const std::vector<int> &got,
-                        const std::vector<int> &want) {
+                       const std::vector<int> &want) {
     if (got != want) {
       fprintf(stderr, "FAIL %s\n", what);
       exit(1);
@@ -125,11 +125,9 @@ static int run_self_tests() {
     }
   };
   long v = -1;
-  expect_bool("is_valid_cpu_number(\"5\")", is_valid_cpu_number("5", &v),
-              true);
+  expect_bool("is_valid_cpu_number(\"5\")", is_valid_cpu_number("5", &v), true);
   expect_eq("is_valid_cpu_number(\"5\") value", double(v), 5.0);
-  expect_bool("is_valid_cpu_number(\"0\")", is_valid_cpu_number("0", &v),
-              true);
+  expect_bool("is_valid_cpu_number(\"0\")", is_valid_cpu_number("0", &v), true);
   // The bug this guards against: strtol(2^32) fits in a 64-bit long and would
   // pass a naive `v >= 0` check, then silently wrap to 0 when narrowed to
   // int — this must be rejected before narrowing, not after.
@@ -225,14 +223,13 @@ int main(int argc, char **argv) {
     // promise of non-zero on bad input.
     if (x == y) {
       fprintf(stderr,
-              "error: cpu%d == cpu%d, refusing to run a same-CPU pair\n", x,
-              y);
+              "error: cpu%d == cpu%d, refusing to run a same-CPU pair\n", x, y);
       return 1;
     }
   }
 
   check_invariant_tsc(); // warn (non-fatally) before trusting any ns figure
-  calibrate();            // establish g_tsc_ghz before any measurement
+  calibrate();           // establish g_tsc_ghz before any measurement
   printf("TSC: %.4f GHz\n\n", g_tsc_ghz);
 
   // Explicit pair mode: user names two CPUs, we show both spin variants so the
@@ -270,9 +267,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "need >=2 cpus\n");
     return 1;
   }
-  int base = cpus[0];              // anchor everything on the first online CPU
-  auto sibs = siblings_of(base);   // its SMT sibling(s)
-  auto l3 = l3_peers_of(base);     // its L3/CCX peers
+  int base = cpus[0];            // anchor everything on the first online CPU
+  auto sibs = siblings_of(base); // its SMT sibling(s)
+  auto l3 = l3_peers_of(base);   // its L3/CCX peers
 
   // Pick one partner per distance class:
   int sibling = -1, same_l3 = -1, other_l3 = -1;
@@ -286,7 +283,7 @@ int main(int argc, char **argv) {
       same_l3 = c;
       break;
     }
-  if (!l3.empty()) // only search if we actually know base's L3 peers —
+  if (!l3.empty())     // only search if we actually know base's L3 peers —
     for (int c : cpus) // outside base's L3 entirely -> cross-CCX
       if (!contains(l3, c)) {
         other_l3 = c;

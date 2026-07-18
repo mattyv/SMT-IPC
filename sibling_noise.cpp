@@ -186,7 +186,8 @@ static std::atomic<uint64_t> g_tenant_sink{0};
 // out of the timing loop so run_self_tests() can call it directly and assert
 // it actually mutates state, without spinning a thread or touching rdtsc.
 // ---------------------------------------------------------------------------
-static inline void victim_chunk(uint64_t *buf, uint64_t acc[NoiseCfg::N_LANES]) {
+static inline void victim_chunk(uint64_t *buf,
+                                uint64_t acc[NoiseCfg::N_LANES]) {
   for (int pass = 0; pass < NoiseCfg::CHUNK_PASSES; pass++) {
     for (int i = 0; i < NoiseCfg::BUF_ELEMS; i += NoiseCfg::N_LANES) {
       for (int k = 0; k < NoiseCfg::N_LANES; k++) {
@@ -202,7 +203,8 @@ static inline void victim_chunk(uint64_t *buf, uint64_t acc[NoiseCfg::N_LANES]) 
 // One "step" of the tenant's hot loop, same independent-lanes shape as
 // victim_chunk. Factored out so run_self_tests() can assert it mutates state
 // without spinning a thread.
-static inline void tenant_step(uint64_t *buf, uint64_t acc[NoiseCfg::TENANT_LANES]) {
+static inline void tenant_step(uint64_t *buf,
+                               uint64_t acc[NoiseCfg::TENANT_LANES]) {
   for (int i = 0; i < NoiseCfg::TENANT_BUF_ELEMS; i += NoiseCfg::TENANT_LANES) {
     for (int k = 0; k < NoiseCfg::TENANT_LANES; k++) {
       acc[k] = acc[k] * NoiseCfg::MIX_CONST + buf[i + k];
@@ -214,7 +216,7 @@ static inline void tenant_step(uint64_t *buf, uint64_t acc[NoiseCfg::TENANT_LANE
 // cpu_sib. Runs until `stop` is observed, then publishes its accumulators to
 // the sink so the compiler can't prove the whole loop is dead.
 static void tenant_hot(int cpu, std::atomic<bool> &ready,
-                        std::atomic<bool> &stop) {
+                       std::atomic<bool> &stop) {
   if (!pin(cpu)) {
     fprintf(stderr, "  ! pin cpu%d failed (tenant)\n", cpu);
     exit(1);
@@ -240,7 +242,7 @@ static void tenant_hot(int cpu, std::atomic<bool> &ready,
 // "Polite tenant": present on the sibling, but PAUSE yields the shared
 // execution ports back to the other hardware thread every iteration.
 static void tenant_noop(int cpu, std::atomic<bool> &ready,
-                         std::atomic<bool> &stop) {
+                        std::atomic<bool> &stop) {
   if (!pin(cpu)) {
     fprintf(stderr, "  ! pin cpu%d failed (tenant)\n", cpu);
     exit(1);
@@ -263,16 +265,18 @@ enum class TenantMode { Idle, Noop, Hot };
 // and it is joined, only AFTER the victim's timed pass completes.
 // ---------------------------------------------------------------------------
 static void run_pass(TenantMode mode, int cpu_hot, int cpu_sib,
-                      std::vector<uint32_t> &out) {
+                     std::vector<uint32_t> &out) {
   std::atomic<bool> ready{false}, stop{false};
   std::thread tenant;
   bool has_tenant = (mode != TenantMode::Idle);
 
   if (has_tenant) {
     if (mode == TenantMode::Hot)
-      tenant = std::thread(tenant_hot, cpu_sib, std::ref(ready), std::ref(stop));
+      tenant =
+          std::thread(tenant_hot, cpu_sib, std::ref(ready), std::ref(stop));
     else
-      tenant = std::thread(tenant_noop, cpu_sib, std::ref(ready), std::ref(stop));
+      tenant =
+          std::thread(tenant_noop, cpu_sib, std::ref(ready), std::ref(stop));
     while (!ready.load(std::memory_order_acquire)) // wait: tenant in position
       _mm_pause();
   }
@@ -304,7 +308,8 @@ static void run_pass(TenantMode mode, int cpu_hot, int cpu_sib,
   uint64_t sink = 0;
   for (int k = 0; k < NoiseCfg::N_LANES; k++)
     sink ^= acc[k];
-  g_victim_sink.store(sink, std::memory_order_relaxed); // keep acc observably alive
+  g_victim_sink.store(sink,
+                      std::memory_order_relaxed); // keep acc observably alive
 
   if (has_tenant) {
     stop.store(true, std::memory_order_relaxed); // only after the timed pass
@@ -319,7 +324,8 @@ static void run_pass(TenantMode mode, int cpu_hot, int cpu_sib,
 struct StateResult {
   const char *label;
   TenantMode mode;
-  std::vector<uint32_t> samples;      // pooled, all R repeats, unsorted until report time
+  std::vector<uint32_t>
+      samples; // pooled, all R repeats, unsorted until report time
   std::vector<double> repeat_medians; // ns, one per repeat
 };
 
@@ -442,8 +448,8 @@ int main(int argc, char **argv) {
 
   printf("cpu pair: hot=cpu%d (victim)  sibling=cpu%d (tenant)\n", cpu_hot,
          cpu_sib);
-  printf("R=%d repeats, %llu samples/pass, %llu warm-up chunks/pass\n\n", NoiseCfg::R,
-         (unsigned long long)NoiseCfg::SAMPLE_ITERS,
+  printf("R=%d repeats, %llu samples/pass, %llu warm-up chunks/pass\n\n",
+         NoiseCfg::R, (unsigned long long)NoiseCfg::SAMPLE_ITERS,
          (unsigned long long)NoiseCfg::WARM_ITERS);
 
   printf("PREDICTION: in the MEDIAN, idle ~= noop << hot — a busy sibling "
@@ -466,12 +472,13 @@ int main(int argc, char **argv) {
       std::vector<uint32_t> pass_samples;
       run_pass(sr->mode, cpu_hot, cpu_sib, pass_samples);
 
-      std::vector<uint32_t> sorted_pass = pass_samples; // pct() needs sorted input
+      std::vector<uint32_t> sorted_pass =
+          pass_samples; // pct() needs sorted input
       std::sort(sorted_pass.begin(), sorted_pass.end());
       sr->repeat_medians.push_back(pct(sorted_pass, 50));
 
       sr->samples.insert(sr->samples.end(), pass_samples.begin(),
-                          pass_samples.end());
+                         pass_samples.end());
     }
   }
 

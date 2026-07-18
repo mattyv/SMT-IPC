@@ -1,0 +1,3 @@
+# Matches the existing sources, which were written to clang-format's LLVM
+# defaults. Kept minimal on purpose — one line to change the whole house style.
+BasedOnStyle: LLVM
