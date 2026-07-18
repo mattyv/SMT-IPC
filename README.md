@@ -227,3 +227,17 @@ This benchmark exists to answer: *does cross-core vs SMT-sibling placement matte
 - **The hybrid design real shops use**: a set of isolated, effectively-SMT-off cores for the hot path, and SMT-on cores for cold-path work (logging, risk batch jobs, housekeeping) where throughput matters and tails don't. Global BIOS SMT-off buys the last sliver of determinism — some microarchitectural resources are statically partitioned under SMT-on even when the sibling is idle — at the cost of throughput everywhere else on the box.
 
 The cross-CCX cliff carries the same placement lesson one level up: keep tightly-coupled threads within one CCX/L3 domain, and treat any CCX (or socket) crossing as a deliberate, budgeted cost.
+
+### "Why disable SMT at all if I can just pin?" — the best-of-both-worlds question
+
+The obvious middle path: leave SMT **on**, pin the hot thread to one hardware thread of a core, and simply never schedule anything on its sibling. The rest of the box keeps SMT throughput; the hot core behaves like an SMT-off core. Is that valid?
+
+**Mostly yes — but affinity is the wrong tool to build it with, and it isn't quite 100%.**
+
+1. **Affinity constrains only the threads you pin.** `taskset`/`pthread_setaffinity_np` says "my thread runs here"; it says nothing about what *else* runs there. The kernel will happily place other processes, kernel threads, softirqs, and IRQ handlers on the sibling — and every one of them contends for the physical core's shared fetch/decode/ports/L1/L2 (see the pipeline diagram above). Pinning your thread while the sibling takes random tenants gets you the fast median and the bad tail simultaneously — the worst trade.
+2. **What actually empties the sibling** is one of:
+   - boot-time isolation covering *both* logical CPUs of the core (`isolcpus=` + `nohz_full=` + `irqaffinity=`), or a `cpuset` shield;
+   - offlining the sibling at runtime: `echo 0 > /sys/devices/system/cpu/cpuN/online` — a reversible, per-core SMT-disable that needs no reboot and removes all doubt.
+3. **Even a perfectly idle sibling isn't identical to SMT-off in BIOS.** With SMT enabled, some core structures are statically partitioned or differently configured (store buffer, ROB entries, some queues — the details are µarch-specific; Zen recombines more gracefully than older Intel). An idle/offlined sibling recovers *nearly* all of it. "Nearly" is the gap BIOS SMT-off closes.
+
+So the hybrid is real: **isolate + offline the sibling on your hot cores, keep SMT everywhere else.** You give up a sliver of determinism versus global SMT-off, and in exchange the rest of the machine keeps its throughput. Firms that run dedicated single-purpose boxes flip SMT off globally not because the hybrid doesn't work, but because on a machine with *no* cold path there's nothing to trade — global-off is simpler and closes the last gap for free.
