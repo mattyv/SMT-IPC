@@ -154,6 +154,12 @@ The SMT-sibling pair only ever runs the **pause** variant: a bare spin on one si
 g++ -O3 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
 ```
 
+or via CMake (defaults to a Release/-O3 build; `ctest` runs the `--test` self-checks):
+
+```sh
+cmake -B build && cmake --build build && ctest --test-dir build
+```
+
 x86-64 Linux only (rdtsc, `_mm_pause`, sysfs topology).
 
 ## Run
