@@ -152,9 +152,12 @@ The SMT-sibling pair only ever runs the **pause** variant: a bare spin on one si
 
 ```sh
 g++ -O3 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
+g++ -O3 -std=c++23 -pthread sibling_noise.cpp -o sibling_noise
 ```
 
-or via CMake (defaults to a Release/-O3 build; `ctest` runs the `--test` self-checks):
+Both binaries share `pp_core.hpp`, but only its low-level primitives — `rdtsc_now`, `calibrate`, `pin`, `pct`, `Cfg`, `Slot`, and the sysfs topology helpers. `smt_pingpong` additionally uses the `bench<>` ping-pong loop; `sibling_noise` does not (its corrected design has no ping-pong). See "A second experiment: does a busy SMT sibling slow down a port-bound victim?" below.
+
+or via CMake (defaults to a Release/-O3 build; `ctest` runs both binaries' `--test` self-checks):
 
 ```sh
 cmake -B build && cmake --build build && ctest --test-dir build
@@ -212,6 +215,45 @@ A natural question: do the flag writes even need to be `std::atomic` — couldn'
 - **The atomics compile to nothing extra on x86.** `store(memory_order_release)` and `load(memory_order_acquire)` are both plain `mov` — x86's memory model already provides those orderings. No `lock` prefix, no `mfence` (verified in the emitted asm). Only `seq_cst` stores would cost (`xchg`/`mfence`), which is why the code uses acquire/release and not the default.
 - `relaxed` + explicit `atomic_thread_fence` pairs would be the legal version of "just a barrier" — and compiles to the same binary on x86. Strictly more code for the same result. Acquire/release earns its keep on portability: on ARM it becomes `ldar`/`stlr` and the benchmark stays correct.
 
+## A second experiment: does a busy SMT sibling slow down a port-bound victim?
+
+`smt_pingpong` never actually measures the claim in "Why this matters for HFT" below — in its SMT-sibling row, the sibling *is* the cooperative ping-pong responder, not an independent noisy tenant. `sibling_noise.cpp` is a separate experiment built to isolate that variable.
+
+**Revision note.** An earlier version of this experiment reused the same-CCX ping-pong as the victim and put a noisy tenant on the initiator's SMT sibling. A review proved that design structurally insensitive: the ping-pong's round trip is dominated by the cross-core coherence path (the line migrating to the responder core and back), so only a single-digit-nanosecond sliver of each sample actually executed on the contended core. A busy sibling could only ever perturb that sliver, and the predicted signal sat below the OS-jitter floor by construction — the prediction failed at every percentile, and it wasn't a tuning problem. The design below replaces it entirely; there is no ping-pong and no responder in this version.
+
+**What it measures.** Only two logical CPUs matter: `cpu_hot` (the anchor) and its SMT sibling `cpu_sib`. 100% of the timed **victim** work runs on `cpu_hot` — a throughput-bound, high-ILP block: `N_LANES=8` independent accumulator lanes folding a small (4KB, L1-resident) buffer, with no cross-lane or cross-iteration dependency, so the lanes issue in parallel and press the core's issue ports. This is the key correction: a dependent/latency-bound workload (pointer chase, single accumulator) is exactly what SMT coexists with well, so it wouldn't show a signal either. A **tenant** thread pinned to `cpu_sib` runs one of three states, each its own pass:
+
+- **idle** — no tenant thread at all.
+- **noop** — tenant spins on `_mm_pause`, present but yielding the shared execution ports every iteration.
+- **hot** — tenant runs the same independent-lanes shape as the victim (8 lanes over its own L1-resident buffer), genuinely competing for shared issue ports — not the earlier version's single dependent mul/add chain, which wasn't port-hungry enough to matter.
+
+**Methodology.** Passes are interleaved round-robin across `R=8` repeats (idle, noop, hot, idle, noop, hot, ...) rather than run as three long sequential blocks, so thermal ramp and scheduler drift are spread evenly across all three states instead of biasing whichever one runs last on a drifting machine. Samples are pooled across all repeats per state for the percentile report; the min/median/max of the 8 *per-repeat* medians is reported separately as the run-to-run stability check — if that spread is small next to the gap between states, the ordering is a real effect, not noise.
+
+**Prediction**: in the median, idle ≈ noop ≪ hot — a busy tenant steals issue ports (~1.3–2× slowdown expected); a polite pause tenant yields ports so it should look ≈ idle; mere tenant presence adds only minor static-partition overhead. The median is the robust signal here; tails remain OS-jitter-sensitive without core isolation, same caveat as `smt_pingpong` itself.
+
+**Run it**:
+
+```sh
+./sibling_noise          # auto-selects cpu_hot / cpu_sib, runs the interleaved repeats
+./sibling_noise --test   # pure-logic self-check, no timing hardware needed
+```
+
+Fails fast (non-zero exit) if `cpu_hot` has no SMT sibling (SMT off) — the experiment is meaningless without one.
+
+**Limitation — "idle" is not "isolated".** "Idle" here means *no tenant thread is spawned by this tool*, not the sibling hardware thread offlined or otherwise quiesced at the OS/BIOS level. Actually emptying a CPU needs root (`isolcpus`/`cpuset`, or `echo 0 > /sys/devices/system/cpu/cpuN/online`), which is out of scope here — the kernel can still schedule unrelated work (other processes, IRQs) onto an "idle" sibling. Treat the idle row as a best-effort proxy, not a guarantee of a quiescent core.
+
+**What we actually saw** (same laptop as above, SMT on, no core isolation, normal background load; `hot=cpu0`, `sibling=cpu12`; 40,000 samples per state pooled over 8 repeats):
+
+| Tenant state | median | min | p90 | p99 | p99.9 | max | per-repeat median: min / median / max |
+|---|---:|---:|---:|---:|---:|---:|---|
+| idle (no tenant) | 370.7 | 360.7 | 370.7 | 380.7 | 510.9 | 6912.8 | 360.7 / 370.7 / 370.7 |
+| noop (pause-spin) | 380.7 | 370.7 | 390.7 | 400.7 | 410.8 | 4087.6 | 380.7 / 380.7 / 380.7 |
+| hot (busy tenant) | 671.2 | 370.7 | 691.3 | 711.3 | 731.4 | 25627.3 | 671.2 / 671.2 / 671.2 |
+
+All ns per timed chunk.
+
+Honest read: **the thesis held in the median.** idle (370.7 ns) and noop (380.7 ns) sit within ~3% of each other — a polite, port-yielding tenant is indistinguishable from no tenant at all — while hot (671.2 ns) is **1.81×** the idle median, squarely inside the 1.3–2× predicted range. The run-to-run per-repeat median spread within each state is only ~10 ns (idle: 360.7–370.7; noop and hot: perfectly flat across all 8 repeats), which is small next to the ~300 ns gap between {idle, noop} and hot — so this ordering is a real effect on this machine, not run-to-run noise. The tails (p99.9, max) are noisier and less trustworthy without core isolation, consistent with the caveat above; the median is where this design was built to show a signal, and it does.
+
 ## Methodology & caveats
 
 - **rdtsc observer overhead**: the fenced `lfence; rdtsc; lfence` reads cost ~20–30 ns per sample pair. This is baked into *every* number, including bare-spin. Accepted as a known, constant tax.
@@ -234,7 +276,7 @@ A natural question: do the flag writes even need to be `std::atomic` — couldn'
 This benchmark exists to answer: *does cross-core vs SMT-sibling placement matter for a latency-critical pipeline, and why do HFT shops turn SMT off if siblings are the fastest handoff?*
 
 - **SMT siblings give the fastest raw handoff** — the line lives in the shared L1/L2 and never leaves the core (~50 ns RTT median here vs ~90 ns same-CCX, ~400–700 ns cross-CCX). If two pipeline stages genuinely hand off constantly, sibling placement is the raw-latency winner.
-- **But firms disable SMT for determinism, not median latency.** A *busy* sibling contends for the physical core's shared resources — execution ports, L1/L2 capacity, store buffer, TLB — and that contention lands squarely on p99.9+. The fast median is only real when the sibling is doing exactly the cooperative thing you placed there; any other tenant on it wrecks the tail.
+- **But a busy sibling contends for the physical core's shared resources.** Execution ports, L1/L2 capacity, and the store buffer are all shared between two SMT hardware threads. The fast sibling handoff above is measured with a *cooperative* sibling (the ping-pong responder); a genuinely busy, port-hungry tenant on that sibling is a different story. `sibling_noise.cpp` (below) measures this directly with a throughput-bound victim, and the effect shows up cleanly **in the median**: a busy tenant slowed the victim ~1.8× on this machine, while an absent or polite (pause-spinning) tenant was indistinguishable from no tenant at all. Read the experiment below before treating this as settled — it took a rewrite to get a workload actually sensitive to the effect, and the ping-pong RTT above is not that workload.
 - **Affinity is necessary but not sufficient.** Pinning your hot thread steers *your* thread only — it does not keep the kernel, IRQs, or other processes off that CPU or its sibling. To effectively get "SMT off for this core" you must also keep everything else off *both* siblings (`isolcpus` / `nohz_full` / `irqaffinity`, or cpusets), and/or offline the sibling entirely: `echo 0 > /sys/devices/system/cpu/cpuN/online`.
 - **The hybrid design real shops use**: a set of isolated, effectively-SMT-off cores for the hot path, and SMT-on cores for cold-path work (logging, risk batch jobs, housekeeping) where throughput matters and tails don't. Global BIOS SMT-off buys the last sliver of determinism — some microarchitectural resources are statically partitioned under SMT-on even when the sibling is idle — at the cost of throughput everywhere else on the box.
 
@@ -246,7 +288,7 @@ The obvious middle path: leave SMT **on**, pin the hot thread to one hardware th
 
 **Mostly yes — but affinity is the wrong tool to build it with, and it isn't quite 100%.**
 
-1. **Affinity constrains only the threads you pin.** `taskset`/`pthread_setaffinity_np` says "my thread runs here"; it says nothing about what *else* runs there. The kernel will happily place other processes, kernel threads, softirqs, and IRQ handlers on the sibling — and every one of them contends for the physical core's shared fetch/decode/ports/L1/L2 (see the pipeline diagram above). Pinning your thread while the sibling takes random tenants gets you the fast median and the bad tail simultaneously — the worst trade.
+1. **Affinity constrains only the threads you pin.** `taskset`/`pthread_setaffinity_np` says "my thread runs here"; it says nothing about what *else* runs there. The kernel will happily place other processes, kernel threads, softirqs, and IRQ handlers on the sibling — and every one of them contends for the physical core's shared fetch/decode/ports/L1/L2 (see the pipeline diagram above). Pinning your thread while the sibling takes random tenants risks the median slowdown `sibling_noise.cpp` measures (~1.8× on a genuinely port-bound workload, above) whenever one of those random tenants happens to be port-hungry — see that experiment for the measurement backing (and honest caveats on) this claim.
 2. **What actually empties the sibling** is one of:
    - boot-time isolation covering *both* logical CPUs of the core (`isolcpus=` + `nohz_full=` + `irqaffinity=`), or a `cpuset` shield;
    - offlining the sibling at runtime: `echo 0 > /sys/devices/system/cpu/cpuN/online` — a reversible, per-core SMT-disable that needs no reboot and removes all doubt.

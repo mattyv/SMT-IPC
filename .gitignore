@@ -1,5 +1,6 @@
-# Compiled benchmark binary
+# Compiled benchmark binaries
 /smt_pingpong
+/sibling_noise
 
 # CMake build trees
 /build*/

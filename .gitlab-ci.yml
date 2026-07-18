@@ -7,4 +7,6 @@ build:
   # runner executing this job must be an amd64 host.
   script:
     - g++ -O3 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
+    - g++ -O3 -std=c++23 -pthread sibling_noise.cpp -o sibling_noise
     - ./smt_pingpong --test
+    - ./sibling_noise --test
