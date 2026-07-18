@@ -65,9 +65,8 @@
 // ------------------------------------------
 // No mwaitx/monitorx/CPUID/WAITPKG anywhere — that family of "hardware wait"
 // instructions was measured non-viable for this kind of sub-microsecond
-// handoff in an earlier phase of this project (~260ns p50 wake vs ~60ns for
-// a spin, and a ~350-480ns timeout floor on this Zen 5 box); see the README's
-// "SPSC pipeline" section ("The measured mwaitx detour") for the numbers.
+// handoff (~260ns p50 wake vs ~60ns for a spin, and a ~350-480ns timeout
+// floor on this Zen 5 box); see the README "Caveats" section for the numbers.
 // This file also does not spin-then-park hybrid before falling back to
 // Blocking's futex path — Blocking here is a pure park-on-first-empty
 // policy. A spin-then-park hybrid (spin briefly, then park if still empty)
@@ -537,10 +536,10 @@ struct PassMetrics {
   // corresponding g_futex_* counter against these instead of a pre-run_pass
   // snapshot, so every per-pass instrument -- wake/eagain/backstop counts,
   // parked_fraction, and the cold/warm counts -- is measured over the exact
-  // same sample-only window. Before this, wake/eagain/backstop were diffed
-  // over the WHOLE pass (WARM_MSGS+SAMPLE_MSGS) while n_bursts and the
-  // cold/warm counts were sample-only, inflating wakes-per-burst by exactly
-  // (WARM_MSGS+SAMPLE_MSGS)/SAMPLE_MSGS -- see the README's MUST-FIX 1 note.
+  // same sample-only window. Diffing these over the WHOLE pass
+  // (WARM_MSGS+SAMPLE_MSGS) while n_bursts and the cold/warm counts stay
+  // sample-only would inflate wakes-per-burst by exactly
+  // (WARM_MSGS+SAMPLE_MSGS)/SAMPLE_MSGS, which is why the snapshot exists.
   uint64_t wake_syscalls_at_sample_start = 0;
   uint64_t backstop_fires_at_sample_start = 0;
   uint64_t eagain_at_sample_start = 0;

@@ -310,7 +310,8 @@ int main(int argc, char **argv) {
   run<true>("cross CCX (pause)", base, other_l3);
   run<false>("cross CCX (bare-spin)", base, other_l3);
 
-  printf("\nnote: SMT on, boost off, governor=performance for stable tails.\n"
+  printf("\nnote: for stable tails, run with boost off + governor=performance "
+         "(this box is not locked).\n"
          "      bare-spin figures still carry ~20-30ns rdtsc observer "
          "overhead.\n"
          "      big p99.99/max outliers are OS jitter (no core isolation).\n");

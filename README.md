@@ -1,490 +1,201 @@
-# smt_pingpong
+# smt_pingpong (SMT-IPC)
 
-A cache-line ping-pong microbenchmark: measures the round-trip latency of handing a cache line back and forth between two CPUs, and reports the full latency distribution across three topology distances — SMT sibling, same L3/CCX, and cross-CCX.
+Three small x86-64 Linux microbenchmarks probing inter-thread handoff latency and the wait-strategy / core-placement tradeoffs that matter for latency-critical pipelines:
 
-## What it measures
+- **`smt_pingpong`** — round-trip latency of bouncing one cache line between two CPUs, across three topology distances (SMT sibling, same-L3/CCX, cross-CCX).
+- **`sibling_noise`** — does a *busy* SMT sibling slow down a port-bound thread sharing its core? (Yes, ~1.8× in the median.)
+- **`spsc_pipeline`** — a producer→queue→consumer pipeline measuring the latency-vs-core-utilization crossover between spinning and kernel-blocking wait strategies, under both steady and bursty arrival.
 
-Two threads, each pinned to one logical CPU, hand a monotonically increasing sequence number back and forth through two shared flags (`a` and `b`, each on its own 128-byte-aligned region to rule out false sharing and adjacent-line prefetch effects):
+All three share `pp_core.hpp` (TSC calibration, pinning, percentiles, sysfs topology discovery). **x86-64 Linux only** (`rdtsc`, `_mm_pause`, sysfs).
+
+## Build & run
+
+```sh
+cmake -B build && cmake --build build && ctest --test-dir build   # builds all 3 + runs self-tests
+# or directly:
+g++ -O3 -std=c++23 -pthread smt_pingpong.cpp  -o smt_pingpong
+g++ -O3 -std=c++23 -pthread sibling_noise.cpp -o sibling_noise
+g++ -O3 -std=c++23 -pthread spsc_pipeline.cpp -o spsc_pipeline    # (needs rigtorp/SPSCQueue include; use CMake)
+```
+
+```sh
+./smt_pingpong           # auto: one pair per topology tier
+./smt_pingpong 0 12      # explicit CPU pair (validated; fatal on bad args / pin failure)
+./sibling_noise          # auto: cpu_hot + its SMT sibling
+./spsc_pipeline          # steady arrival-rate sweep
+./spsc_pipeline --bursty # bursty (on/off) arrival sweep
+<tool> --test            # pure-logic self-checks, no timing hardware needed
+```
+
+Bad CPU args and pin failures are always fatal (non-zero exit) rather than producing a meaningless run. A missing SMT sibling is fatal only where the tool requires one (`sibling_noise`); `smt_pingpong` auto mode just prints `(no such pair)` and skips that tier.
+
+---
+
+## `smt_pingpong` — cache-line handoff latency
+
+Two pinned threads bounce a monotonically increasing sequence number through two flags, each on its own 128B-aligned region (rules out false sharing and adjacent-line prefetch). The strictly-increasing value rules out ABA: the spin exits only on *this* iteration's value.
 
 ```
-INITIATOR (timed thread)                RESPONDER
-------------------------------------    ---------------------------
+INITIATOR (timed)                RESPONDER
 t0 = rdtsc
-store a = i   --- line `a` migrates -->  spin until a == i
-                                         store b = i
-spin until b == i  <-- line `b` back --
-t1 = rdtsc
-sample = t1 - t0   (one full round trip)
+store a = i   --line a-->         spin until a == i
+                                  store b = i
+spin until b == i  <--line b--
+t1 = rdtsc ; sample = t1 - t0     (one round trip)
 ```
 
-The same handoff as a sequence — one line each way, both threads hot-spinning:
+Each store forces the other core to give up the line (coherence invalidate / RFO), so exactly one line moves each way. Both threads hot-spin throughout — this is the **best-case handoff between two live spinners**, no wakeup cost. Timing is `lfence; rdtsc; lfence` (~20–30 ns observer tax, in every number), converted to ns via a TSC frequency calibrated against `steady_clock`. Each pair: 200k warm-up + 2M recorded round trips.
 
-```mermaid
-sequenceDiagram
-    participant A as Initiator · cpu_a (timed)
-    participant B as Responder · cpu_b
-    Note over A: t0 = rdtsc
-    A->>B: store a = i  (line `a` migrates: RFO / invalidate)
-    Note over B: spin until a == i
-    B->>A: store b = i  (line `b` returns)
-    Note over A: spin until b == i<br/>t1 = rdtsc<br/>sample = t1 − t0  (RTT)
-```
-
-Each store forces the other core to give up the line (a coherence invalidate / RFO), so exactly one line moves each way per iteration. Both threads are hot-spinning throughout — no thread-wakeup cost is included. This is the standard ping-pong metric: **best-case handoff latency between two live spinners**. The reported number is the full round trip (RTT); divide by 2 for an approximate one-way handoff latency.
-
-Using a strictly increasing sequence number (rather than a toggling flag) means a stale cached value can never satisfy the wait — the spin exits only when it observes *this* iteration's value, ruling out ABA effects.
-
-Timing is `rdtsc` fenced with `lfence` on both sides, converted to nanoseconds using a TSC frequency calibrated against `steady_clock` over a 300 ms busy-spin. Each pair runs 200k unrecorded warm-up round trips (coherence-state warming, branch training, clock ramp), then 2M recorded round trips — enough samples to populate p99.99.
-
-### The three topology tiers (auto mode)
-
-The benchmark reads Linux sysfs (`/sys/devices/system/cpu/*/topology`, `.../cache/index*`) to pick a representative partner for CPU 0 at each distance:
-
-| Tier | Meaning | Where the line lives |
-|---|---|---|
-| **SMT sibling** | Two hardware threads on the *same physical core* | Shared L1/L2 — the line never leaves the core |
-| **same L3 / CCX** | Two *distinct cores* sharing one L3 slice | Core→core, but inside one L3 domain |
-| **cross CCX** | Cores in *different L3 domains* | Crosses the on-die interconnect — the expensive case |
-
-Note on "same L2": on Zen, L1 and L2 are private per core, so the only logical CPUs that share an L2 are the SMT siblings of one core. There is no separate same-L2 tier — that *is* the SMT-sibling row.
-
-This box's actual topology (single socket, 12 cores / 24 threads, 3 CCX; two CCX shown). The three coloured arrows are the three measured distances, all anchored on `cpu0`:
+**Topology tiers** (auto mode, discovered from sysfs, anchored on cpu0). On Zen, L1/L2 are private per core, so "shares L2" == "is an SMT sibling" — there is no separate same-L2 tier.
 
 ```mermaid
 flowchart TB
-  subgraph CCX0["CCX 0 · shared L3 = 16 MB"]
-    L30["L3 slice (16 MB)"]
+  subgraph CCX0["CCX 0 · shared L3"]
+    L30["L3 slice"]
     subgraph CORE0["Core 0"]
-      cpu0["cpu0 — thread"]
+      cpu0["cpu0"]
       cpu12["cpu12 — SMT sibling"]
-      l1a["L1D 48K · L1I 32K (private)"]
-      l2a["L2 1 MB (private)"]
+      l1a["L1D/L1I · L2 (private)"]
     end
-    subgraph CORE1["Core 1"]
-      cpu1["cpu1 — thread"]
-      l2b["L1 · L2 (private)"]
-    end
-    CORE2["Core 2 · cpu2 / cpu14"]
-    CORE3["Core 3 · cpu3 / cpu15"]
+    CORE1["Core 1 · cpu1"]
   end
   subgraph CCX1["CCX 1 · different L3"]
-    L31["L3 slice (16 MB)"]
-    subgraph CORE4["Core 4"]
-      cpu4["cpu4 — thread"]
-      l2c["L1 · L2 (private)"]
-    end
-    CORE5["Cores 5–7"]
+    L31["L3 slice"]
+    CORE4["Core 4 · cpu4"]
   end
-
   cpu0 --- l1a
   cpu12 --- l1a
-  l1a --- l2a --- L30
-  cpu1 --- l2b --- L30
-  CORE2 --- L30
-  CORE3 --- L30
-  cpu4 --- l2c --- L31
-  CORE5 --- L31
+  l1a --- L30
+  CORE1 --- L30
+  CORE4 --- L31
   L30 <-->|on-die interconnect| L31
-
   cpu0 -. "① SMT sibling — shares L1/L2, line never leaves core" .- cpu12
-  cpu0 == "② same-CCX — core→core via shared L3" ==> cpu1
-  cpu0 == "③ cross-CCX — over the interconnect (the cliff)" ==> cpu4
-
+  cpu0 == "② same-CCX — core→core via shared L3" ==> CORE1
+  cpu0 == "③ cross-CCX — over the interconnect (the cliff)" ==> CORE4
   classDef hot fill:#1f6feb,color:#fff,stroke:#0d1117;
   classDef sib fill:#2ea043,color:#fff,stroke:#0d1117;
-  classDef same fill:#9e6a03,color:#fff,stroke:#0d1117;
-  classDef cross fill:#a40e26,color:#fff,stroke:#0d1117;
-  class cpu0 hot;
-  class cpu12 sib;
-  class cpu1 same;
-  class cpu4 cross;
+  class cpu0 hot; class cpu12 sib;
 ```
 
-### The physical core under SMT
-
-Why the sibling handoff is fastest *and* why a busy sibling is poison for the tail comes down to what two SMT threads share inside one core. The whole front-end and back-end are shared; some structures (store buffer, ROB entries) are **statically partitioned** the moment SMT is on, even if the sibling is idle:
+**Two spin variants**, run on the cross-core tiers: **pause** (`_mm_pause`, polite but its ~64-cycle park on Zen 2+ *adds* detection latency) and **bare-spin** (tight re-load, closer to raw coherence latency but hammers the load unit). The SMT-sibling pair runs **pause only** — a bare spin on one sibling starves the shared execution ports the other needs, measuring self-inflicted starvation rather than handoff. That sharing is also why a *busy* sibling hurts the tail:
 
 ```mermaid
 flowchart LR
-  T0["Thread 0<br/>(hot path)"]
-  T1["Thread 1<br/>(sibling)"]
+  T0["Thread 0 (hot)"]
+  T1["Thread 1 (sibling)"]
   subgraph CORE["One physical core"]
-    direction LR
-    subgraph FE["Shared front-end"]
-      FETCH["Fetch /<br/>I-cache"]
-      DEC["Decode"]
-      REN["Rename /<br/>allocate"]
-    end
-    subgraph BE["Shared back-end"]
-      SCHED["Scheduler"]
-      PORTS["Execution ports<br/>ALU · AGU · Load/Store"]
-      SB["Store buffer<br/>(split under SMT)"]
-    end
-    L1L2["Shared L1D / L1I / L2"]
-    FETCH --> DEC --> REN --> SCHED --> PORTS
-    PORTS --> SB --> L1L2
-    PORTS --> L1L2
+    FE["Shared front-end<br/>fetch · decode · rename"]
+    PORTS["Shared exec ports<br/>ALU · AGU · load/store"]
+    SB["Store buffer (split under SMT)"]
+    L1L2["Shared L1/L2"]
+    FE --> PORTS --> SB --> L1L2
   end
-  T0 --> FETCH
-  T1 --> FETCH
-  T1 -. "contends for every shared box → jitter on p99.9+" .-> PORTS
-
+  T0 --> FE
+  T1 -. "contends for every shared box → tail jitter" .-> PORTS
   classDef hot fill:#1f6feb,color:#fff,stroke:#0d1117;
   classDef sib fill:#2ea043,color:#fff,stroke:#0d1117;
-  class T0 hot;
-  class T1 sib;
+  class T0 hot; class T1 sib;
 ```
 
-- **Shared L1/L2** is why the SMT-sibling RTT is the lowest tier: the line stays inside the core.
-- **Shared fetch/decode/ports** is why a *busy* sibling steals issue bandwidth from the hot thread — the fast median holds only if the sibling stays cooperative (or empty).
-- `_mm_pause` on the hot spinner exists precisely to hand those shared ports back to the sibling; a bare spin there would starve it (hence the sibling pair runs the pause variant only).
+### Results
 
-### The two spin variants
-
-- **pause** — the spin loop issues `_mm_pause` (x86 `PAUSE`). Realistic for a polite spinner, but on Zen 2+ PAUSE parks the core for ~64 cycles (~32 ns @ 2 GHz), so a peer store landing mid-PAUSE isn't seen until the PAUSE ends — it *adds* detection latency.
-- **bare-spin** — the spin loop just re-loads in a tight loop. No PAUSE delay, so this is closer to raw coherence latency, at the cost of hammering the load unit and a branch mispredict on exit.
-
-The (pause − bare-spin) gap isolates the PAUSE detection latency from the coherence cost itself.
-
-The SMT-sibling pair only ever runs the **pause** variant: a bare spin on one sibling saturates the shared core's execution ports that the *other* sibling needs to perform its store, so it would measure self-inflicted starvation rather than handoff latency.
-
-## Build
-
-```sh
-g++ -O3 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
-g++ -O3 -std=c++23 -pthread sibling_noise.cpp -o sibling_noise
-```
-
-Both binaries share `pp_core.hpp`, but only its low-level primitives — `rdtsc_now`, `calibrate`, `pin`, `pct`, `Cfg`, `Slot`, and the sysfs topology helpers. `smt_pingpong` additionally uses the `bench<>` ping-pong loop; `sibling_noise` does not (its corrected design has no ping-pong). See "A second experiment: does a busy SMT sibling slow down a port-bound victim?" below.
-
-or via CMake (defaults to a Release/-O3 build; `ctest` runs both binaries' `--test` self-checks):
-
-```sh
-cmake -B build && cmake --build build && ctest --test-dir build
-```
-
-x86-64 Linux only (rdtsc, `_mm_pause`, sysfs topology).
-
-## Run
-
-```sh
-# Auto mode: discovers one pair per topology tier from /sys and runs all of them
-./smt_pingpong
-
-# Explicit pair mode: name two logical CPUs; runs BOTH spin variants on that pair
-./smt_pingpong 0 12
-
-# Self-check: pure-logic tests only (parse_list, pct) — no timing hardware needed
-./smt_pingpong --test
-```
-
-Explicit mode validates both arguments (must be non-negative integers naming an online CPU) and exits non-zero immediately on bad input, rather than silently running a meaningless pair. If the two CPUs are SMT siblings, the bare-spin variant is skipped (one line explaining why) since a bare spin on a sibling is an invalid measurement — see "Why the sibling pair only runs pause" above. A pin failure inside either thread is fatal (`exit(1)`), not a logged warning: an unpinned pair means nothing, per the caveats below.
-
-Auto mode prints the calibrated TSC frequency, then one line per pair with the distribution:
-
-```
-min / p50 / mean / p90 / p99 / p99.9 / p99.99 / max   (ns, round trip)
-```
-
-## Representative results
-
-Measured on an AMD Zen box: single socket, 12 cores / 24 threads, invariant TSC ~1.996 GHz, private L1+L2 per core, L3 shared across a 4-core/8-thread CCX. **SMT on, but no core isolation, and boost/governor not locked** — so treat absolutes as noisy; the ordering is the robust result.
+AMD Zen box, 12c/24t, TSC ~1.996 GHz, **SMT on but no core isolation, boost/governor not locked** — treat absolutes as noisy; the *ordering* is the robust result, and compare rows only within one run.
 
 | Pair (variant) | min | p50 | p99 | p99.9 |
 |---|---:|---:|---:|---:|
 | SMT sibling (pause) | ~30 | ~50 | ~70 | ~70 |
-| same L3/CCX (pause) | ~60 | ~90 | ~120 | ~210 |
-| same L3/CCX (bare-spin) | ~70 | ~100 | ~110 | ~200 |
-| cross CCX (pause) | ~190 | ~701 | ~982 | ~1723 |
-| cross CCX (bare-spin) | ~230 | ~381 | ~972 | ~1733 |
+| same L3/CCX (pause) | ~60 | ~90 | ~120 | ~140 |
+| cross CCX (pause) | ~200 | ~711 | ~922 | ~2294 |
+| cross CCX (bare-spin) | ~240 | ~741 | ~912 | ~2174 |
 
-All numbers are ns RTT. An earlier, quieter run of the same binary showed lower absolute numbers across the board — **only compare rows within a single run**, not across runs or machines.
+- **The topology ordering holds at every percentile**: sibling < same-CCX < cross-CCX. The CCX crossing is the big cliff (~8× the same-CCX median).
+- **pause vs bare-spin is roughly a wash on this box**: at both cross-core tiers the two variants sit within a few percent of each other — PAUSE's added detection latency and bare-spin's load-unit pressure / exit mispredict roughly cancel. (The gap is power-state dependent; under a locked governor pause can phase-lock to a larger multiple. Only compare the two within one run.)
+- **The microsecond p99.99/max outliers are OS jitter**, not hardware — affinity steers only this benchmark's threads.
 
-### Interpretation
+> The flag writes are `std::atomic` acquire/release not for hardware atomicity (an aligned 8B store never tears on x86) but for the C++ data-race rule — a plain load in the spin gets hoisted into an infinite loop at `-O2`. On x86 they compile to plain `mov` (no `lock`/`mfence`), so correctness costs nothing here.
 
-1. **The topology ordering holds at every percentile**: SMT sibling < same-CCX < cross-CCX. Crossing an L3/CCX boundary is the big cliff — roughly 4–7× the same-CCX median.
-2. **PAUSE bias is real and worst at cross-CCX.** Under pause, the cross-CCX median is roughly *double* the bare-spin median (~701 vs ~381 ns p50): the return store keeps landing early in a ~64-cycle PAUSE window and the loop becomes phase-locked to it. At same-CCX the two variants are roughly a wash — the bare spin's tight-loop mispredict and load-unit pressure cancel out what dropping PAUSE saves.
-3. **The huge p99.99/max outliers (microseconds to tens of microseconds) are OS jitter, not hardware.** Thread affinity only steers *this* benchmark's threads; it does not evict other work from those CPUs. Without isolation, the tail is the scheduler preempting a spin loop.
+---
 
-### Why atomics (and why they're free here)
+## `sibling_noise` — does a busy sibling slow a port-bound victim?
 
-A natural question: do the flag writes even need to be `std::atomic` — couldn't a plain `uint64_t` plus a barrier do? No, for two distinct reasons — and the atomics cost nothing anyway:
+`smt_pingpong`'s sibling row uses the sibling as the *cooperative* ping-pong responder, so it never measures a genuinely noisy tenant. This experiment isolates that variable: 100% of the timed **victim** work runs on `cpu_hot` — a throughput-bound, high-ILP block (8 independent accumulator lanes over a 4KB L1-resident buffer) that saturates the core's integer-multiply pipes. A **tenant** on the SMT sibling runs one of three states per pass: **idle** (no thread), **noop** (`_mm_pause`, yields ports), **hot** (the same 8-lane shape, genuinely contending for ports). Passes are interleaved across 8 repeats to spread thermal/scheduler drift; per-repeat median spread is the significance check. (A dependent/latency-bound victim — pointer chase, single accumulator — is what SMT coexists with well, so it must be port-bound to be sensitive.)
 
-- **Hardware atomicity is not the issue.** On x86-64 an aligned 8-byte store is atomic at the hardware level regardless; the write was never going to tear.
-- **The C++ data-race rule is the issue.** A plain `uint64_t` written by one thread and read by another is a data race → undefined behaviour, and `std::atomic_thread_fence` does not fix that — fences only synchronize *between atomic operations*. The UB is practical, not theoretical: in `while (b.v != i);` with a non-atomic `b.v`, the compiler sees no write in the loop, hoists the load, and emits an infinite loop at `-O2`. The atomic load is what forces a re-read each iteration. (`volatile` also forces the re-read but guarantees no cross-thread ordering — it "works on x86" by accident, not by contract.)
-- **The atomics compile to nothing extra on x86.** `store(memory_order_release)` and `load(memory_order_acquire)` are both plain `mov` — x86's memory model already provides those orderings. No `lock` prefix, no `mfence` (verified in the emitted asm). Only `seq_cst` stores would cost (`xchg`/`mfence`), which is why the code uses acquire/release and not the default.
-- `relaxed` + explicit `atomic_thread_fence` pairs would be the legal version of "just a barrier" — and compiles to the same binary on x86. Strictly more code for the same result. Acquire/release earns its keep on portability: on ARM it becomes `ldar`/`stlr` and the benchmark stays correct.
+**Result** (same box; `hot=cpu0`, `sibling=cpu12`; 40k samples/state over 8 repeats):
 
-## A second experiment: does a busy SMT sibling slow down a port-bound victim?
+| Tenant | median (ns/chunk) | vs idle |
+|---|---:|---:|
+| idle | 370.7 | — |
+| noop (pause) | 380.7 | +3% |
+| hot (busy) | 671.2 | **1.81×** |
 
-`smt_pingpong` never actually measures the claim in "Why this matters for HFT" below — in its SMT-sibling row, the sibling *is* the cooperative ping-pong responder, not an independent noisy tenant. `sibling_noise.cpp` is a separate experiment built to isolate that variable.
+A busy sibling nearly doubles the work in the median; a polite pausing sibling is indistinguishable from none. Per-repeat median spread is ~10 ns against a ~300 ns between-state gap, so the ordering is real, not noise — tails stay OS-jitter-sensitive without core isolation. Note "idle" means *no tenant thread spawned*, not a quiesced core (that needs root `isolcpus`/offlining) — the kernel can still land other work there.
 
-**Revision note.** An earlier version of this experiment reused the same-CCX ping-pong as the victim and put a noisy tenant on the initiator's SMT sibling. A review proved that design structurally insensitive: the ping-pong's round trip is dominated by the cross-core coherence path (the line migrating to the responder core and back), so only a single-digit-nanosecond sliver of each sample actually executed on the contended core. A busy sibling could only ever perturb that sliver, and the predicted signal sat below the OS-jitter floor by construction — the prediction failed at every percentile, and it wasn't a tuning problem. The design below replaces it entirely; there is no ping-pong and no responder in this version.
+---
 
-**What it measures.** Only two logical CPUs matter: `cpu_hot` (the anchor) and its SMT sibling `cpu_sib`. 100% of the timed **victim** work runs on `cpu_hot` — a throughput-bound, high-ILP block: `N_LANES=8` independent accumulator lanes folding a small (4KB, L1-resident) buffer, with no cross-lane or cross-iteration dependency, so the lanes issue in parallel and press the core's issue ports. This is the key correction: a dependent/latency-bound workload (pointer chase, single accumulator) is exactly what SMT coexists with well, so it wouldn't show a signal either. A **tenant** thread pinned to `cpu_sib` runs one of three states, each its own pass:
+## `spsc_pipeline` — spin vs block: the latency/utilization crossover
 
-- **idle** — no tenant thread at all.
-- **noop** — tenant spins on `_mm_pause`, present but yielding the shared execution ports every iteration.
-- **hot** — tenant runs the same independent-lanes shape as the victim (8 lanes over its own L1-resident buffer), genuinely competing for shared issue ports — not the earlier version's single dependent mul/add chain, which wasn't port-hungry enough to matter.
-
-**Methodology.** Passes are interleaved round-robin across `R=8` repeats (idle, noop, hot, idle, noop, hot, ...) rather than run as three long sequential blocks, so thermal ramp and scheduler drift are spread evenly across all three states instead of biasing whichever one runs last on a drifting machine. Samples are pooled across all repeats per state for the percentile report; the min/median/max of the 8 *per-repeat* medians is reported separately as the run-to-run stability check — if that spread is small next to the gap between states, the ordering is a real effect, not noise.
-
-**Prediction**: in the median, idle ≈ noop ≪ hot — a busy tenant steals issue ports (~1.3–2× slowdown expected); a polite pause tenant yields ports so it should look ≈ idle; mere tenant presence adds only minor static-partition overhead. The median is the robust signal here; tails remain OS-jitter-sensitive without core isolation, same caveat as `smt_pingpong` itself.
-
-**Run it**:
-
-```sh
-./sibling_noise          # auto-selects cpu_hot / cpu_sib, runs the interleaved repeats
-./sibling_noise --test   # pure-logic self-check, no timing hardware needed
-```
-
-Fails fast (non-zero exit) if `cpu_hot` has no SMT sibling (SMT off) — the experiment is meaningless without one.
-
-**Limitation — "idle" is not "isolated".** "Idle" here means *no tenant thread is spawned by this tool*, not the sibling hardware thread offlined or otherwise quiesced at the OS/BIOS level. Actually emptying a CPU needs root (`isolcpus`/`cpuset`, or `echo 0 > /sys/devices/system/cpu/cpuN/online`), which is out of scope here — the kernel can still schedule unrelated work (other processes, IRQs) onto an "idle" sibling. Treat the idle row as a best-effort proxy, not a guarantee of a quiescent core.
-
-**What we actually saw** (same laptop as above, SMT on, no core isolation, normal background load; `hot=cpu0`, `sibling=cpu12`; 40,000 samples per state pooled over 8 repeats):
-
-| Tenant state | median | min | p90 | p99 | p99.9 | max | per-repeat median: min / median / max |
-|---|---:|---:|---:|---:|---:|---:|---|
-| idle (no tenant) | 370.7 | 360.7 | 370.7 | 380.7 | 510.9 | 6912.8 | 360.7 / 370.7 / 370.7 |
-| noop (pause-spin) | 380.7 | 370.7 | 390.7 | 400.7 | 410.8 | 4087.6 | 380.7 / 380.7 / 380.7 |
-| hot (busy tenant) | 671.2 | 370.7 | 691.3 | 711.3 | 731.4 | 25627.3 | 671.2 / 671.2 / 671.2 |
-
-All ns per timed chunk.
-
-Honest read: **the thesis held in the median.** idle (370.7 ns) and noop (380.7 ns) sit within ~3% of each other — a polite, port-yielding tenant is indistinguishable from no tenant at all — while hot (671.2 ns) is **1.81×** the idle median, squarely inside the 1.3–2× predicted range. The run-to-run per-repeat median spread within each state is only ~10 ns (idle: 360.7–370.7; noop and hot: perfectly flat across all 8 repeats), which is small next to the ~300 ns gap between {idle, noop} and hot — so this ordering is a real effect on this machine, not run-to-run noise. The tails (p99.9, max) are noisier and less trustworthy without core isolation, consistent with the caveat above; the median is where this design was built to show a signal, and it does.
-
-## Methodology & caveats
-
-- **rdtsc observer overhead**: the fenced `lfence; rdtsc; lfence` reads cost ~20–30 ns per sample pair. This is baked into *every* number, including bare-spin. Accepted as a known, constant tax.
-- **TSC calibration**: the TSC is calibrated against `steady_clock` over a 300 ms busy-spin. This assumes an invariant TSC (constant tick rate regardless of core boost) — true on modern AMD/Intel; check `constant_tsc nonstop_tsc` in `/proc/cpuinfo` flags.
-- **Absolutes are environment-sensitive.** For stable tails run with:
-  - SMT enabled (otherwise no sibling pair exists to measure),
-  - turbo/boost **off** and `governor=performance` (so the core clock doesn't drift mid-run and smear the distribution),
-  - ideally `isolcpus` / `nohz_full` / IRQ affinity steering work off both CPUs of the pair. Without that, expect the p99.99/max tail to be dominated by scheduler noise.
-- Pin failures are fatal (the process exits immediately): an unpinned thread can migrate mid-run, so the "pair" would mean nothing, and the run is defined as invalid rather than merely warned about.
-- The sample array write (`(*samples)[i - 1] = ...`) happens between the two timed `rdtsc_now()` calls of the *next* iteration's window, not inside the one it records, but the store can still land late and overlap the very start of the next timed section on a busy store buffer. This is noise-level and accepted, not corrected for.
-
-## What this does NOT measure
-
-- **Throughput under load** — this is a latency benchmark of a strictly serialized handoff; it says nothing about bandwidth or sustained message rates.
-- **Tail latency under contention** — both threads are dedicated, hot spinners with nothing else competing (by intent). Real systems with contended cores, cold wakeups (futex/condvar), or shared-line contention from third parties will look much worse.
-- **Thread wakeup cost** — no futex/scheduler wakeup is in the path. This is the floor for two already-spinning threads, not the cost of waking a sleeping consumer.
-
-## Why this matters for HFT (and why firms disable SMT)
-
-This benchmark exists to answer: *does cross-core vs SMT-sibling placement matter for a latency-critical pipeline, and why do HFT shops turn SMT off if siblings are the fastest handoff?*
-
-- **SMT siblings give the fastest raw handoff** — the line lives in the shared L1/L2 and never leaves the core (~50 ns RTT median here vs ~90 ns same-CCX, ~400–700 ns cross-CCX). If two pipeline stages genuinely hand off constantly, sibling placement is the raw-latency winner.
-- **But a busy sibling contends for the physical core's shared resources.** Execution ports, L1/L2 capacity, and the store buffer are all shared between two SMT hardware threads. The fast sibling handoff above is measured with a *cooperative* sibling (the ping-pong responder); a genuinely busy, port-hungry tenant on that sibling is a different story. `sibling_noise.cpp` (below) measures this directly with a throughput-bound victim, and the effect shows up cleanly **in the median**: a busy tenant slowed the victim ~1.8× on this machine, while an absent or polite (pause-spinning) tenant was indistinguishable from no tenant at all. Read the experiment below before treating this as settled — it took a rewrite to get a workload actually sensitive to the effect, and the ping-pong RTT above is not that workload.
-- **Affinity is necessary but not sufficient.** Pinning your hot thread steers *your* thread only — it does not keep the kernel, IRQs, or other processes off that CPU or its sibling. To effectively get "SMT off for this core" you must also keep everything else off *both* siblings (`isolcpus` / `nohz_full` / `irqaffinity`, or cpusets), and/or offline the sibling entirely: `echo 0 > /sys/devices/system/cpu/cpuN/online`.
-- **The hybrid design real shops use**: a set of isolated, effectively-SMT-off cores for the hot path, and SMT-on cores for cold-path work (logging, risk batch jobs, housekeeping) where throughput matters and tails don't. Global BIOS SMT-off buys the last sliver of determinism — some microarchitectural resources are statically partitioned under SMT-on even when the sibling is idle — at the cost of throughput everywhere else on the box.
-
-The cross-CCX cliff carries the same placement lesson one level up: keep tightly-coupled threads within one CCX/L3 domain, and treat any CCX (or socket) crossing as a deliberate, budgeted cost.
-
-### "Why disable SMT at all if I can just pin?" — the best-of-both-worlds question
-
-The obvious middle path: leave SMT **on**, pin the hot thread to one hardware thread of a core, and simply never schedule anything on its sibling. The rest of the box keeps SMT throughput; the hot core behaves like an SMT-off core. Is that valid?
-
-**Mostly yes — but affinity is the wrong tool to build it with, and it isn't quite 100%.**
-
-1. **Affinity constrains only the threads you pin.** `taskset`/`pthread_setaffinity_np` says "my thread runs here"; it says nothing about what *else* runs there. The kernel will happily place other processes, kernel threads, softirqs, and IRQ handlers on the sibling — and every one of them contends for the physical core's shared fetch/decode/ports/L1/L2 (see the pipeline diagram above). Pinning your thread while the sibling takes random tenants risks the median slowdown `sibling_noise.cpp` measures (~1.8× on a genuinely port-bound workload, above) whenever one of those random tenants happens to be port-hungry — see that experiment for the measurement backing (and honest caveats on) this claim.
-2. **What actually empties the sibling** is one of:
-   - boot-time isolation covering *both* logical CPUs of the core (`isolcpus=` + `nohz_full=` + `irqaffinity=`), or a `cpuset` shield;
-   - offlining the sibling at runtime: `echo 0 > /sys/devices/system/cpu/cpuN/online` — a reversible, per-core SMT-disable that needs no reboot and removes all doubt.
-3. **Even a perfectly idle sibling isn't identical to SMT-off in BIOS.** With SMT enabled, some core structures are statically partitioned or differently configured (store buffer, ROB entries, some queues — the details are µarch-specific; Zen recombines more gracefully than older Intel). An idle/offlined sibling recovers *nearly* all of it. "Nearly" is the gap BIOS SMT-off closes.
-
-So the hybrid is real: **isolate + offline the sibling on your hot cores, keep SMT everywhere else.** You give up a sliver of determinism versus global SMT-off, and in exchange the rest of the machine keeps its throughput. Firms that run dedicated single-purpose boxes flip SMT off globally not because the hybrid doesn't work, but because on a machine with *no* cold path there's nothing to trade — global-off is simpler and closes the last gap for free.
-
-## SPSC pipeline
-
-`smt_pingpong` and `sibling_noise` both keep every CPU involved **fully busy** the whole time — neither has a notion of "core idle waiting for work." Real pipelines aren't always busy: when messages arrive slowly, spinning to catch the next one wastes an entire core (or, on an SMT sibling, half a physical core) for nothing. `spsc_pipeline.cpp` asks: at what arrival rate does it stop being worth it to spin, and how much latency do you pay to let the consumer sleep instead?
-
-### The pipeline shape
-
-One producer thread, one consumer thread, one [`rigtorp::SPSCQueue<Msg>`](https://github.com/rigtorp/SPSCQueue) between them (pinned to a specific commit — see `CMakeLists.txt` — so upstream can't silently change what this builds against):
+The first two tools keep every CPU fully busy. Real pipelines aren't: when messages arrive slowly, spinning to catch the next one burns a whole core (or half a physical core, on a sibling) for nothing. This asks: *at what arrival rate does spinning stop being worth it, and what latency do you pay to let the consumer sleep?*
 
 ```mermaid
 flowchart LR
-  P["Producer thread<br/>(paced publisher)"] -->|try_emplace, one 64B Msg| Q[["rigtorp::SPSCQueue&lt;Msg&gt;"]]
-  Q -->|front / pop| C["Consumer thread<br/>(wait policy under test)"]
-  C -.->|"parked / wake (Blocking only)"| P
-
+  P["Producer<br/>(paced publisher)"] -->|try_emplace, 64B Msg| Q[["rigtorp::SPSCQueue&lt;Msg&gt;"]]
+  Q -->|front / pop| C["Consumer<br/>(wait policy under test)"]
+  C -.->|"park / wake (Blocking only)"| P
   classDef hot fill:#1f6feb,color:#fff,stroke:#0d1117;
   class P,C hot;
 ```
 
-Each `Msg` is exactly one 64B cache line (`seq`, `pub_tsc`, 6 payload words) so publishing one message can never generate coherence traffic on a neighbour's line. The consumer is anchored on `cpu0`; the producer runs on a partner selected by the same sysfs topology discovery `smt_pingpong` uses — SMT sibling, same-CCX, or cross-CCX. Unlike `smt_pingpong`, the roles are fixed and asymmetric: the consumer is the latency-critical side under measurement, the producer just needs to hit its pacing schedule.
+One producer, one consumer, one [`rigtorp::SPSCQueue<Msg>`](https://github.com/rigtorp/SPSCQueue) (FetchContent, pinned to a commit). Each `Msg` is one 64B line. Consumer anchored on cpu0; producer on a partner selected by tier. Latency is end-to-end: `t_done − pub_tsc`, `pub_tsc` stamped once at the first `try_emplace` (a backpressure retry never re-stamps).
 
-Latency is end-to-end: `t_done` (consumer finishes processing) minus `pub_tsc` (stamped once, at the producer's *first* `try_emplace` attempt for that message — a backpressure retry never re-stamps it, so a message queued behind a full ring doesn't get to lie about when it was first offered).
+**Three consumer wait policies** (a compile-time template parameter, not a per-iteration branch):
 
-### The three wait policies
-
-| Policy | Consumer behaviour when the queue is empty | Cost model |
+| Policy | On empty queue | Trade |
 |---|---|---|
-| **BareSpin** | Tight re-poll of `front()`, no `PAUSE` | Zero detection latency, burns 100% of the core, hammers the load unit |
-| **Pause** | Re-poll with `_mm_pause` each iteration | Slightly higher detection latency (PAUSE's own park window), still burns 100% of the core, but yields shared execution ports to an SMT sibling |
-| **Blocking** | Parks on a futex once the queue is observed empty; producer wakes it conditionally | Consumer core goes idle between messages, at the cost of a park/wake round trip added to that message's tail latency |
+| BareSpin | tight `front()` re-poll | zero detection latency, burns 100% of a core |
+| Pause | re-poll with `_mm_pause` | ~same, but yields shared ports to an SMT sibling |
+| Blocking | parks on a futex, producer wakes it conditionally | frees the core between messages, at a µs-scale wake tax |
 
-`WaitPolicy` is a template parameter, not a runtime enum tested per iteration — same reasoning as `pp_core.hpp`'s `relax<bool Pause>()`: the compiler specializes a dedicated wait loop per policy so the hot loop never spends a branch on which policy it's running.
+BareSpin is skipped on the sibling tier (same port-starvation reason as `smt_pingpong`); Blocking is the marquee sibling row (a parked consumer frees the *whole* logical CPU). Blocking uses a hand-rolled futex eventcount (not `condition_variable`, to measure raw kernel cost); the producer only issues `FUTEX_WAKE` when the consumer is actually parked, so it degrades to ~free at saturation. Correctness against the missed-wake race rests on a **seq_cst Dekker fence pair** (one `atomic_thread_fence(seq_cst)` on each side, between its store and its load) — argued in the code, since the race window is a few ns and not reliably reproducible from userspace. Producer pacing uses an absolute-deadline schedule (a late message never drags the rest).
 
-**BareSpin is skipped on the SMT-sibling tier.** Producer and consumer there are two hardware threads of the *same physical core*; a bare spin on one thread saturates the shared core's execution ports the other thread needs to issue its own store/load, so the row would measure self-inflicted starvation, not handoff latency (identical reasoning to why `smt_pingpong`'s sibling pair only runs the pause variant). Blocking on the sibling tier is the marquee row instead: a parked consumer frees the *entire* logical CPU, easing port pressure on the physical core rather than adding to it.
+### The crossover
 
-### The futex conditional-wake protocol
-
-Blocking's "sleep the consumer" mechanism is a hand-rolled eventcount on one 32-bit word (`ParkWord::v`) plus the raw `futex(2)` syscall — not `std::condition_variable`, because the point is to measure the actual kernel park/wake cost, not whatever a condvar's internal mutex adds on top.
-
-The producer never syscalls unconditionally on every publish (that would defeat the point of the fast path): `maybe_wake()` does one relaxed load of `parked`, and only pays for `FUTEX_WAKE` on a hit. This is why `futex-wake-syscalls` should sit near 0 at `gap=0` (the queue is essentially never observed empty, so the fast path almost never fires) and climb toward the sample count as the gap widens (the consumer is parked before almost every message).
-
-**The missed-wake hazard.** The producer must never publish a message, observe "nobody is parked," and skip the wake — while the consumer is mid-way through announcing that it's about to park. Without an ordering fix, this interleaving is possible even though each individual store is a normal atomic write:
-
-```
-consumer: front() sees empty -> parked.store(1) -> re-checks front(), STILL sees
-          empty (producer's queue-index store hasn't drained from its store
-          buffer yet) -> calls futex_wait
-producer: try_emplace() succeeds (queue-index store enters store buffer)
-          -> parked.load() executes EARLY, before that store drains, and
-          observes parked==0 -> skips the wake
-```
-
-Result: the message is fully published, the consumer is genuinely parked, and nobody wakes it — masked only by the deadlock-insurance backstop timeout (`FUTEX_BACKSTOP_TIMEOUT_MS`), not by correctness.
-
-**The fix is a textbook Dekker/StoreLoad fence pair — two `std::atomic_thread_fence(seq_cst)` calls, one on each thread, each sitting between that thread's own store and its own subsequent load:**
-
-```
-producer: queue-index store (try_emplace)
-          atomic_thread_fence(seq_cst)     <- drains the store before the load
-          parked.load(relaxed)
-consumer: parked.store(1, relaxed)
-          atomic_thread_fence(seq_cst)     <- drains the store before the load
-          front() re-check (a load of the queue index)
-```
-
-Two seq_cst fences on different threads are totally ordered against each other — that ordering is exactly what `memory_order_seq_cst` guarantees for fences, independent of what memory order the *stores themselves* use. Whichever fence lands second in that total order is guaranteed to see everything the other thread wrote before its own fence, so at least one side of the race above always sees the other's write. This is a standard guarantee, not an x86 store-buffer accident.
-
-It would be tempting to use a `seq_cst` *store* on the consumer's side instead of a relaxed store + fence (fewer lines, and it's what an earlier version of this code did) — but a seq_cst store paired against a seq_cst-fenced load on another thread is **not** formally guaranteed to give StoreLoad ordering by the C++ standard. That pairing happened to work on x86 only because GCC compiles a seq_cst store to `xchg`, which is itself a full barrier — a compiler-codegen accident, not a standard guarantee, and not something to depend on. The two-fence version above is formally watertight and, on x86, compiles to the *same* barrier either way — so fixing this cost nothing measurable.
-
-**On the test coverage for this fence.** `--blocking-probe`'s MISSED-WAKE STRESS test exercises the park/wake protocol under randomized producer-side jitter (`nanosleep`-based delays straddling the announce/re-check/park window) and checks for zero backstop fires across 10k rounds. This is honest **protocol smoke coverage** — it round-trips the park/wake path, the EAGAIN path, spurious wakes, and sequence integrity under stress — but it is **not a regression test for the fence itself**. The race window the fence closes is a few nanoseconds wide (the store-buffer drain window), and `nanosleep` is itself a barrier with microsecond-scale granularity — several orders of magnitude too coarse to reliably land a jitter delay inside a few-ns window. When this fence was deliberately removed during review to check whether the probe would catch it, the stress test still passed 3/3 with zero backstop fires. The fence's correctness rests on the analytic Dekker argument above, not on any test result; the probe is there to catch protocol regressions (a broken re-check, a wrong clear-before-wake ordering, an EAGAIN path that actually sleeps), which are much larger-scale bugs it *can* reliably catch.
-
-### Producer pacing
-
-The producer runs an absolute-deadline schedule: message `n`'s target publish time is `t_start + n * gap_cycles`, computed fresh from `t_start` every iteration rather than accumulated by adding `gap_cycles` to the previous message's actual publish time. This means a late message never drags every subsequent message's deadline later with it — a producer that falls behind catches back up to the original schedule rather than free-running at a slower effective rate.
-
-`pace_until(deadline)` is a two-phase busy-wait (never a real sleep — a sleep's wakeup granularity would swamp the sub-microsecond gaps this sweep cares about):
-
-1. **Pause-coarse**: while more than `PACE_TAIL_CYCLES` from the deadline, spin with `_mm_pause` — core-friendly, doesn't hammer the load unit or starve a sibling for no reason.
-2. **Bare-tail**: once within `PACE_TAIL_CYCLES` of the deadline, drop to a bare re-check spin — trades core-friendliness for the tightest possible deadline detection right at the end, since a PAUSE's own latency risks overshooting a deadline that close.
-
-`pace_until` returns whether the deadline had *already* passed on entry (`late_on_entry`), which is the honest "late-publish" signal — comparing a *post-pacing* timestamp to the deadline would be trivially always-true, since the function only returns once `now >= deadline`. At `gap=0` the deadline is fixed at `t_start` for every message, so every message is legitimately "late" (saturated: no pacing possible) — that's the expected, correct reading of `late-publish ≈ SAMPLE_MSGS` at that row, not a bug.
-
-### The arrival-rate sweep and what the metrics mean
-
-`PipeCfg::GAP_NS` sweeps `{0, 250, 1000, 5000, 20000}` ns of producer inter-message gap, from saturated (back-to-back) to clearly sub-saturated. Per `(tier, policy, gap)` cell:
-
-- **waited-fraction** — the share of sampled messages whose *first* `front()` poll found the queue empty. Near 0 at `gap=0` (the queue is rarely empty), approaching 1 as the gap widens past what the consumer can keep the queue topped up against.
-- **parked-fraction** — the share of the sampled window's wall time the consumer spent inside the wait function (Blocking only). Measured over the *sampled* window specifically (consumer-stamped TSC marks at the start of message `WARM_MSGS` and the end of the last message), not the pass's full wall time — the full-pass window also includes thread pin/spin-up and the `WARM_MSGS` warm-up run, which would inflate the denominator and cap a fully-parked pass around 0.83 instead of letting it approach 1.0.
-- **futex-wake-syscalls** — real `FUTEX_WAKE` syscalls issued (diffed around the pass from a global counter). Near 0 at `gap=0` (queue rarely empty, so the conditional fast path rarely fires), rising toward the sample count as the gap grows.
-- **futex-backstop-fires** — the deadlock-insurance timeout firing. Should be exactly 0 in every real pass; a nonzero count here is a missed-wake smoking gun, not a normal outcome.
-
-### The crossover: latency vs. core utilization
-
-At `gap=0` all three wait policies converge — nothing is ever idle long enough for Blocking's park path to matter, and its wake-syscall count is near 0. **Read this row's latency number as queue-depth sojourn time (Little's law: mean latency ≈ mean queue depth / arrival rate), not as a measurement of wake cost** — the queue is saturated, so a message's latency is dominated by how many messages are ahead of it, not by how it was woken.
-
-As the gap widens, BareSpin and Pause keep burning 100% of their core for a shrinking trickle of messages, while Blocking's consumer core goes idle between messages — parked-fraction climbs toward 1.0 — at the cost of the futex park/wake round trip added to each message's tail latency. Roughly: **spin/pause win on raw latency and burn a whole core doing it; Blocking frees on the order of 80%+ of that core back to the OS once the arrival rate is clearly sub-saturated, in exchange for a microsecond-scale wake tax per message.** Where exactly that crossover sits is workload- and machine-dependent — run the sweep and read the `parked-fraction` / latency columns together rather than trusting a single quoted number, since this box has no core isolation (see below).
+The steady sweep runs `gap ∈ {0, 250, 1000, 5000, 20000} ns`. At `gap=0` all three policies converge (the queue is never idle; that row's latency is queue-depth sojourn, not wake cost). As the gap widens, **spin/pause keep burning a full core for a shrinking trickle of messages, while Blocking's consumer goes idle (parked-fraction → ~0.8+) at a µs-scale wake per message.** Where the crossover sits is workload- and machine-dependent — read the `parked-fraction` and latency columns together. Per-cell instrumentation (`waited-fraction`, `futex-wake-syscalls`, `futex-backstop-fires` — which must be 0; nonzero is a missed-wake smoking gun) makes the regime observable.
 
 ### Bursty arrival (`--bursty`)
 
-The gap sweep above models a *steady* arrival rate: every message is `gap_ns` after the last. Real feeds are often bursty instead — long quiet stretches punctuated by a run of back-to-back messages — and that shape stresses Blocking's park/wake path differently than a steady sub-saturated rate: ideally, only the *first* message of a burst should ever pay a wake cost, with the rest of the burst finding the consumer already awake and draining the queue at full speed. `./spsc_pipeline --bursty` runs a second sweep that models exactly this, alongside the default even sweep (run separately — one invocation runs one mode or the other, never both). The bursty mode is additive: it doesn't change or replace the even sweep, which stays the steady-state baseline.
+Real feeds are bursty — quiet stretches, then back-to-back messages — and that's the regime where Blocking should shine: only the *first* message of a burst pays a wake; the rest are drained while the consumer is already awake. `--bursty` runs an on/off schedule: `BURST_LEN ∈ {1,4,16,64}` messages back-to-back, then a 20µs idle gap. (`BURST_LEN=1` reduces to the even sweep — a built-in cross-check.) Each latency sample is tagged **cold** (the consumer paid its wait path — a syscall, for Blocking) or **warm** (the message was already there).
 
-**The model.** A burst is `PipeCfg::BURST_LENS` (`{1, 4, 16, 64}`) messages published `PipeCfg::BURST_INTRA_GAP_NS` (`0`ns — back-to-back, as if the messages were already sitting in a socket buffer by the time the first one is observed) apart, followed by `PipeCfg::BURST_IDLE_GAP_NS` (`20000`ns — chosen to comfortably clear a futex park-entry + wake round trip, so Blocking reliably has time to actually park between bursts) before the next burst's first message. `burst_len=1` is the even-schedule anchor: a "burst" of one message *is* the even sweep, so that row is a live cross-check that the bursty codepath reduces to the already-validated one, not a separate implementation.
+**Result** (SMT-sibling tier, one run; compare within run):
 
-**The closed-form schedule.** Message `n`'s deadline is computed by `sched_deadline(t_start, n, spec)`, a pure function of an `ArrivalSpec{burst_len, intra_gap_cycles, idle_gap_cycles}`:
+| BURST_LEN | Blocking wakes/burst | Blocking p50 | Pause p50 | ratio |
+|---:|---:|---:|---:|---:|
+| 1 (= gap=20000) | — | 1322 | 150 | 8.8× |
+| 4 | 0.99 | 1352 | 321 | 4.2× |
+| 16 | 1.00 | 2114 | 842 | 2.5× |
+| 64 | 0.99 | 5290 | 3086 | 1.7× |
 
-```
-pos       = n % burst_len       // this message's position within its burst
-burst_idx = n / burst_len       // which burst this message belongs to
-period    = (burst_len - 1) * intra_gap_cycles + idle_gap_cycles
-deadline  = t_start + burst_idx * period + pos * intra_gap_cycles
-```
+- **Amortization is essentially perfect**: Blocking pays ≈1.0 wakes per burst regardless of burst length (vs the naive `BURST_LEN`), and its latency closes on Pause's as bursts grow (8.8× → 1.7×). Bursts are exactly where blocking becomes competitive.
+- **Warm-message p50 is queue sojourn, not wake cost**: with back-to-back publication a mid-burst message sits behind its burst-mates, so its end-to-end latency is ≈ position × drain time (~100 ns/slot; the warm bucket is ~100% mid-burst). It rises with burst length and does not shrink on an isolated box — it's queueing, not jitter. Genuine wake avoidance shows only for Blocking at short even-sweep gaps, where warm p50 lands below cold.
 
-Same absolute-deadline, no-drift-accumulation discipline as the even sweep's `pace_until` schedule (see "Producer pacing" above) — a late burst never drags every subsequent burst's deadline later with it. With `burst_len=1`, `pos` is always 0 and `burst_idx == n`, so this reduces bit-for-bit to `t_start + n*gap_cycles`, the even sweep's original formula — asserted directly in `--test` as an equivalence anchor across every value in `GAP_NS`, and the even sweep's producer loop is now implemented by calling `sched_deadline` rather than duplicating the arithmetic.
+---
 
-**Cold/warm attribution, consumer-observed.** Every sampled message's latency (still `t_done - pub_tsc`, no new timestamp — `pub_tsc` is stamped after `pace_until` returns, so an idle gap before publish is never inside the sample) is tagged cold or warm, and the tagging is *deliberately asymmetric* between wait policies:
+## Why this matters for HFT (and why firms disable SMT)
 
-- **BareSpin/Pause**: cold iff the message's first `front()` poll found the queue empty (`had_to_wait`). There's no cheaper/more-expensive path inside a spin loop — every extra iteration costs the same tight re-poll — so `had_to_wait` is the only signal these policies need.
-- **Blocking**: cold iff `wait_blocking_impl` actually invoked `wait_fn` for this message — i.e. a real syscall entry was paid, whether that call resolved via a genuine park+wake or returned `EAGAIN` immediately (the value changed before the kernel actually parked the thread). `had_to_wait` alone is NOT enough: if the announce/re-check race closes before any syscall (the re-check's `front()` finds the message), the message is WARM even though `had_to_wait` was true. This is the same distinction "The futex conditional-wake protocol" section above draws between the outer check and the re-check — cold/warm attribution just makes it directly observable per message instead of only in aggregate wake-syscall counts.
+- **SMT siblings give the fastest raw handoff** (line stays in shared L1/L2). If two hot stages hand off constantly, sibling placement wins on raw latency.
+- **But a busy sibling wrecks it** — ~1.8× slowdown from a port-hungry tenant (`sibling_noise`). The fast median holds only while the sibling stays cooperative or empty.
+- **Affinity is necessary but not sufficient**: pinning steers *your* thread, not the kernel/IRQs/other processes the scheduler puts on the sibling. To truly empty a sibling you need boot-time isolation (`isolcpus`+`nohz_full`+`irqaffinity`) or offlining (`echo 0 > .../cpuN/online`) covering *both* logical CPUs of the core.
+- **The hybrid real shops use**: isolate + offline the sibling on hot-path cores, keep SMT elsewhere for throughput. Global BIOS SMT-off closes the last sliver (some structures are statically partitioned even with an idle sibling).
+- The cross-CCX cliff is the same lesson one level up: keep tightly-coupled threads within one CCX; treat any CCX/socket crossing as a budgeted cost.
 
-The EAGAIN sub-case is split out from a genuine park+wake via a new counter, `g_futex_eagain` (bumped in `real_futex_wait` on `errno==EAGAIN`, mirroring how `g_futex_backstop_fires` already tracks `ETIMEDOUT`) — printed per cell (`eagain N`) alongside the existing wake/backstop counts, diffed the same way around each pass.
+## Caveats
 
-**Boundary semantics via the cross-tab.** Each cell also prints a 4-way cross-tab — cold/warm crossed with burst-head/non-head (`is_burst_head(seq, burst_len) = seq % burst_len == 0`) — as `xtab c/h=.. c/nh=.. w/h=.. w/nh=..`. In the even sweep (`burst_len=1`) every message is a head by definition, so `c/nh` and `w/nh` are always 0 there. In the bursty sweep this is what makes a mid-burst re-park visible: a `cold ∧ nonhead` count above the EAGAIN-driven noise floor means the consumer parked, was woken, and then had to park *again* before the next message in the same burst arrived — the burst wasn't fully absorbed by a single wake.
+- **No core isolation on this box**: absolutes (especially p99.9+ tails) are environment-sensitive — compare rows *within one run*. `late-publish` / `waited-fraction` are the more robust cross-run signals (derived from the pacing schedule, not raw tail latency).
+- **TSC**: calibrated against `steady_clock`, assumes invariant TSC (`constant_tsc nonstop_tsc`).
+- **Not measured**: throughput/bandwidth, tail latency under third-party contention, and (for `smt_pingpong`) thread-wakeup cost — it's the floor for two already-spinning threads.
+- **`mwaitx` is not used**: on this Zen 5 box the AMD hardware wait-on-address woke at ~260 ns p50 vs ~60 ns for a plain spin (>4× slower, ~350–480 ns timeout floor) — not viable for a sub-µs handoff, so Blocking uses a futex.
 
-#### Prediction (written before running the sweep)
+## Future work
 
-As `BURST_LEN` grows from 1 to 64, holding `BURST_IDLE_GAP_NS`/`BURST_INTRA_GAP_NS` fixed:
-
-- **Blocking's wakes-per-burst** (`futex-wake-syscalls` diffed per cell, divided by `SAMPLE_MSGS/BURST_LEN`) should fall toward **≈1** — one park+wake amortized over the whole burst, instead of one per message (`BURST_LEN` wakes) at the low end.
-- **Blocking's mean/p50 latency** should drift toward **Pause's** latency at the same `BURST_LEN`, since only the burst's first message pays the park/wake tax and the rest are drained at spin-loop speed once the consumer is awake.
-- **Cold p50** should stay in the microsecond range across all `BURST_LEN` values (it's dominated by the syscall round trip, not by which message in the burst triggered it) while **warm p50** should stay near the nanosecond-scale processing floor (a warm message paid no syscall at all).
-- **BareSpin/Pause** should be largely burst-insensitive on cold p50 specifically — a spin loop has no "amortizable" expensive path, so bursting messages together shouldn't change what a cold (had-to-wait) sample costs.
-- **The crossover** this predicts: Blocking becomes competitive with spin/pause once `wake_cost / BURST_LEN` drops below the latency budget the workload can tolerate — i.e. large bursts are exactly the regime where Blocking's fixed per-wake tax gets amortized away, even though it's a poor trade at `BURST_LEN=1` (the even sweep already shows this: Blocking's `gap=20000` row pays a full wake tax on essentially every message).
-
-#### Measured (this box, one `--bursty` run, no core isolation)
-
-Blocking, `wakes-per-burst` (target: → 1 as `BURST_LEN` grows) and p50 latency (ns) alongside Pause's p50 at the same `BURST_LEN`, for one representative tier:
-
-| tier | BURST_LEN | Blocking wakes-per-burst | Blocking p50 (ns) | Pause p50 (ns) | Blocking/Pause ratio |
-|---|---:|---:|---:|---:|---:|
-| SMT sibling | 1 (= gap=20000 row) | — | 1322.5 | 150.3 | 8.8× |
-| SMT sibling | 4  | 0.989 | 1352.5 | 320.6 | 4.2× |
-| SMT sibling | 16 | 0.999 | 2113.9 | 841.6 | 2.5× |
-| SMT sibling | 64 | 0.995 | 5289.8 | 3085.7 | 1.7× |
-| cross CCX | 1 (= gap=20000 row) | — | 3897.2 | 891.7 | 4.4× |
-| cross CCX | 4  | 0.999 | 2504.6 | 711.3 | 3.5× |
-| cross CCX | 16 | 1.003 | 2314.3 | 571.1 | 4.1× |
-| cross CCX | 64 | 0.971 | 3266.0 | 450.8 | 7.2× |
-
-Cold/warm split, Blocking, same run (ns):
-
-| tier | BURST_LEN | cold p50 | warm p50 | eagain | xtab (c/h, c/nh, w/h, w/nh) |
-|---|---:|---:|---:|---:|---|
-| SMT sibling | 4  | 1322.4 | 1372.5 | 3 | 24707, 25, 293, 74975 |
-| SMT sibling | 16 | 1342.5 | 2154.0 | 0 | 6240, 2, 10, 93748 |
-| SMT sibling | 64 | 1332.5 | 5339.9 | 0 | 1555, 0, 7, 98438 |
-| cross CCX | 4  | 3917.2 | 2414.5 | 2 | 24958, 7, 42, 74993 |
-| cross CCX | 16 | 2554.7 | 2294.2 | 1 | 6220, 27, 30, 93723 |
-| cross CCX | 64 | 2174.0 | 3286.1 | 1 | 1508, 8, 54, 98430 |
-
-`futex-backstop-fires` was 0 in every cell across the full `--bursty` run (all tiers, all policies, all `BURST_LEN`) — no missed wake.
-
-**Does the prediction hold?** The mechanism half holds cleanly; one prediction (warm ≈ ns) turned out to be ill-posed rather than wrong-in-fact. Details below, honestly — this box has no core isolation, so the tail-latency confounds (C6) are visibly present, but the headline amortization result does not depend on them.
-
-- **Wakes-per-burst → 1: yes, essentially perfectly.** Every Blocking cell sits at **0.97–1.00** — one park+wake per burst, no matter the burst length, versus the naive `BURST_LEN` wakes/burst a per-message park would cost. The amortization is not just "in the ballpark"; it is as clean as the mechanism allows. (An earlier draft reported ≈1.2 here — that was a metric bug: the wake tally was diffed over the whole pass, including the 20k warm-up messages, while the burst count divided only the 100k sample window, inflating the ratio by exactly 120000/100000 = 1.2. The counters are now snapshotted at the warm→sample boundary so every per-cell instrument covers the same window; see the `wakes_per_burst` helper and its `--test` case.)
-- **Blocking drifting toward Pause: yes, clearly.** The Blocking/Pause p50 ratio falls from 8.8× (`BURST_LEN=1`) to 1.7× (`BURST_LEN=64`) on the SMT-sibling tier — the predicted direction and a large effect. The cross-CCX tier is noisier (7.2× at `BURST_LEN=64`) — OS scheduling noise on that pair given no `isolcpus`/IRQ steering (see confound C6) — but the sibling tier, where the two threads share a core and jitter is lowest, shows the crossover cleanly.
-- **Cold p50 stays ~µs: yes.** Every cold p50 above is in the 1.3–3.9µs range, consistent with "dominated by the syscall round trip" regardless of `BURST_LEN` or tier.
-- **Warm p50 stays ~ns: no — and the reason is not noise, it is queueing.** Warm p50 is also in the microsecond range and, for Pause, *grows monotonically with `BURST_LEN`* (SMT-sibling Pause warm p50: 340.6 → 891.6 → 3135.8 ns at `BURST_LEN` 4 → 16 → 64). That is deterministic intra-burst **sojourn time**, not a wake cost and not scheduler jitter: with `BURST_INTRA_GAP_NS=0` a whole burst is published in one instant, so the *k*-th message of a burst sits in the queue while the consumer drains the *k*−1 ahead of it, and its end-to-end latency (`t_done − pub_tsc`) is ≈ *k* × per-message drain time (~100 ns/position — the numbers above are roughly linear in median burst position). The cross-tab proves the warm bucket *is* these mid-burst messages: at `BURST_LEN=64`, `w/nh=98438` of a warm count of 98445 — essentially 100% non-head. So "warm ≈ nanoseconds" was an **ill-posed prediction** under `t_done − pub_tsc`: for a spinner, "warm" just means the message was already queued when the consumer looked (the consumer was *behind*), so warm latency embeds sojourn/lateness by construction — it is not a "the wake was free" signal, and an isolated box would *not* remove it (it is queueing, not jitter). Measuring "the wake cost nothing" needs a consumer-side *noticed-at* timestamp — see the wake-only-timestamp item under Future work. The place the split **does** measure wake avoidance is Blocking at *short* gaps in the even sweep (`gap=250/1000`), where warm p50 lands *below* cold p50 because the re-check-closed-race path genuinely skips the syscall.
-- **BareSpin/Pause burst-insensitive on cold p50: yes.** SMT-sibling Pause cold p50 is 160.3 ns flat across `BURST_LEN=4/16/64` — a spin loop has no amortizable expensive path, so bunching messages doesn't change what a cold sample costs.
-
-Net: the amortization mechanism is real and now cleanly measured — Blocking pays essentially one wake per burst (wakes-per-burst ≈ 1.0), and its latency closes on Pause's as bursts lengthen. The warm-latency half of the prediction was simply ill-posed: warm p50 measures intra-burst queue sojourn, not wake cost, so it was never going to sit at nanoseconds under an end-to-end metric — that is a framing correction, not a confound to isolate away.
-
-**Confounds** (also called out as comments at the relevant code/README sites):
-
-- **C1 — warm latency grows with `BURST_LEN`, at the median as well as the tail.** This is intra-burst sojourn time (Little's law: a message's latency is dominated by how many already-published siblings sit ahead of it in the queue), the same phenomenon the even sweep's `gap=0` note describes, not wake cost. It dominates warm **p50**, not just p99, because with `BURST_INTRA_GAP_NS=0` the *median* warm sample is itself a mid-burst message (the cross-tab shows the warm bucket is ~100% non-head). This is deterministic queueing and does **not** shrink on an isolated box — it is a property of the arrival pattern, not of scheduler noise.
-- **C2 — EAGAIN contamination is bounded, not eliminated.** `g_futex_eagain` can be nonzero (see the table: a handful of events per cell, e.g. 3 at SMT-sibling `BURST_LEN=4`), meaning some "cold" Blocking samples paid a syscall that returned immediately rather than a full park+wake. Since the metric-window fix (MUST-FIX 1), `g_futex_eagain` is snapshotted at the warm→sample boundary just like the wake and backstop counts, so it now covers the *same* sample-only window as the cold/warm sample counts — the eagain figure and the cold count are directly comparable, and the contamination is a few parts in ten thousand.
-- **C3 — mid-burst re-parks are real but negligible.** A nonzero `cold ∧ nonhead` count (e.g. SMT-sibling `BURST_LEN=4`: `c/nh=25`) means the consumer parked, woke, and had to park *again* before the burst finished draining — the burst wasn't fully absorbed by a single wake. These are rare (tens of events out of ~25k bursts, ≈0.001 extra wakes/burst), which is why wakes-per-burst lands at ≈1.0 rather than measurably above it; they are reported so the effect is visible, not because it moves the headline number.
-- **C4 — `intra_gap=0` late-publish semantics.** With `BURST_INTRA_GAP_NS=0`, every non-head message's deadline equals its burst's start time (`sched_deadline`'s `pos * intra_gap_cycles` term is 0 for every `pos`), so `pace_until` finds it already "late" by construction as soon as the burst head has published — every non-head message reads as late-publish. Expect `late-publish ≈ SAMPLE_MSGS*(BURST_LEN-1)/BURST_LEN` (visible in the measured runs: e.g. `BURST_LEN=4` → ≈75000/100000), the same "saturated, not a bug" reading as the even sweep's `gap=0` note, just applied per-burst — `print_pass` prints this explanation on every bursty cell so it doesn't read as a pacing failure.
-- **C5 — `WARM_MSGS=20000` isn't a multiple of every `BURST_LEN`.** `20000/64 = 312.5`, so the sampled window can open mid-burst for the largest `BURST_LEN`. Per-message cold/warm/head tagging is unbiased regardless of where the window boundary falls (each message is tagged on its own merits), so this is documented rather than special-cased.
-- **C6 — cold p50 embeds real scheduler-wake latency on an unisolated box.** Without `isolcpus`/`nohz_full`/IRQ affinity steering, the OS scheduler can land other work on the producer's or consumer's CPU mid-run, and a park+wake's actual latency includes however long the scheduler takes to run the woken thread — compare cells *within this run* only, not against a different run or machine (same caveat as the even sweep — see "No-core-isolation caveat" below).
-
-### The measured mwaitx detour
-
-An earlier phase of this project measured `mwaitx`/`monitorx` (the AMD hardware wait-on-address instructions, `WAITPKG`-adjacent) as a candidate for Blocking's park mechanism, on the theory that a hardware wait might beat a futex round trip for this sub-microsecond handoff. It didn't: on this Zen 5 box, `mwaitx` wake latency measured **~260ns p50**, against **~60ns for a plain spin** reacting to the same store — over 4× slower than just spinning — and imposed a **~350–480ns timeout floor** even in the best case. Both numbers rule it out for a handoff this latency-sensitive; a futex park/wake round trip, despite going through the kernel, is not meaningfully worse and is far simpler to reason about and to actually implement portably. `mwaitx`/`monitorx`/`CPUID`/`WAITPKG` accordingly do not appear anywhere in `spsc_pipeline.cpp` — this was evaluated and dropped, not overlooked.
-
-### Future work
-
-- **Spin-then-park hybrid.** Blocking here is a pure park-on-first-empty policy. Spinning briefly before falling back to a futex park (rather than parking on the very first empty poll) is very likely a better latency/utilization trade at the low end of the gap sweep — it would absorb short empty windows without paying the wake tax, while still freeing the core once the empty window looks sustained. Not implemented here, to keep this pass's three wait policies simple, orthogonal, and easy to reason about in isolation.
-- **Poisson inter-arrival.** Both the even sweep and `--bursty` model deterministic schedules (a fixed gap, or a fixed burst shape at a fixed idle gap). A Poisson process — exponentially distributed inter-arrival times — would stress the park/wake path with a more realistic mix of very-short and very-long gaps at the same mean rate, which a fixed-gap or fixed-burst schedule structurally cannot produce. Not modelled here.
-- **Wake-only timestamp.** The cold/warm split added in this pass reuses the existing end-to-end `t_done - pub_tsc` latency sample for both buckets — it does not add a new timestamp isolating just the park→wake→re-check span from the rest of the message's processing/queueing time. A dedicated wake-latency timestamp (stamped right after `wait_fn` returns, before `check_seq`/`process_msg`) would let cold-sample latency be decomposed into "syscall/wake cost" vs. "everything else" instead of reading it as one combined number — useful for separating C1 (sojourn time) from genuine wake cost more precisely than the current per-cell aggregate allows.
-
-### No-core-isolation caveat
-
-Same caveat as `smt_pingpong` and `sibling_noise`: this box runs with no `isolcpus`/`nohz_full`/IRQ affinity steering, so the OS scheduler and other work can land on either the producer's or consumer's CPU mid-run. Absolute latency numbers, especially in the tail (p99.9+), are environment-sensitive; compare rows *within one run* on this machine, not across runs or machines. `late-publish` and `waited-fraction` are the more robust cross-run signals since they're derived from the pacing schedule itself rather than raw tail latency.
+- **Spin-then-park hybrid** for Blocking (spin briefly before parking) — likely a better trade at the low end than park-on-first-empty.
+- **Poisson inter-arrival** — a more realistic mix of gaps than the deterministic schedules.
+- **Wake-only timestamp** — isolate the park→wake→re-check span from processing/queueing to separate genuine wake cost from sojourn time.
