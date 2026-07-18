@@ -192,9 +192,7 @@ cmake -B build && cmake --build build && ctest --test-dir build   # builds all 3
 ./smt_pingpong 0 12       # explicit CPU pair (validated; fatal on bad args / pin failure)
 ./sibling_noise           # busy-sibling contention (tenant on the SMT sibling)
 ./sibling_noise --same-ccx  # control: tenant on a same-CCX core instead
-./spsc_pipeline           # steady arrival-rate sweep (spin vs pause vs blocking)
-./spsc_pipeline --bursty  # bursty (on/off) arrival
-./spsc_pipeline --proc-sweep   # the placement × processing-weight crossover above
+./spsc_pipeline           # the placement × processing-weight crossover (Step 4)
 <tool> --test             # pure-logic self-checks, no timing hardware needed
 ```
 
@@ -202,17 +200,11 @@ All three share `pp_core.hpp` (TSC calibration, pinning, percentiles, sysfs topo
 discovery). Bad CPU args and pin failures are always fatal — an unpinned pair measures
 nothing. **x86-64 Linux only** (`rdtsc`, `_mm_pause`, sysfs).
 
-## The rest of `spsc_pipeline`
-
-The pipeline does more than the placement crossover — it's also where the *wait strategy*
-lives. When messages arrive slowly, spinning to catch the next one burns a whole core; the
-default sweep and `--bursty` measure the latency-vs-core-utilization tradeoff between a
-**spin**, a **pause**, and a **futex-blocking** consumer across arrival rates. Blocking frees
-the core (~80%+ idle at low rates) at a microsecond-scale wake cost, and its conditional-wake
-fast path degrades to ~free at saturation; a burst amortizes the wake to essentially one per
-burst. (`mwaitx` was measured for the park and dropped — ~260 ns wake vs ~60 ns for a spin on
-this Zen 5 box, so a futex is used instead.) The blocking path's correctness rests on a
-seq_cst Dekker fence pair, argued analytically in the code since the race window is a few ns.
+*(An earlier, larger version of `spsc_pipeline` also carried a separate wait-strategy study —
+spin vs pause vs futex-blocking consumers under steady and bursty arrival. It answered a
+different question (latency vs core-utilization) and is preserved on the
+[`full-wait-strategy-study`](https://github.com/mattyv/SMT-IPC/tree/full-wait-strategy-study)
+branch to keep this one focused on the placement result.)*
 
 ## Caveats
 
@@ -222,3 +214,6 @@ seq_cst Dekker fence pair, argued analytically in the code since the race window
 - **TSC** calibrated against `steady_clock`, assumes invariant TSC (`constant_tsc nonstop_tsc`).
 - **Not measured:** throughput/bandwidth, contention from third parties, and real-socket I/O
   (whose µs-scale syscalls would dominate every ns-scale result here).
+- **`mwaitx` was evaluated and dropped:** the consumer waits with `_mm_pause`, not the AMD
+  hardware wait-on-address — on this Zen 5 box `mwaitx` woke at ~260 ns p50 vs ~60 ns for a
+  plain spin (>4× slower, ~350–480 ns timeout floor), so it isn't viable for a sub-µs handoff.
