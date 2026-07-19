@@ -32,15 +32,19 @@
 //     demand from mca — sibling_analyze treats a call inside a region as a hard
 //     error, because the resulting vector is silently empty.
 //
-// PERTURBATION NOTE: the inline asm carries a "memory" clobber so the compiler
-// cannot hoist memory operations across the marker (which would move work out
-// of the region you meant to measure). That same barrier can itself perturb
-// codegen — most sharply, a volatile asm inside a loop body can defeat
-// autovectorisation. This is the other reason markers belong around the loop,
-// not in it. sibling_analyze additionally builds your TU twice — once with
-// markers and once with them compiled out (-DSIBLING_MARKERS_OFF) — and warns
-// if the instruction mix differs, so a perturbation that changed what ships is
-// caught rather than silently analysed.
+// PERTURBATION NOTE: the inline asm carries a "memory" clobber, which orders
+// MEMORY accesses across the marker — but it does NOT pin register-only
+// dataflow. The compiler may still hoist purely-register work (an ALU chain
+// with no memory operand) out of a marked span, leaving the region empty; that
+// is why the marked region should wrap a LOOP whose body touches memory, not a
+// straight-line register computation. sibling_analyze guards this from both
+// sides: it hard-errors on a marked region that ends up with zero compute
+// instructions (the total-hoist case), and it builds your TU twice — with
+// markers and with them compiled out (-DSIBLING_MARKERS_OFF) — warning if the
+// compute instruction mix of the marked functions differs (the partial-hoist /
+// blocked-vectorisation case). The other perturbation to know about: a volatile
+// asm INSIDE a loop body can defeat autovectorisation, which is the main reason
+// markers belong around the loop, not in it.
 //
 // x86 only (the markers are assembler comments; the concept is x86 SMT). Header
 // is dependency-free and safe to include anywhere.

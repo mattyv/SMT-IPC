@@ -193,33 +193,43 @@ where their placement budget `W*` lands. It's the two-thread analogue of a stati
 
 ```cpp
 #include "sibling_marks.hpp"
-// consumer's steady-state loop:
+// consumer's steady-state loop — markers wrap the LOOP, not its body (a
+// "memory"-clobber marker inside the body can block vectorisation):
 for (;;) { auto* m = q.front(); if (!m) { _mm_pause(); continue; }
   SIBLING_REGION_BEGIN("consumer");
-  process(*m);                       // <-- the per-message work being judged
+  for (int r = 0; r < rounds; r++) process(*m);   // the per-message work
   SIBLING_REGION_END("consumer");
   q.pop(); }
 ```
 
 ```
-$ ./sibling_analyze mythreads.cpp --profile my.profile
+$ ./sibling_analyze mythreads.cpp --profile my.profile --consumer-iters-per-msg 64
+llvm-mca: -mcpu=native
 combined demand (producer+consumer utilisation, >1.0 = oversubscribed):
-    SKXPort1               1.25   <== bottleneck
-    dispatch(front-end)    0.95
-VERDICT: COLLIDES on 'SKXPort1' (combined demand 1.25).
-placement budget W*: mid 1332 ns  (range 887–2664 ns)
-=> consumer does ~3 ns/msg < W*: SIBLING is the faster placement.
+    SKXPort1               2.01   <== bottleneck
+VERDICT: COLLIDES on 'SKXPort1' (combined demand 2.01).
+placement budget W* (ns of WORK PER MESSAGE): mid 1641 ns  (range 1089–3296 ns)
+=> your consumer does ~64 ns/msg < W*~1641 ns: SIBLING is the faster placement.
 ```
 
+Note **`--consumer-iters-per-msg`**: mca's "iteration" is one repeat of the marked *asm block*
+(usually one loop iteration), which is not one message. To turn the per-block cost into
+per-message work — the quantity the recommendation compares against `W*` — you tell the tool how
+many blocks make a message. Without it, the tool prints the budget but withholds the
+recommendation rather than assume `1` (which would make almost any loop-marked consumer read as
+"sibling wins").
+
 **How it maps to the four measured steps.** The friction multiplier `C` comes from overlaying
-the two regions' per-port utilisation (a port over 1.0 = a clash), plus a synthetic
-*dispatch* row that catches two port-*disjoint* streams still colliding on shared front-end
-width. The budget is the same crossover as Step 4 —
-`W* = Δh / (ε + duty(W)·(C−1))` — with `Δh` (one-way handoff edge) from Step 1/4, `ε` (presence
-tax) from Step 2's polite-sibling row, and `duty(W)` solved as a fixed point from the
-producer's own cycle count. **`--calibrate` ties it back to Step 2's ground truth**: it runs the
-`sibling_noise` victim kernel through the static path and prints the `calib_scale` that maps
-the predicted `C` onto your measured busy-sibling multiplier (the README's 1.81×).
+the two regions' per-port utilisation — each resource's pressure divided by its *unit count*, so
+a multi-unit group (AMD's `Zn4LSU`/`Zn4FP45`) isn't mistaken for oversubscribed — plus a
+synthetic *dispatch* row that catches two port-*disjoint* streams still colliding on shared
+front-end width. The budget is the same crossover as Step 4 — `W* = Δh / (ε + duty(W)·(C−1))` —
+with `Δh` (one-way handoff edge) from Step 1/4, `ε` (presence tax) from Step 2's polite-sibling
+row, and `duty(W)` solved in closed form from the producer's own cycle count. **`--calibrate`
+ties it back to Step 2's ground truth**: it runs the `sibling_noise` victim kernel through the
+static path and prints the `calib_scale` that maps the predicted `C` onto your measured
+busy-sibling multiplier (the README's 1.81×). Set `mca_mcpu` in your profile if `-mcpu=native`
+mis-resolves (LLVM < 19 has no `znver5` model).
 
 **Seeing the prediction against the measurement.** `sibling_analyze --emit-model` dumps the
 predicted `Δ(W)` curve as CSV (the C++ tool stays the single source of the model math), and

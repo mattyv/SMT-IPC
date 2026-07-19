@@ -38,3 +38,13 @@ allowance_ns = 40
 # busy-sibling multiplier. Run `sibling_analyze --calibrate <your measured
 # hot/idle ratio>` and paste the value it prints. 1.0 means "trust mca as-is".
 calib_scale = 0.81
+
+# The -mcpu model llvm-mca uses. "native" auto-detects the host, BUT LLVM < 19
+# has no znver5 model, so on a Zen 5 box native silently falls back to a
+# generic/znver4 model — set this explicitly (e.g. znver4) if native
+# mis-resolves, or upgrade to LLVM >= 19 for a true znver5 model.
+mca_mcpu = native
+
+# Machine fingerprint, stamped into --emit-model output and matched against the
+# measured CSV so an overlay never silently mixes two microarchitectures.
+machine = zen5

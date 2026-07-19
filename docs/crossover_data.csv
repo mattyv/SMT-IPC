@@ -10,6 +10,9 @@
 #
 # machine: AMD Zen 5 (README box); no core isolation (p50 wanders run-to-run;
 # the robust signal is the sign-change bracket 1.7us..6.9us, not the exact point).
+# The `machine=` tag below must match the profile's `machine=` (and the model
+# CSV's stamp) or plot_crossover.py --check refuses the overlay as a mismatch.
+# machine=zen5
 work_ns,sibling_p50_ns,sameccx_p50_ns
 20,70,120
 120,180,220

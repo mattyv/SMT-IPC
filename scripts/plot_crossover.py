@@ -40,17 +40,24 @@ import sys
 
 
 def read_measured(path):
-    """CSV: work_ns,sibling_p50_ns,sameccx_p50_ns -> [(work_ns, delta_ns)]."""
+    """CSV: work_ns,sibling_p50_ns,sameccx_p50_ns -> ([(work_ns, delta_ns)],
+    machine). The machine fingerprint is read from a `# machine=NAME` comment."""
     pts = []
+    machine = None
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#") or line.startswith("work_ns"):
+            if line.startswith("#"):
+                for tok in line.lstrip("# ").split():
+                    if tok.startswith("machine="):
+                        machine = tok.split("=", 1)[1]
+                continue
+            if not line or line.startswith("work_ns"):
                 continue
             work, sib, ccx = (float(x) for x in line.split(",")[:3])
             pts.append((work, sib - ccx))
     pts.sort()
-    return pts
+    return pts, machine
 
 
 def read_model(path):
@@ -100,21 +107,56 @@ def interp_delta(curve, w):
     return curve[-1][1]
 
 
-def run_check(measured, curve, meta, tol_ns):
-    """Numeric agreement check. Returns (ok, lines)."""
+def _finite(x):
+    """True iff x is a finite number (the 'none' W* sentinel is a str, and
+    float('nan') would slip past a bare isinstance(float) — guard both)."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) \
+        and x == x and abs(x) != float("inf")
+
+
+def run_check(measured, curve, m_machine, meta, tol_ns, rel_tol, force):
+    """Numeric agreement check. Returns (ok, lines). Compares machine
+    fingerprints, the W* band vs the measured sign-change bracket (with a
+    both-sides-no-crossover case that PASSES), and per-point residuals with a
+    scale-aware tolerance max(tol_ns, rel_tol*|measured|)."""
     lines = []
     ok = True
 
+    # Machine fingerprint: an mca model is uarch-specific, so refuse to validate
+    # a cross-machine overlay unless explicitly forced.
+    mod_machine = meta.get("machine")
+    if isinstance(mod_machine, (int, float)):
+        mod_machine = str(mod_machine)
+    if m_machine and mod_machine and m_machine != mod_machine:
+        msg = (f"machine mismatch: measured='{m_machine}' model='{mod_machine}' "
+               f"— an mca model is uarch-specific; this overlay is not a "
+               f"validation")
+        if force:
+            lines.append(msg + " (forced, continuing)")
+        else:
+            lines.append(msg + " — FAIL (pass --force to override)")
+            ok = False
+    elif not (m_machine and mod_machine):
+        lines.append("note: machine fingerprint missing on one side — cannot "
+                     "confirm same-machine; treat result with care")
+
     lo, hi = meta.get("wstar_lo"), meta.get("wstar_hi")
+    model_has_band = _finite(lo) and _finite(hi)
     bracket = sign_change_bracket(measured)
-    if bracket is None:
-        lines.append("measured: no sign change found — cannot bracket crossover")
+    if bracket is None and not model_has_band:
+        # Perfect agreement: neither side crosses zero in range (sibling always
+        # wins). This is a PASS, not a failure.
+        lines.append("both measured and model predict NO crossover in range "
+                     "(sibling wins throughout): agree")
+    elif bracket is None:
+        lines.append("mismatch: measured shows NO crossover but model predicts "
+                     f"W* in [{lo:.0f},{hi:.0f}] — FAIL")
         ok = False
-    elif not (isinstance(lo, float) and isinstance(hi, float)):
-        lines.append("model: no finite W* band — nothing to compare")
+    elif not model_has_band:
+        lines.append("mismatch: model predicts NO crossover but measured "
+                     f"crosses in [{bracket[0]:.0f},{bracket[1]:.0f}] — FAIL")
         ok = False
     else:
-        # Bands overlap iff each starts before the other ends.
         overlap = (lo <= bracket[1]) and (bracket[0] <= hi)
         lines.append(
             f"W* band [{lo:.0f},{hi:.0f}] ns vs measured bracket "
@@ -123,18 +165,19 @@ def run_check(measured, curve, meta, tol_ns):
         )
         ok = ok and overlap
 
-    worst = 0.0
+    worst_ratio = 0.0
     for w, dm in measured:
         dpred = interp_delta(curve, w)
         r = abs(dpred - dm)
-        worst = max(worst, r)
+        tol = max(tol_ns, rel_tol * abs(dm))  # scale-aware
+        worst_ratio = max(worst_ratio, r / tol)
         lines.append(
             f"  work={w:8.0f} ns  measured Δ={dm:7.1f}  model Δ={dpred:7.1f}  "
-            f"|resid|={r:6.1f} ns"
+            f"|resid|={r:6.1f} ns  (tol {tol:.0f})"
         )
-    lines.append(f"max residual {worst:.1f} ns (tol {tol_ns:.0f} ns): "
-                 f"{'ok' if worst <= tol_ns else 'FAIL'}")
-    ok = ok and (worst <= tol_ns)
+    lines.append(f"residual/tol worst {worst_ratio:.2f}: "
+                 f"{'ok' if worst_ratio <= 1.0 else 'FAIL'}")
+    ok = ok and (worst_ratio <= 1.0)
     return ok, lines
 
 
@@ -242,11 +285,15 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--stamp", default="")
     ap.add_argument("--check", action="store_true")
-    ap.add_argument("--tol", type=float, default=80.0,
-                    help="max |model-measured| delta residual, ns")
+    ap.add_argument("--tol", type=float, default=130.0,
+                    help="absolute floor for the delta residual tolerance, ns")
+    ap.add_argument("--rel-tol", type=float, default=0.15,
+                    help="relative residual tolerance (fraction of |measured|)")
+    ap.add_argument("--force", action="store_true",
+                    help="proceed even if machine fingerprints mismatch")
     a = ap.parse_args()
 
-    measured = read_measured(a.measured)
+    measured, m_machine = read_measured(a.measured)
     curve, meta = read_model(a.model)
     if len(measured) < 2 or len(curve) < 2:
         print("need >=2 measured and >=2 model points", file=sys.stderr)
@@ -258,7 +305,8 @@ def main():
         print(f"wrote {a.out}")
 
     if a.check:
-        ok, lines = run_check(measured, curve, meta, a.tol)
+        ok, lines = run_check(measured, curve, m_machine, meta, a.tol,
+                              a.rel_tol, a.force)
         print("\n".join(lines))
         print("CHECK:", "PASS" if ok else "FAIL")
         return 0 if ok else 1

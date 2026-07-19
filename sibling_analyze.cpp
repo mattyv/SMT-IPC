@@ -92,6 +92,8 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <sys/wait.h> // WIFEXITED / WEXITSTATUS for pclose status decoding
+#include <unistd.h>   // getpid, mkdtemp
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -122,9 +124,39 @@ struct Profile {
   // means "trust mca as-is"; --calibrate refines it against a measured busy-
   // sibling number for a known pair.
   double calib_scale = 1.0;
+  // The -mcpu model llvm-mca should use. "native" asks LLVM to detect the host,
+  // but LLVM < 19 has no znver5 model, so on a Zen 5 box native silently falls
+  // back to a generic/znver4 model; set this to a known-good model explicitly
+  // (e.g. "znver4") when native mis-resolves. Printed on every run.
+  std::string mca_mcpu = "native";
+  // Machine fingerprint (free-form, e.g. "zen5"): stamped into --emit-model
+  // output and matched against the measured CSV so an overlay never silently
+  // mixes two microarchitectures.
+  std::string machine = "";
 
   double Dh() const { return handoff_sameccx_ns - handoff_sibling_ns; }
 };
+
+// Validate machine constants; returns an error string (empty == ok). A bad
+// profile must fail loudly, not silently propagate inf/NaN/"W*=1ns" nonsense.
+static std::string validate_profile(const Profile &p) {
+  if (!(p.freq_ghz > 0))
+    return "freq_ghz must be > 0";
+  if (!(p.pacing_headroom > 0))
+    return "pacing_headroom must be > 0";
+  if (p.allowance_ns < 0)
+    return "allowance_ns must be >= 0";
+  if (p.presence_tax < 0)
+    return "presence_tax must be >= 0";
+  if (p.Dh() < 0)
+    return "handoff_sameccx_ns < handoff_sibling_ns (Dh negative) — the "
+           "sibling "
+           "must have the SMALLER handoff; check the two values are not "
+           "swapped";
+  if (!(p.calib_scale > 0))
+    return "calib_scale must be > 0";
+  return "";
+}
 
 // One llvm-mca "Code Region": the fields we need from its summary plus the
 // per-iteration pressure on every named processor resource.
@@ -136,7 +168,14 @@ struct RegionProfile {
   long instructions = 0;      // total (all iterations)
   long iterations = 0;
   std::map<std::string, double>
-      pressure; // resource name -> per-iteration cycles
+      pressure; // resource name -> per-iteration cycles (summed over sub-units)
+  std::map<std::string, int>
+      units; // resource name -> number of parallel sub-units (its CAPACITY).
+             // llvm-mca models a ProcResGroup (e.g. AMD Zn4LSU, Zn4FP45) as
+             // several sub-indices [14.0]/[14.1]/[14.2] that all share ONE
+             // name; that count is the resource's throughput, so per-unit
+             // utilisation is pressure / (cycles * units), NOT pressure /
+             // cycles. A plain single-ported resource has units == 1.
 };
 
 // Result of overlaying two regions.
@@ -229,10 +268,13 @@ static std::vector<RegionProfile> parse_mca_text(const std::string &text) {
         r.uops_per_cycle = v;
       else if (scalar(line, "Block RThroughput:", v))
         r.cycles_per_iter = v;
-      else if (std::smatch rm; std::regex_match(line, rm, res_decl))
+      else if (std::smatch rm; std::regex_match(line, rm, res_decl)) {
         idx2name[rm[1].str()] = rm[2].str();
-      else if (line.find("Resource pressure per iteration:") !=
-               std::string::npos) {
+        // Each sub-index declaration of a name adds one parallel unit of
+        // capacity. "[3] - Zn4ALU0" => units 1; "[14.0/.1/.2] - Zn4LSU" => 3.
+        r.units[rm[2].str()]++;
+      } else if (line.find("Resource pressure per iteration:") !=
+                 std::string::npos) {
         // Header line of column indices, then a values line, positionally
         // aligned. Zip them; skip '-' (zero pressure).
         if (i + 2 < N) {
@@ -269,8 +311,18 @@ static std::vector<RegionProfile> parse_mca_text(const std::string &text) {
 static std::map<std::string, double> utilisation(const RegionProfile &r) {
   std::map<std::string, double> u;
   double cyc = r.cycles_per_iter > 0 ? r.cycles_per_iter : 1.0;
-  for (auto &[name, p] : r.pressure)
-    u[name] = p / cyc;
+  for (auto &[name, p] : r.pressure) {
+    // Divide the summed pressure by the resource's CAPACITY (cycles * units):
+    // a 3-unit group at 3.0 cycles of pressure over a 1-cycle block is 100%
+    // busy per unit (u = 3/(1*3) = 1.0), NOT 300% (u = 3/1). Without the unit
+    // count this over-predicts grouped resources (AMD's load/store/FP groups) —
+    // which would flip the tool's safety asymmetry into false COLLIDES verdicts
+    // on exactly the platform the repo targets.
+    int units = r.units.count(name) ? r.units.at(name) : 1;
+    if (units < 1)
+      units = 1;
+    u[name] = p / (cyc * units);
+  }
   if (r.dispatch_width > 0)
     u["dispatch(front-end)"] = r.uops_per_cycle / r.dispatch_width;
   return u;
@@ -314,33 +366,37 @@ static Overlay overlay(const RegionProfile &producer,
 // SECTION 3 — duty(W) and the W* crossover (pure).
 // ===========================================================================
 
-// Producer busy-time per message, ns: its cycles-per-iteration converted to ns.
-// (One region iteration == one message's worth of producer work, by the marking
-// contract: the producer's marked loop body is the per-message publish path.)
+// Producer busy-time per MESSAGE, ns: cycles-per-block * blocks-per-message,
+// converted to ns. blocks_per_msg comes from --producer-iters-per-msg (default
+// 1): one marked block need not be one message (mca's "iteration" is one repeat
+// of the marked asm block, which may be a single loop iteration).
 static double producer_busy_ns(const RegionProfile &producer,
-                               const Profile &prof) {
-  return producer.cycles_per_iter / prof.freq_ghz;
+                               const Profile &prof, double blocks_per_msg) {
+  return producer.cycles_per_iter * blocks_per_msg / prof.freq_ghz;
 }
 
 // duty(W): fraction of the consumer's window during which the producer is hot.
-// Fixed point: the message period is headroom*(contended consumer work +
-// allowance); duty = producer_busy / period; the contended work depends on duty
-// through C_eff. A handful of iterations converge (period is monotone in duty).
+// The message period is headroom*(contended consumer work + allowance) and
+// duty = producer_busy / period, where the contended work depends on duty
+// through c_eff = 1 + eps + duty*(C-1). Substituting gives a quadratic in duty:
+//   a*duty^2 + b*duty - t = 0,  a = H*W*(C-1), b = H*(W*(1+eps)+A), t = t_prod.
+// We take the positive root (exact — no iteration, no convergence caveat) and
+// clamp to [0,1] (the producer cannot be busy more than all the time).
 static double duty_of(double W_ns, const Profile &prof, double C,
                       double t_prod_ns) {
-  double duty = 0.0;
-  for (int it = 0; it < 32; it++) {
-    double c_eff = 1.0 + prof.presence_tax + duty * (C - 1.0);
-    double period = prof.pacing_headroom * (W_ns * c_eff + prof.allowance_ns);
-    double next = period > 0 ? t_prod_ns / period : 0.0;
-    if (next > 1.0)
-      next = 1.0; // producer cannot be busy more than all the time
-    if (std::fabs(next - duty) < 1e-9) {
-      duty = next;
-      break;
-    }
-    duty = next;
-  }
+  double H = prof.pacing_headroom, A = prof.allowance_ns,
+         eps = prof.presence_tax;
+  double a = H * W_ns * (C - 1.0);
+  double b = H * (W_ns * (1.0 + eps) + A);
+  double duty;
+  if (a <= 0.0) // C == 1 (or degenerate W): linear, duty = t / b
+    duty = b > 0 ? t_prod_ns / b : 0.0;
+  else
+    duty = (-b + std::sqrt(b * b + 4.0 * a * t_prod_ns)) / (2.0 * a);
+  if (duty < 0.0)
+    duty = 0.0;
+  if (duty > 1.0)
+    duty = 1.0;
   return duty;
 }
 
@@ -407,6 +463,7 @@ static Budget solve_budget(const Profile &prof, const Overlay &o,
 struct Lint {
   std::vector<std::string> errors;   // fatal: vector is untrustworthy
   std::vector<std::string> warnings; // caveat: verdict weaker
+  int compute = 0;                   // count of real port-bound instructions
 };
 
 // `region_asm` is the raw asm text between a region's BEGIN and END markers.
@@ -414,29 +471,41 @@ static Lint lint_region(const std::string &name,
                         const std::string &region_asm) {
   Lint L;
   std::istringstream is(region_asm);
-  int calls = 0, branches = 0, atomics = 0;
+  int calls = 0, branches = 0, atomics = 0, compute = 0;
   for (std::string line; std::getline(is, line);) {
     std::string t = trim(line);
     if (t.empty() || t[0] == '.' || t[0] == '#')
-      continue; // directive / comment / label
-    if (t.back() == ':')
-      continue; // label
+      continue; // directive / comment
     auto toks = tokens(t);
     if (toks.empty())
       continue;
     std::string op = toks[0];
+    // A label may share a line with an instruction ("foo: nop"): drop a leading
+    // "label:" token and re-read the mnemonic, rather than losing the whole
+    // line. A bare label line ("foo:") then has no further token and is
+    // skipped.
+    if (!op.empty() && op.back() == ':') {
+      if (toks.size() < 2)
+        continue;
+      op = toks[1];
+    }
     // lock-prefixed atomic: "lock" then the real op.
     bool locked = (op == "lock");
     if (locked && toks.size() > 1)
       op = toks[1];
     if (op.rfind("call", 0) == 0)
       calls++;
-    else if (op.size() >= 2 && op[0] == 'j' && op != "jmp")
+    else if (op.rfind("jmp", 0) == 0)
+      continue; // unconditional jump: not a mispredict/branch-model concern
+    else if (op.size() >= 2 && op[0] == 'j')
       branches++; // conditional jump (jne/je/jl/...)
     else if (locked || op.rfind("xchg", 0) == 0 || op.rfind("mfence", 0) == 0 ||
              op.rfind("lfence", 0) == 0 || op.rfind("sfence", 0) == 0)
       atomics++;
+    else
+      compute++; // a real instruction that lands on some port
   }
+  L.compute = compute;
   if (calls)
     L.errors.push_back(name + ": contains " + std::to_string(calls) +
                        " call(s) — the callee's demand is invisible to mca, so "
@@ -456,6 +525,16 @@ static Lint lint_region(const std::string &name,
         "iteration and models no mispredict. A cold path inside the region "
         "inflates its demand; shrink the region to the true steady-state "
         "body.");
+  if (compute == 0)
+    L.errors.push_back(
+        name +
+        ": marked region contains ZERO compute instructions — the "
+        "compiler hoisted the register-only work out across the marker (a "
+        "\"memory\" clobber orders memory ops, not register dataflow). The "
+        "region's port vector is empty and any verdict from it is a lie. Wrap "
+        "a "
+        "loop whose body touches memory, or restructure so the work stays "
+        "put.");
   return L;
 }
 
@@ -471,24 +550,62 @@ static std::string slurp_file(const std::string &path) {
   return ss.str();
 }
 
-// Run a command, capture stdout. Returns exit status; fills `out`.
-static int run_capture(const std::string &cmd, std::string &out) {
+// Single-quote a token for safe shell interpolation: wrap in '...' and escape
+// any embedded single quote as '\''. Defeats command injection and word-
+// splitting from source paths / --cflags (an ordinary space in a path, or a
+// malicious '; rm ...', both become one inert argument).
+static std::string shell_quote(const std::string &s) {
+  std::string out = "'";
+  for (char c : s) {
+    if (c == '\'')
+      out += "'\\''";
+    else
+      out += c;
+  }
+  out += "'";
+  return out;
+}
+
+// Run a command; capture stdout into `out` and stderr into `err` (kept
+// SEPARATE, so a tool's warnings are surfaced to the user rather than fed into
+// the parser). Returns the child's exit code (0 = success), or -1 to spawn /
+// 128+signal on abnormal termination. stderr is routed through a unique temp
+// file so nothing is interleaved into stdout.
+static int run_capture(const std::string &cmd, std::string &out,
+                       std::string &err, const std::string &tmpdir) {
   out.clear();
-  FILE *p = popen(cmd.c_str(), "r");
+  err.clear();
+  std::string errfile = tmpdir + "/stderr." + std::to_string(getpid());
+  std::string full = cmd + " 2>" + shell_quote(errfile);
+  FILE *p = popen(full.c_str(), "r");
   if (!p)
     return -1;
   char buf[4096];
   size_t n;
   while ((n = fread(buf, 1, sizeof(buf), p)) > 0)
     out.append(buf, n);
-  return pclose(p);
+  int st = pclose(p);
+  err = slurp_file(errfile);
+  ::remove(errfile.c_str());
+  if (st == -1)
+    return -1;
+  if (WIFSIGNALED(st))
+    return 128 + WTERMSIG(st);
+  return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-// Extract the raw asm text of each named region from a compiled .s: everything
-// between "# LLVM-MCA-BEGIN name" and the matching "# LLVM-MCA-END".
-static std::map<std::string, std::string>
-extract_regions_asm(const std::string &asm_text) {
-  std::map<std::string, std::string> out;
+// Extract the raw asm text of each named region from a compiled .s (everything
+// between "# LLVM-MCA-BEGIN name" and "# LLVM-MCA-END"), and count how many
+// times each name is opened. A name opened more than once means the marked
+// function was inlined at several call sites (or duplicate markers) — llvm-mca
+// then emits several same-named regions and find_region() would silently pick
+// one, so the driver hard-errors on a count > 1.
+struct RegionAsm {
+  std::map<std::string, std::string> body;
+  std::map<std::string, int> begins;
+};
+static RegionAsm extract_regions_asm(const std::string &asm_text) {
+  RegionAsm out;
   std::istringstream is(asm_text);
   std::string cur;
   std::string body;
@@ -499,11 +616,12 @@ extract_regions_asm(const std::string &asm_text) {
       cur = toks.empty() ? "" : toks.back();
       body.clear();
       in = true;
+      out.begins[cur]++;
       continue;
     }
     if (line.find("LLVM-MCA-END") != std::string::npos) {
       if (in)
-        out[cur] += body;
+        out.body[cur] += body;
       in = false;
       continue;
     }
@@ -522,14 +640,16 @@ extract_regions_asm(const std::string &asm_text) {
 // vpmuludq, etc.), which are kept.
 static bool is_data_movement(const std::string &op) {
   static const char *prefixes[] = {
-      "mov",        "vmov",    "lea",      "push",   "pop",
-      "vzero",      "vinsert", "vextract", "vpinsr", "vpextr",
-      "vperm",      "vpunpck", "vshuf",    "shuf",   "vpbroadcast",
-      "vbroadcast", "vpblend", "vblend",   "vpack",  "vpalignr"};
+      "mov",        "vmov",    "cmov",    "kmov",     "lea",    "push",
+      "pop",        "vzero",   "vinsert", "vextract", "vpinsr", "vpextr",
+      "vperm",      "vpunpck", "punpck",  "vshuf",    "shuf",   "vpbroadcast",
+      "vbroadcast", "vpblend", "vblend",  "pblend",   "vpack",  "pack",
+      "vpalignr",   "palignr"};
   for (const char *p : prefixes)
     if (op.rfind(p, 0) == 0)
       return true;
-  return op == "nop" || op == "endbr64" || op == "ret" || op == "vzeroupper";
+  return op == "nop" || op == "endbr64" || op == "ret" || op == "retq" ||
+         op == "vzeroupper";
 }
 
 // Fraction of COMPUTE instructions that changed between two builds' histograms.
@@ -580,6 +700,54 @@ mnemonic_histogram(const std::string &asm_text) {
   return h;
 }
 
+// Split a .s into (function-symbol -> body) chunks. A function starts at a
+// column-0 label that is not a local ".L" label; everything up to the next such
+// label is its body. Used to scope the perturbation diff to only the functions
+// that actually contain markers, so a regional vectorisation loss isn't diluted
+// by unrelated code elsewhere in the TU.
+static std::map<std::string, std::string>
+split_functions(const std::string &asm_text) {
+  std::map<std::string, std::string> out;
+  std::istringstream is(asm_text);
+  std::string cur, body;
+  for (std::string line; std::getline(is, line);) {
+    if (!line.empty() && line[0] != ' ' && line[0] != '\t' &&
+        line.back() == ':' && line.rfind(".L", 0) != 0 && line[0] != '.') {
+      if (!cur.empty())
+        out[cur] += body;
+      cur = line.substr(0, line.size() - 1);
+      body.clear();
+    } else if (!cur.empty()) {
+      body += line + "\n";
+    }
+  }
+  if (!cur.empty())
+    out[cur] += body;
+  return out;
+}
+
+// Perturbation ratio scoped to the functions that contain markers: compare each
+// marked function's compute histogram against the same function in the unmarked
+// build, aggregated. Returns 0 if no marked function is found in both.
+static double marked_function_perturbation(const std::string &asm_on,
+                                           const std::string &asm_off) {
+  auto fon = split_functions(asm_on);
+  auto foff = split_functions(asm_off);
+  std::string on_marked, off_marked;
+  for (auto &[name, body] : fon) {
+    if (body.find("LLVM-MCA-BEGIN") == std::string::npos)
+      continue;
+    on_marked += body;
+    auto it = foff.find(name);
+    if (it != foff.end())
+      off_marked += it->second;
+  }
+  if (on_marked.empty() || off_marked.empty())
+    return 0.0; // nothing comparable — no false alarm
+  return perturbation_ratio(mnemonic_histogram(on_marked),
+                            mnemonic_histogram(off_marked));
+}
+
 // Load a key=value profile file over the defaults.
 static Profile load_profile(const std::string &path) {
   Profile p;
@@ -614,29 +782,65 @@ static Profile load_profile(const std::string &path) {
       p.allowance_ns = v;
     else if (k == "calib_scale")
       p.calib_scale = v;
+    else if (k == "mca_mcpu")
+      p.mca_mcpu = trim(line.substr(eq + 1));
+    else if (k == "machine")
+      p.machine = trim(line.substr(eq + 1));
   }
   return p;
 }
 
-// Compile a TU to asm (-S). `markers_off` selects the unmarked build. Returns
-// the .s text, or empty + sets ok=false on compile failure.
+// Compile a TU to asm (-S). `markers_off` selects the unmarked build. Every
+// interpolated token (source path, each cflag) is shell-quoted, and outputs go
+// to unique per-run paths inside `tmpdir`. Returns the .s text; sets ok=false
+// and prints the compiler's stderr on failure.
 static std::string compile_to_asm(const std::string &src,
-                                  const std::string &extra_cflags,
-                                  bool markers_off, bool &ok) {
-  std::string sfile =
-      "/tmp/sibling_analyze_" + std::string(markers_off ? "off" : "on") + ".s";
-  std::string cmd = "g++ -O3 -std=c++23 -march=native -S " + extra_cflags +
-                    (markers_off ? " -DSIBLING_MARKERS_OFF" : "") + " " + src +
-                    " -o " + sfile + " 2>&1";
-  std::string out;
-  int rc = run_capture(cmd, out);
+                                  const std::vector<std::string> &cflags,
+                                  bool markers_off, const std::string &tmpdir,
+                                  bool &ok) {
+  std::string sfile = tmpdir + "/" + (markers_off ? "off" : "on") + ".s";
+  std::string cmd = "g++ -O3 -std=c++23 -march=native -S";
+  for (auto &f : cflags)
+    cmd += " " + shell_quote(f);
+  if (markers_off)
+    cmd += " -DSIBLING_MARKERS_OFF";
+  cmd += " " + shell_quote(src) + " -o " + shell_quote(sfile);
+  std::string out, err;
+  int rc = run_capture(cmd, out, err, tmpdir);
   if (rc != 0) {
-    fprintf(stderr, "compile failed:\n%s\n", out.c_str());
+    fprintf(stderr, "compile failed:\n%s%s\n", out.c_str(), err.c_str());
     ok = false;
     return "";
   }
   ok = true;
   return slurp_file(sfile);
+}
+
+// Create a unique per-run temp directory (mkdtemp). Returns "" on failure.
+static std::string make_tmpdir() {
+  char tmpl[] = "/tmp/sibling_analyze.XXXXXX";
+  char *d = mkdtemp(tmpl);
+  return d ? std::string(d) : std::string();
+}
+
+// Best-effort recursive removal of a temp dir we created (only our own files).
+static void remove_tmpdir(const std::string &dir) {
+  if (dir.empty())
+    return;
+  std::string cmd = "rm -rf " + shell_quote(dir);
+  std::string o, e;
+  run_capture(cmd, o, e, "/tmp");
+}
+
+// Run llvm-mca on a .s file with an explicit -mcpu. stdout -> `out`, stderr ->
+// `err` (surfaced, since a wrong/unrecognised -mcpu warning must reach the user
+// rather than be parsed as report text). Returns exit code.
+static int run_mca(const std::string &sfile, const std::string &mcpu,
+                   const std::string &tmpdir, std::string &out,
+                   std::string &err) {
+  std::string cmd =
+      "llvm-mca -mcpu=" + shell_quote(mcpu) + " " + shell_quote(sfile);
+  return run_capture(cmd, out, err, tmpdir);
 }
 
 static const RegionProfile *find_region(const std::vector<RegionProfile> &rs,
@@ -647,21 +851,57 @@ static const RegionProfile *find_region(const std::vector<RegionProfile> &rs,
   return nullptr;
 }
 
+// Post-parse sanity: a region is only usable if mca actually populated it.
+// Returns an error string naming the missing field (empty == ok). This closes
+// the fail-UNSAFE paths where a format drift or an empty region silently yields
+// cycles=0 (→ utilisation divides by a 1.0 fallback) or empty pressure (→
+// c_raw floors to 1.0, a confident false "no collision").
+static std::string validate_region(const RegionProfile &r) {
+  if (!(r.cycles_per_iter > 0))
+    return "'" + r.name +
+           "': Block RThroughput not parsed (cycles_per_iter <= 0) — llvm-mca "
+           "output format may have drifted, or the region is degenerate";
+  if (r.pressure.empty())
+    return "'" + r.name +
+           "': no resource pressure parsed — the region is empty or the "
+           "'Resource pressure per iteration' table was not found";
+  if (!(r.dispatch_width > 0))
+    return "'" + r.name + "': Dispatch Width not parsed (<= 0)";
+  if (r.instructions <= 0)
+    return "'" + r.name + "': Instructions not parsed (<= 0)";
+  return "";
+}
+
 // ---------------------------------------------------------------------------
 // Human-readable report + machine-readable JSON.
 // ---------------------------------------------------------------------------
+// Per-message multipliers. mca's "iteration" is one repeat of the marked ASM
+// BLOCK, which is NOT necessarily one message (it is usually one loop
+// iteration). To turn per-block cycles into per-message work you must say how
+// many blocks make a message. Defaults are 1 with `explicit_msg=false`, in
+// which case the tool prints the budget but withholds the bottom-line
+// placement recommendation (it cannot know the consumer's real per-message
+// work) rather than printing a near-unconditional "sibling wins".
+struct Iters {
+  double cons = 1.0, prod = 1.0;
+  bool explicit_msg = false;
+};
+
 static void print_report(const RegionProfile &prod, const RegionProfile &cons,
-                         const Profile &prof, const Overlay &o,
-                         const Budget &b) {
+                         const Profile &prof, const Overlay &o, const Budget &b,
+                         const Iters &it) {
   auto ns = [&](double cyc) { return cyc / prof.freq_ghz; };
-  double W_cons = ns(cons.cycles_per_iter);
-  double t_prod = producer_busy_ns(prod, prof);
+  double W_block = ns(cons.cycles_per_iter); // one marked block
+  double W_msg = W_block * it.cons;          // per message (if known)
+  double t_prod = producer_busy_ns(prod, prof, it.prod);
 
   printf("\n=== sibling_analyze — STATIC, ports+dispatch only ===\n");
-  printf("producer '%s': %.1f cyc/msg (%.1f ns @ %.2f GHz)\n",
-         prod.name.c_str(), prod.cycles_per_iter, t_prod, prof.freq_ghz);
-  printf("consumer '%s': %.1f cyc/msg (%.1f ns), bottleneck resource below\n",
-         cons.name.c_str(), cons.cycles_per_iter, W_cons);
+  printf(
+      "producer '%s': %.1f cyc/block (%.1f ns/msg @ %.2f GHz, %gx blocks/msg)"
+      "\n",
+      prod.name.c_str(), prod.cycles_per_iter, t_prod, prof.freq_ghz, it.prod);
+  printf("consumer '%s': %.1f cyc/block (%.1f ns/block), bottleneck below\n",
+         cons.name.c_str(), cons.cycles_per_iter, W_block);
 
   printf("\ncombined demand (producer+consumer utilisation, >1.0 = "
          "oversubscribed):\n");
@@ -684,8 +924,8 @@ static void print_report(const RegionProfile &prod, const RegionProfile &cons,
         "store-heavy.\n",
         o.bottleneck_demand);
 
-  printf("\nplacement budget W* (consumer ns/msg below which the sibling "
-         "wins):\n");
+  printf("\nplacement budget W* (consumer ns of WORK PER MESSAGE below which "
+         "the sibling wins):\n");
   auto show = [](const char *tag, const std::optional<double> &w) {
     if (w)
       printf("    %-8s W* = %.0f ns\n", tag, *w);
@@ -700,17 +940,28 @@ static void print_report(const RegionProfile &prod, const RegionProfile &cons,
   printf("  (W* is an UPPER BOUND: every unmodelled effect — caches, MSHRs, "
          "front-end sharing — only lowers it.)\n");
 
+  // The bottom-line recommendation compares the consumer's PER-MESSAGE work to
+  // W*. That requires knowing blocks-per-message; without --consumer-iters-per-
+  // msg we refuse to guess (a marked loop body is ~one iteration, so assuming
+  // 1 would make the answer near-unconditionally "sibling").
+  if (!it.explicit_msg) {
+    printf("\n=> per-message work UNKNOWN: pass --consumer-iters-per-msg N "
+           "(blocks per message) for a placement recommendation. Budget above "
+           "is per message; the consumer's marked block is %.1f ns.\n",
+           W_block);
+    return;
+  }
   if (b.mid) {
-    if (W_cons < *b.mid)
+    if (W_msg < *b.mid)
       printf(
           "\n=> your consumer does ~%.0f ns/msg < W*~%.0f ns: SIBLING is the "
           "faster placement (subject to the memory caveat above).\n",
-          W_cons, *b.mid);
+          W_msg, *b.mid);
     else
       printf(
           "\n=> your consumer does ~%.0f ns/msg >= W*~%.0f ns: step OUT to a "
           "same-CCX core; on-core contention now outweighs the handoff edge.\n",
-          W_cons, *b.mid);
+          W_msg, *b.mid);
   } else {
     printf("\n=> no crossover in range: for this pair the sibling's handoff "
            "edge is not overtaken by contention up to 1 ms/msg of work.\n");
@@ -718,16 +969,20 @@ static void print_report(const RegionProfile &prod, const RegionProfile &cons,
 }
 
 static void print_json(const RegionProfile &prod, const RegionProfile &cons,
-                       const Profile &prof, const Overlay &o, const Budget &b) {
+                       const Profile &prof, const Overlay &o, const Budget &b,
+                       const Iters &it) {
   auto jopt = [](const std::optional<double> &w) {
     return w ? std::to_string((long)llround(*w)) : std::string("null");
   };
   printf("{\n");
   printf("  \"producer\": \"%s\", \"consumer\": \"%s\",\n", prod.name.c_str(),
          cons.name.c_str());
-  printf("  \"producer_ns_per_msg\": %.1f,\n", producer_busy_ns(prod, prof));
-  printf("  \"consumer_ns_per_msg\": %.1f,\n",
-         cons.cycles_per_iter / prof.freq_ghz);
+  printf("  \"producer_ns_per_msg\": %.1f, \"iters_per_msg_explicit\": %s,\n",
+         producer_busy_ns(prod, prof, it.prod),
+         it.explicit_msg ? "true" : "false");
+  printf("  \"consumer_ns_per_block\": %.1f, \"consumer_ns_per_msg\": %.1f,\n",
+         cons.cycles_per_iter / prof.freq_ghz,
+         cons.cycles_per_iter * it.cons / prof.freq_ghz);
   printf("  \"c_raw\": %.3f, \"c\": %.3f, \"calib_scale\": %.3f,\n", o.c_raw,
          o.c, prof.calib_scale);
   printf("  \"bottleneck\": \"%s\", \"bottleneck_demand\": %.3f, \"collides\": "
@@ -750,12 +1005,18 @@ static void print_json(const RegionProfile &prod, const RegionProfile &cons,
 // carry C, the W* band, and Dh so the plotter can render the band + zero line
 // without re-deriving anything.
 static void emit_model(const RegionProfile &prod, const Profile &prof,
-                       const Overlay &o, const Budget &b) {
-  double t_prod = producer_busy_ns(prod, prof);
+                       const Overlay &o, const Budget &b, const Iters &it) {
+  double t_prod = producer_busy_ns(prod, prof, it.prod);
+  // "none" (not "nan"): Python's float("nan") parses successfully, so a "nan"
+  // sentinel would silently pass an isinstance(float) guard and poison the
+  // downstream check. "none" stays a string the plotter can test explicitly.
   auto opt = [](const std::optional<double> &w) {
-    return w ? std::to_string((long)llround(*w)) : std::string("nan");
+    return w ? std::to_string((long)llround(*w)) : std::string("none");
   };
   printf("# sibling_analyze model curve (predicted sibling - same-CCX, ns)\n");
+  printf("# machine=%s mca_mcpu=%s\n",
+         prof.machine.empty() ? "unspecified" : prof.machine.c_str(),
+         prof.mca_mcpu.c_str());
   printf("# C=%.4f calib_scale=%.4f dh_ns=%.2f presence_tax=%.4f "
          "producer_ns=%.2f freq_ghz=%.3f\n",
          o.c, prof.calib_scale, prof.Dh(), prof.presence_tax, t_prod,
@@ -865,12 +1126,13 @@ static int run_self_tests() {
     // test.
     Profile prof;
     Overlay o = overlay(*prod, *cons, prof);
-    check(o.bottleneck_demand >= 1.0, "some resource at/over 1.0");
-    // The dispatch row: consumer 0.99/6 + producer 1.95/6 = ~0.49, no
-    // collision.
-    check(!o.collides || o.bottleneck != "SKXPort1" ||
-              o.bottleneck_demand < 1.1,
-          "disjoint-bottleneck pair not flagged as a hard Port1 collision");
+    // Consumer alone saturates Port1 (8.0/8.0 = 1.0); the producer puts nothing
+    // on Port1, so combined Port1 == exactly 1.0 and nothing else is higher —
+    // NOT a collision. Assert the concrete values, not a trivially-true OR.
+    check(o.bottleneck == "SKXPort1", "disjoint pair bottleneck is Port1");
+    check(std::fabs(o.bottleneck_demand - 1.0) < 1e-6,
+          "disjoint pair: combined Port1 == 1.0");
+    check(!o.collides, "disjoint pair does NOT collide (demand 1.0 < margin)");
 
     // Now the golden shape: consumer overlaid with ITSELF (imul vs imul) must
     // land Port1 at 2.0 — the measured busy-sibling ~1.8x case.
@@ -886,6 +1148,57 @@ static int run_self_tests() {
     cal.calib_scale = 0.8;
     Overlay selfc = overlay(*cons, *cons, cal);
     check(std::fabs(selfc.c - 1.8) < 1e-6, "calibrated C == measured 1.8");
+  }
+
+  // ProcResGroup (dot-index) normalization — the regression test for the bug
+  // that shipped: a 3-unit AMD-style Zn4LSU group carrying 3.0 cycles of
+  // pressure over a 1-cycle block is 100% busy per unit, u == 1.0, NOT 3.0. A
+  // single light region must therefore NOT self-report as oversubscribed.
+  {
+    static const char *kGrouped = R"MCA(
+[0] Code Region - grp
+
+Iterations:        100
+Instructions:      300
+Total Cycles:      100
+Total uOps:        300
+Dispatch Width:    6
+uOps Per Cycle:    3.0
+IPC:               3.0
+Block RThroughput: 1.0
+
+Resources:
+[0]   - Zn4ALU0
+[14.0] - Zn4LSU
+[14.1] - Zn4LSU
+[14.2] - Zn4LSU
+
+Resource pressure per iteration:
+[0]    [14.0] [14.1] [14.2]
+ -      1.00   1.00   1.00
+)MCA";
+    auto gr = parse_mca_text(kGrouped);
+    check(gr.size() == 1 && gr[0].name == "grp", "grouped region parsed");
+    if (gr.size() == 1) {
+      check(gr[0].units["Zn4LSU"] == 3, "Zn4LSU counted as 3 parallel units");
+      check(std::fabs(gr[0].pressure["Zn4LSU"] - 3.0) < 1e-6,
+            "Zn4LSU summed pressure == 3.0");
+      auto u = utilisation(gr[0]);
+      check(std::fabs(u["Zn4LSU"] - 1.0) < 1e-6,
+            "Zn4LSU per-unit utilisation == 1.0 (NOT 3.0)");
+      // Overlaying this light region with a disjoint one must not collide.
+      RegionProfile light;
+      light.name = "light";
+      light.cycles_per_iter = 1.0;
+      light.dispatch_width = 6.0;
+      light.uops_per_cycle = 1.0;
+      light.instructions = 1;
+      light.pressure["Zn4ALU0"] = 0.2;
+      light.units["Zn4ALU0"] = 1;
+      Profile prof;
+      Overlay og = overlay(light, gr[0], prof);
+      check(!og.collides, "light+grouped region does NOT false-collide");
+    }
   }
 
   // duty(W) monotonicity: duty must fall as W grows (period grows).
@@ -940,14 +1253,86 @@ static int run_self_tests() {
           "data-movement classification");
   }
 
-  // Region asm extraction from a tiny .s.
+  // Region asm extraction + duplicate detection from a tiny .s.
   {
     std::string s = "foo:\n  # LLVM-MCA-BEGIN consumer\n  imulq %rax, %rdx\n"
                     "  # LLVM-MCA-END consumer\n  ret\n";
     auto m = extract_regions_asm(s);
-    check(m.count("consumer") == 1, "extracted consumer region");
-    check(m["consumer"].find("imulq") != std::string::npos,
+    check(m.body.count("consumer") == 1, "extracted consumer region");
+    check(m.begins["consumer"] == 1, "consumer opened once");
+    check(m.body["consumer"].find("imulq") != std::string::npos,
           "region body captured");
+    // Two openings of the same name (inlined twice) must be counted as 2.
+    std::string dup = s +
+                      "bar:\n  # LLVM-MCA-BEGIN consumer\n  addq %rax, %rbx\n"
+                      "  # LLVM-MCA-END consumer\n  ret\n";
+    check(extract_regions_asm(dup).begins["consumer"] == 2,
+          "duplicate region opening counted");
+  }
+
+  // lint_region: empty region is a hard error; a real one is clean.
+  {
+    check(!lint_region("r", "  # comment only\n").errors.empty(),
+          "zero-compute region flagged as error");
+    Lint good = lint_region("r", "  imulq %rax, %rdx\n  addq (%rdi), %rdx\n");
+    check(good.errors.empty() && good.compute == 2, "clean region: 2 compute");
+    // a (non-directive) label sharing a line with an instruction is not dropped
+    check(lint_region("r", "foo: imulq %rax, %rdx\n").compute == 1,
+          "label+insn on one line still counts the insn");
+  }
+
+  // validate_region: a populated region passes; missing fields fail by name.
+  {
+    RegionProfile r;
+    r.name = "x";
+    r.cycles_per_iter = 8;
+    r.dispatch_width = 6;
+    r.instructions = 8;
+    r.pressure["P1"] = 8;
+    check(validate_region(r).empty(), "populated region validates");
+    RegionProfile bad = r;
+    bad.cycles_per_iter = 0;
+    check(!validate_region(bad).empty(), "cycles=0 region rejected");
+    RegionProfile empty = r;
+    empty.pressure.clear();
+    check(!validate_region(empty).empty(), "empty-pressure region rejected");
+  }
+
+  // validate_profile: good passes; swapped handoff / bad freq rejected.
+  {
+    Profile p;
+    check(validate_profile(p).empty(), "default profile valid");
+    Profile sw = p;
+    sw.handoff_sibling_ns = 90;
+    sw.handoff_sameccx_ns = 50; // Dh negative
+    check(!validate_profile(sw).empty(), "negative Dh rejected");
+    Profile f0 = p;
+    f0.freq_ghz = 0;
+    check(!validate_profile(f0).empty(), "freq_ghz=0 rejected");
+  }
+
+  // Budget band ordering: lo <= mid <= hi whenever all three are finite.
+  {
+    Profile prof;
+    Overlay ov;
+    ov.c = 1.8;
+    Budget bud = solve_budget(prof, ov, 20.0);
+    if (bud.lo && bud.mid && bud.hi)
+      check(*bud.lo <= *bud.mid + 1e-6 && *bud.mid <= *bud.hi + 1e-6,
+            "W* band ordered lo <= mid <= hi");
+  }
+
+  // duty_of exact root: at C==1 duty is the linear t/b; must be in [0,1] and
+  // match a direct evaluation.
+  {
+    Profile prof;
+    double d = duty_of(1000.0, prof, 1.0, 50.0);
+    double b = prof.pacing_headroom *
+               (1000.0 * (1.0 + prof.presence_tax) + prof.allowance_ns);
+    check(std::fabs(d - 50.0 / b) < 1e-9, "duty exact at C==1");
+    check(duty_of(1000.0, prof, 3.0, 50.0) >= 0 &&
+              duty_of(1000.0, prof, 3.0, 50.0) <= 1.0,
+          "duty in [0,1] at C=3");
   }
 
   if (fails == 0)
@@ -959,54 +1344,76 @@ static int run_self_tests() {
 // SECTION 7 — --calibrate: reproduce a measured busy-sibling multiplier through
 // the static path, and print the scale factor to put in your profile.
 // ===========================================================================
-static int run_calibrate(double measured_multiplier) {
+static int run_calibrate(double measured_multiplier, const std::string &mcpu) {
   // Emit a tiny TU whose single marked region is the sibling_noise victim: 8
-  // independent imul-accumulate lanes. Overlaying it with itself is the
-  // static analogue of "victim on one thread, identical busy tenant on its
-  // sibling" — the experiment that measured ~1.8x.
+  // independent imul-accumulate lanes, PURE REGISTER (no memory loads, so it
+  // exercises only the multiply port and does not drag in grouped Load/LSU
+  // resources whose mis-costing would contaminate the scale). Markers wrap the
+  // LOOP per the tool's own contract; the marker macros are inlined so the
+  // calibration doesn't depend on cwd / -I.
   const char *src = R"SRC(
 #include <cstdint>
-#include "sibling_marks.hpp"
-uint64_t k(const uint64_t* p, int n){
+#define SIBLING_REGION_BEGIN(n) __asm__ volatile("# LLVM-MCA-BEGIN " n ::: "memory")
+#define SIBLING_REGION_END(n)   __asm__ volatile("# LLVM-MCA-END " n ::: "memory")
+uint64_t k(uint64_t n){
   uint64_t a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8;
-  for(int i=0;i<n;i+=8){ SIBLING_REGION_BEGIN("victim");
-    a=a*2654435761u+p[i]; b=b*2654435761u+p[i+1]; c=c*2654435761u+p[i+2]; d=d*2654435761u+p[i+3];
-    e=e*2654435761u+p[i+4]; f=f*2654435761u+p[i+5]; g=g*2654435761u+p[i+6]; h=h*2654435761u+p[i+7];
-    SIBLING_REGION_END("victim"); }
+  SIBLING_REGION_BEGIN("victim");
+  for(uint64_t i=0;i<n;i++){
+    a=a*2654435761u+i; b=b*2654435761u+i; c=c*2654435761u+i; d=d*2654435761u+i;
+    e=e*2654435761u+i; f=f*2654435761u+i; g=g*2654435761u+i; h=h*2654435761u+i;
+  }
+  SIBLING_REGION_END("victim");
   return a+b+c+d+e+f+g+h;
 }
 )SRC";
-  std::ofstream("/tmp/sibling_calib.cpp") << src;
-  bool ok = false;
-  std::string asm_on =
-      compile_to_asm("/tmp/sibling_calib.cpp", "-I.", false, ok);
-  if (!ok)
+  std::string tmpdir = make_tmpdir();
+  if (tmpdir.empty()) {
+    fprintf(stderr, "calibrate: could not create temp dir\n");
     return 1;
-  std::ofstream("/tmp/sibling_calib.s") << asm_on;
-  std::string mca;
-  if (run_capture("llvm-mca -mcpu=native /tmp/sibling_calib.s 2>&1", mca) !=
-      0) {
-    fprintf(stderr, "llvm-mca failed:\n%s\n", mca.c_str());
+  }
+  std::string cppfile = tmpdir + "/calib.cpp";
+  std::ofstream(cppfile) << src;
+  bool ok = false;
+  std::string asm_on = compile_to_asm(cppfile, {}, false, tmpdir, ok);
+  if (!ok) {
+    remove_tmpdir(tmpdir);
+    return 1;
+  }
+  std::string sfile = tmpdir + "/calib.s";
+  std::ofstream(sfile) << asm_on;
+  std::string mca, err;
+  int rc = run_mca(sfile, mcpu, tmpdir, mca, err);
+  if (!err.empty())
+    fprintf(stderr, "llvm-mca (mcpu=%s) messages:\n%s\n", mcpu.c_str(),
+            err.c_str());
+  if (rc != 0) {
+    fprintf(stderr, "llvm-mca failed (exit %d)\n", rc);
+    remove_tmpdir(tmpdir);
     return 1;
   }
   auto regions = parse_mca_text(mca);
   const RegionProfile *v = find_region(regions, "victim");
-  if (!v) {
-    fprintf(stderr, "calibrate: victim region not found in mca output\n");
+  if (!v || !validate_region(*v).empty()) {
+    fprintf(stderr, "calibrate: victim region not usable: %s\n",
+            v ? validate_region(*v).c_str() : "not found");
+    remove_tmpdir(tmpdir);
     return 1;
   }
   Profile prof;
   Overlay self = overlay(*v, *v, prof);
   double scale =
       self.c_raw > 1.0 ? (measured_multiplier - 1.0) / (self.c_raw - 1.0) : 1.0;
-  printf("calibrate: victim bottleneck '%s', C_raw=%.3f\n",
-         self.bottleneck.c_str(), self.c_raw);
+  printf("calibrate (mcpu=%s): victim bottleneck '%s', C_raw=%.3f\n",
+         mcpu.c_str(), self.bottleneck.c_str(), self.c_raw);
   printf("measured busy-sibling multiplier: %.3f\n", measured_multiplier);
   printf("=> calib_scale = %.3f   (put `calib_scale=%.3f` in your profile)\n",
          scale, scale);
   printf("note: measured multiplier defaults to the README's Zen 5 figure "
          "(1.81); pass your own machine's sibling_noise 'hot' median / 'idle' "
-         "median as the argument to --calibrate.\n");
+         "median as the argument to --calibrate. Assumes a multiply/port-bound "
+         "consumer like the victim; a memory-bound consumer needs its own "
+         "measured scale.\n");
+  remove_tmpdir(tmpdir);
   return 0;
 }
 
@@ -1017,10 +1424,11 @@ static void usage(const char *a0) {
   fprintf(stderr,
           "usage:\n"
           "  %s <source.cpp> [--producer NAME] [--consumer NAME] "
-          "[--profile FILE] [--cflags \"...\"] [--json]\n"
+          "[--profile FILE] [--cflags TOK]... [--consumer-iters-per-msg N] "
+          "[--producer-iters-per-msg N] [--json|--emit-model]\n"
           "  %s --mca-file <llvm-mca-dump.txt> [--producer NAME] "
           "[--consumer NAME] [--profile FILE] [--json]\n"
-          "  %s --calibrate [MEASURED_MULTIPLIER]\n"
+          "  %s --calibrate [MEASURED_MULTIPLIER] [--profile FILE]\n"
           "  %s --test\n",
           a0, a0, a0, a0);
 }
@@ -1028,18 +1436,14 @@ static void usage(const char *a0) {
 int main(int argc, char **argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--test") == 0)
     return run_self_tests();
-  if (argc >= 2 && std::strcmp(argv[1], "--calibrate") == 0) {
-    double m = (argc >= 3) ? std::atof(argv[2]) : 1.81;
-    return run_calibrate(m);
-  }
-  if (argc < 2) {
-    usage(argv[0]);
-    return 1;
-  }
 
-  std::string source, mca_file, profile_path, cflags = "-I.";
+  // Shared arg parse (also used by --calibrate for --profile).
+  std::string source, mca_file, profile_path;
   std::string producer = "producer", consumer = "consumer";
-  bool as_json = false, emit_model_csv = false;
+  std::vector<std::string> cflags{"-I."};
+  bool as_json = false, emit_model_csv = false, calibrate = false;
+  double calib_measured = 1.81;
+  Iters iters;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&](const char *what) -> std::string {
@@ -1049,16 +1453,25 @@ int main(int argc, char **argv) {
       }
       return argv[++i];
     };
-    if (a == "--producer")
+    if (a == "--calibrate") {
+      calibrate = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-')
+        calib_measured = std::atof(argv[++i]);
+    } else if (a == "--producer")
       producer = next("--producer");
     else if (a == "--consumer")
       consumer = next("--consumer");
     else if (a == "--profile")
       profile_path = next("--profile");
     else if (a == "--cflags")
-      cflags += " " + next("--cflags");
+      cflags.push_back(next("--cflags"));
     else if (a == "--mca-file")
       mca_file = next("--mca-file");
+    else if (a == "--consumer-iters-per-msg") {
+      iters.cons = std::atof(next("--consumer-iters-per-msg").c_str());
+      iters.explicit_msg = true;
+    } else if (a == "--producer-iters-per-msg")
+      iters.prod = std::atof(next("--producer-iters-per-msg").c_str());
     else if (a == "--json")
       as_json = true;
     else if (a == "--emit-model")
@@ -1072,6 +1485,22 @@ int main(int argc, char **argv) {
   }
 
   Profile prof = profile_path.empty() ? Profile() : load_profile(profile_path);
+  if (std::string e = validate_profile(prof); !e.empty()) {
+    fprintf(stderr, "fatal: invalid profile: %s\n", e.c_str());
+    return 1;
+  }
+  if (iters.cons <= 0 || iters.prod <= 0) {
+    fprintf(stderr, "fatal: --*-iters-per-msg must be > 0\n");
+    return 1;
+  }
+
+  if (calibrate)
+    return run_calibrate(calib_measured, prof.mca_mcpu);
+
+  if (source.empty() && mca_file.empty()) {
+    usage(argv[0]);
+    return 1;
+  }
   if (profile_path.empty())
     fprintf(stderr,
             "note: no --profile given; using PLACEHOLDER machine "
@@ -1079,40 +1508,55 @@ int main(int argc, char **argv) {
             "from smt_pingpong/sibling_noise on your target.\n",
             prof.Dh(), prof.presence_tax);
 
-  std::string mca_text;
+  std::string mca_text, tmpdir;
   if (!mca_file.empty()) {
     mca_text = slurp_file(mca_file);
-  } else if (!source.empty()) {
-    bool ok = false;
-    std::string asm_on = compile_to_asm(source, cflags, false, ok);
-    if (!ok)
+  } else {
+    tmpdir = make_tmpdir();
+    if (tmpdir.empty()) {
+      fprintf(stderr, "fatal: could not create temp dir\n");
       return 1;
-    std::ofstream("/tmp/sibling_analyze.s") << asm_on;
+    }
+    bool ok = false;
+    std::string asm_on = compile_to_asm(source, cflags, false, tmpdir, ok);
+    if (!ok) {
+      remove_tmpdir(tmpdir);
+      return 1;
+    }
+    std::string sfile = tmpdir + "/on.s";
+    std::ofstream(sfile) << asm_on;
 
-    // Perturbation diff: unmarked build vs marked, whole-file mnemonic mix.
-    std::string asm_off = compile_to_asm(source, cflags, true, ok);
+    // Perturbation diff, scoped to the marked functions only (so a regional
+    // vectorisation loss isn't diluted by the rest of the TU).
+    std::string asm_off = compile_to_asm(source, cflags, true, tmpdir, ok);
     if (ok) {
-      auto h_on = mnemonic_histogram(asm_on);
-      auto h_off = mnemonic_histogram(asm_off);
-      // 15% of the compute mnemonics changed => a real codegen difference
-      // (vectorisation blocked, work hoisted), not a boundary spill.
-      double pr = perturbation_ratio(h_on, h_off);
+      double pr = marked_function_perturbation(asm_on, asm_off);
       if (pr > 0.15)
         fprintf(stderr,
                 "\n*** WARNING: markers perturbed codegen — %.0f%% of compute "
-                "instructions differ between the marked and unmarked builds "
-                "(likely blocked vectorisation or hoisting). The analysed code "
-                "may not be what ships; move markers to wrap the loop, not its "
-                "body. ***\n",
+                "instructions differ (in the marked functions) between the "
+                "marked and unmarked builds (likely blocked vectorisation or "
+                "hoisting). The analysed code may not be what ships; move "
+                "markers to wrap the loop, not its body. ***\n",
                 pr * 100.0);
     }
 
-    // Region lint.
+    // Region lint + duplicate-region detection.
     auto region_asm = extract_regions_asm(asm_on);
     bool fatal = false;
     for (auto &nm : {producer, consumer}) {
-      auto it = region_asm.find(nm);
-      if (it == region_asm.end()) {
+      if (region_asm.begins.count(nm) && region_asm.begins.at(nm) > 1) {
+        fprintf(stderr,
+                "LINT ERROR: region '%s' is opened %d times (inlined at "
+                "several sites, or duplicate markers) — mca emits several "
+                "same-named regions and the analysis cannot tell which is "
+                "'the' region. Give each an unambiguous name.\n",
+                nm.c_str(), region_asm.begins.at(nm));
+        fatal = true;
+        continue;
+      }
+      auto it = region_asm.body.find(nm);
+      if (it == region_asm.body.end()) {
         fprintf(stderr,
                 "warning: region '%s' not found in the compiled asm — "
                 "did you mark it?\n",
@@ -1130,19 +1574,21 @@ int main(int argc, char **argv) {
     if (fatal) {
       fprintf(stderr, "aborting: a region's port vector is untrustworthy (see "
                       "LINT ERROR above).\n");
+      remove_tmpdir(tmpdir);
       return 1;
     }
 
-    std::string rc;
-    if (run_capture("llvm-mca -mcpu=native /tmp/sibling_analyze.s 2>&1", rc) !=
-        0) {
-      fprintf(stderr, "llvm-mca failed:\n%s\n", rc.c_str());
+    std::string err;
+    int rc = run_mca(sfile, prof.mca_mcpu, tmpdir, mca_text, err);
+    fprintf(stderr, "llvm-mca: -mcpu=%s", prof.mca_mcpu.c_str());
+    if (!err.empty())
+      fprintf(stderr, " (messages: %s)", trim(err).c_str());
+    fprintf(stderr, "\n");
+    if (rc != 0) {
+      fprintf(stderr, "llvm-mca failed (exit %d)\n", rc);
+      remove_tmpdir(tmpdir);
       return 1;
     }
-    mca_text = rc;
-  } else {
-    usage(argv[0]);
-    return 1;
   }
 
   auto regions = parse_mca_text(mca_text);
@@ -1153,17 +1599,28 @@ int main(int argc, char **argv) {
             "error: could not find both regions '%s' and '%s' in the mca "
             "output (found %zu region(s)). Check your marker names.\n",
             producer.c_str(), consumer.c_str(), regions.size());
+    remove_tmpdir(tmpdir);
     return 1;
+  }
+  // Post-parse validation: refuse to emit a confident verdict from a region mca
+  // didn't actually populate (closes the fail-unsafe paths).
+  for (const RegionProfile *r : {prod, cons}) {
+    if (std::string e = validate_region(*r); !e.empty()) {
+      fprintf(stderr, "error: region %s\n", e.c_str());
+      remove_tmpdir(tmpdir);
+      return 1;
+    }
   }
 
   Overlay o = overlay(*prod, *cons, prof);
-  Budget b = solve_budget(prof, o, producer_busy_ns(*prod, prof));
+  Budget b = solve_budget(prof, o, producer_busy_ns(*prod, prof, iters.prod));
 
   if (emit_model_csv)
-    emit_model(*prod, prof, o, b);
+    emit_model(*prod, prof, o, b, iters);
   else if (as_json)
-    print_json(*prod, *cons, prof, o, b);
+    print_json(*prod, *cons, prof, o, b, iters);
   else
-    print_report(*prod, *cons, prof, o, b);
+    print_report(*prod, *cons, prof, o, b, iters);
+  remove_tmpdir(tmpdir);
   return 0;
 }
