@@ -40,20 +40,21 @@
 <circle cx="362.0" cy="322.5" r="4.5" fill="#14b8a6" stroke="#0d1117" stroke-width="0.6"/>
 <circle cx="522.8" cy="280.1" r="4.5" fill="#14b8a6" stroke="#0d1117" stroke-width="0.6"/>
 <circle cx="687.0" cy="110.4" r="4.5" fill="#14b8a6" stroke="#0d1117" stroke-width="0.6"/>
-<path d="M100.4 301.3 L214.1 195.2 L362.0 216.5 L522.8 258.9 L687.0 110.4" fill="none" stroke="#e0912f" stroke-width="2.2" />
-<circle cx="100.4" cy="301.3" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
-<circle cx="214.1" cy="195.2" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
-<circle cx="362.0" cy="216.5" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
-<circle cx="522.8" cy="258.9" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
-<circle cx="687.0" cy="110.4" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
+<path d="M-8.6 301.3 L73.9 301.3 L214.1 322.5 L362.0 301.3 L522.8 280.1 L687.0 34.0" fill="none" stroke="#e0912f" stroke-width="2.2" />
+<circle cx="-8.6" cy="301.3" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
+<circle cx="73.9" cy="301.3" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
+<circle cx="214.1" cy="322.5" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
+<circle cx="362.0" cy="301.3" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
+<circle cx="522.8" cy="280.1" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
+<circle cx="687.0" cy="34.0" r="4.5" fill="#e0912f" stroke="#0d1117" stroke-width="0.6"/>
 <line x1="732" y1="42" x2="752" y2="42" stroke="#8b7ff0" stroke-width="2.2" stroke-dasharray="5 3"/>
 <text x="758" y="45.5" font-size="10.5" fill="#8b949e">prediction (llvm-mca)</text>
 <line x1="732" y1="64" x2="752" y2="64" stroke="#14b8a6" stroke-width="2.2"/><circle cx="742" cy="64" r="4" fill="#14b8a6"/>
 <text x="758" y="67.5" font-size="10.5" fill="#8b949e">measured: polite producer</text>
 <line x1="732" y1="86" x2="752" y2="86" stroke="#e0912f" stroke-width="2.2"/><circle cx="742" cy="86" r="4" fill="#e0912f"/>
-<text x="758" y="89.5" font-size="10.5" fill="#8b949e">measured: both busy</text>
+<text x="758" y="89.5" font-size="10.5" fill="#8b949e">measured: both busy (paced)</text>
 <text x="732" y="122" font-size="10" fill="#8b949e">crossover:</text>
-<text x="732" y="138" font-size="10" fill="#e0912f">both busy: few 100 ns</text>
+<text x="732" y="138" font-size="10" fill="#e0912f">both busy (paced): ~2.5µs</text>
 <text x="732" y="153" font-size="10" fill="#8b7ff0">model ~1.7µs</text>
 <text x="732" y="168" font-size="10" fill="#14b8a6">polite ~3.7µs</text>
 </svg>

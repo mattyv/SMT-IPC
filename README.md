@@ -3,15 +3,20 @@
 > **TL;DR — for two threads that pass messages to each other, the fastest place is the *same
 > physical core* (its two SMT siblings), as long as the sibling stays *quiet*.** A sibling that's
 > only cooperating — mostly `pause`-waiting for its partner — costs about **3%**, and in exchange
-> you get the ~50 ns shared-L1/L2 handoff, roughly **2× faster** than putting the two threads on
-> separate cores. That holds for realistic per-message work (up to ~2–3 µs). The whole trick is
-> keeping that sibling quiet: a *busy, independent* tenant on it — another process, an IRQ, or your
-> own second thread grinding flat-out — flips the ~2× win into a **~1.8× loss**.
+> you get the ~50 ns shared-L1/L2 handoff, **~2× faster** (≈1.8× measured) than putting the two
+> threads on separate cores in the same CCX. That holds for realistic per-message work (up to a
+> couple of µs), and — measured, and it surprised me — it holds whether *one or both* threads are
+> busy, **as long as they're paced so they never execute at the same instant** (a paced pipeline's
+> consumer waits ~98% of the time, so the two just alternate). The one thing that kills it is
+> genuine **overlap**: an *independent* port-hungry tenant on the sibling (another process, an IRQ)
+> — or your own two threads under saturation, continuously running at once — slows the
+> sibling-placed thread's compute by ~1.8× (Step 2), and the sibling stops being worth it. Keeping
+> the sibling *quiet* — only your cooperating, mostly-waiting partner on it — is the whole trick.
 >
 > **How to milk it in your design:**
 > 1. **Pin your producer and consumer to the two SMT threads of one physical core** — that buys the shared-L1/L2 handoff.
 > 2. **Keep everything else off that core.** Pinning steers *your* threads only; the kernel still lands IRQs and other work on the sibling. Isolate it (`isolcpus` + `nohz_full` + `irqaffinity`) or offline the neighbours — a quiet sibling *is* the trick.
-> 3. **Keep the relationship asymmetric — one side mostly waits.** If *both* threads grind at once they become each other's victim and the edge collapses (crossover falls from ~3 µs to the low hundreds of ns). A producer that waits on a queue feeding a consumer that does the work is the ideal shape.
+> 3. **Don't let them execute at the same instant.** Under matched pacing the two threads alternate, so *both-busy is fine* — the sibling still wins. You only lose it if the load saturates the queue and the two overlap continuously (then Step 2's 1.8× contention kicks in). Pace the feed, or keep one side mostly waiting, so they never grind simultaneously.
 > 4. **Stay under a few µs of work per message.** Past the crossover — or whenever both sides must be busy — step out to a *same-CCX* core instead (~40 ns slower handoff, but immune to on-core contention).
 > 5. **Check before you commit:** `sibling_analyze` predicts, statically from your compiled loops, whether your two specific threads will collide or fit — no timing rig required.
 
@@ -23,7 +28,7 @@ L1." The folklore is half right, and chasing down the other half is what this re
 is. Three small x86-64 Linux microbenchmarks, run on an AMD Zen 5 box, that build to one
 measured answer:
 
-![Sibling vs same-CCX placement crossover: the static llvm-mca prediction (dashed) overlaid on the measured curves — a polite producer (crossover ~3.7 µs) and both threads busy (crossover into the low hundreds of ns), with the model's W* band between them](docs/crossover.svg)
+![Sibling vs same-CCX placement crossover: end-to-end latency difference as consumer work grows. The two measured curves — a polite producer and a both-busy-but-paced producer — nearly coincide (both cross ~2.5–3 µs), because matched pacing stops the threads from overlapping. The dashed line is sibling_analyze's static estimate; its W* band is shaded.](docs/crossover.svg)
 
 **A processing consumer is faster on the producer's SMT sibling — but only up to a couple
 of microseconds of work per message. Past that, a separate core in the same CCX wins.** For
@@ -80,7 +85,7 @@ flowchart TB
 ```
 
 The ordering is unambiguous, at every percentile: **SMT sibling ~50 ns, same-CCX ~90 ns,
-cross-CCX ~700 ns** (median RTT, pause spinner). Crossing an L3/CCX boundary is a ~8× cliff.
+cross-CCX ~700 ns** (median RTT, pause spinner). Crossing an L3/CCX boundary is a ~7–8× cliff.
 So if raw handoff latency were the whole story, you'd always pick the sibling — the line
 never leaves the shared L1/L2.
 
@@ -174,20 +179,27 @@ nanoseconds you'd guess from the 1.8× busy-sibling figure. The practical readin
 doing less than a couple of µs of work per message — the common case — is faster on the SMT
 sibling, provided the producer stays polite and nothing else runs on that core.
 
-**But "polite" is doing real work in that sentence.** Make the producer busy too and both
-threads become each other's victim — `--proc-sweep --producer-rounds 512` runs exactly that, and
-the crossover *collapses from ~3.7 µs to the low hundreds of ns* (with `proc_ratio` measured at ~1.5, genuine
-mutual contention, not the ~3 % polite tax). So the real rule is: siblings win only while one
-side stays polite; once both are heavy, step to separate cores. Both regimes — polite and
-both-busy — are the two solid lines in the graph at the top; the dashed line is Step 5's static
-prediction of the same crossover, landing between them.
+**Does that survive *both* threads being busy?** Make the producer do the same per-message work
+as the consumer (`--both-busy`) and — this surprised me — the crossover barely moves (~2.5 µs,
+`proc_ratio ≈ 1.0`): the two solid lines in the graph nearly coincide. The reason is **overlap**.
+Matched pacing keeps the queue near-empty (`waited-fraction ≈ 0.98`), so the two threads
+*alternate* — the producer works during the gap while the consumer waits — rather than execute at
+the same instant, and threads that don't overlap don't contend. The real mutual-contention
+penalty (Step 2's 1.8×) needs them to genuinely run *simultaneously*, which happens only under
+**saturation / continuous load** — a throughput regime where the queue is never empty and this
+handoff crossover is no longer the metric. (An earlier version of this experiment did report a
+"collapse to hundreds of ns," but that was a pacing bug — the producer's fixed work didn't fit the
+consumer-sized gap, forcing an artificial overlap. The valid symmetric sweep removes it.) So the
+honest rule: a **paced** pipeline keeps the sibling winning whether one *or both* sides are busy;
+you lose the sibling only when the load is high enough that the two threads overlap continuously.
 
 **Scope, so this isn't over-read:** the message source is an in-memory ring, *by design* — a
 real socket's `recv()` is microseconds and would swamp this nanosecond-scale placement signal
 entirely. This answers "given a message already in hand, does placement or processing weight
 decide who's faster," not "is it fast enough for a live feed." And with no core isolation on
-this box, the crossover *direction* reproduces run to run; the exact point (~2–3 µs) is the
-softer part.
+this box, the crossover *direction* reproduces **as long as the box is quiet and unthrottled**
+(watch the `proc_insitu_ratio` column reads ≈ 1 — on a loaded or low-power box the producer stops
+staying polite and the sign can flip); the exact point (~2–3 µs) is the softer part.
 
 ## So, for HFT
 
@@ -201,7 +213,7 @@ softer part.
   across **both** SMT threads, which is why HFT shops isolate hot cores or disable SMT outright.
 - **Heavy per-message work (> ~3 µs) or an untrusted sibling → step out to a same-CCX core.**
   You give up ~40 ns of handoff for immunity to on-core contention.
-- **Keep tightly-coupled threads inside one CCX regardless** — the cross-CCX cliff is ~8× and
+- **Keep tightly-coupled threads inside one CCX regardless** — the cross-CCX cliff is ~7–8× and
   dwarfs any of this.
 
 ## Step 5 — predicting it for *your* threads, without running anything
@@ -258,24 +270,26 @@ as `detail:` lines, and any lint warning rides right next to the verdict. *(One 
 `llvm-mca` counts iterations, not messages; without it, it prints the budget but withholds the
 recommendation rather than guess.)*
 
-**It takes the "both threads are victims of each other" view — which is the point.** The tool
-*sums* both loops' demand on each port, so it models mutual contention, not one thread
-victimising a passive one. That's why its estimate lands *between* the two regimes we measured:
-with a **polite** producer the crossover measured ~3.7 µs (the producer barely competes, so the
-sibling wins far out), and with **both threads busy** it collapsed into the low hundreds of ns (each taxes the
-other — `spsc_pipeline --proc-sweep --producer-rounds 512` measures exactly that mutual case).
-The static ~1.7 µs estimate is the safe, both-competing default.
+**What's actually predicted, and what isn't — read this before trusting the budget.** The `W*`
+number is *mostly not* the llvm-mca model. It's `W* = Δh / (ε + duty·(C−1))`, and at the crossover
+the `duty` term is tiny, so `W*` collapses to **Δh/ε ≈ 50 ns / 3% ≈ 1.67 µs** — the *measured*
+handoff edge (Step 1) over the *measured* presence tax (Step 2). Plugging in the model's
+contention `C` moves that by **~0.8%** (13 ns). So the budget is ~99% two measured constants, not a
+static prediction; and `calib_scale` is *fit* so the model's `C` reproduces Step 2's 1.81× — that
+magnitude agrees by construction, not by independent check. **The genuinely predictive output is
+the verdict** — *does a specific execution port oversubscribe when these two loops run together,
+and which one* — read straight from llvm-mca on your compiled code. Trust the `COLLIDES`/`fit`
+call and the named port; treat `W*` as an order-of-magnitude budget seeded by the measured
+handoff numbers — roughly the crossover Steps 1–4 already give you, not a separate result.
 
-**How accurate is it?** On this box, for that example, it predicts a budget of **~1.65 µs**; the
-measured crossover runs **~2.4–3.7 µs** (polite) down to **the low hundreds of ns** (both busy). So it's right
-on *direction* and *order of magnitude*, and within ~2× of the polite measurement — good for a
-compile-time screen that runs nothing. Its port model is validated separately: `--calibrate`
-maps the predicted contention onto the *measured* 1.81× busy-sibling ratio from Step 2, and
-lands within 0.7%. The overlay at the top of this README is `sibling_analyze --emit-model` (the
-dashed prediction) plotted against both measured curves; `scripts/plot_crossover.py --check`
-asserts they agree by numbers, not pixels — on **same-machine** data only, since the model is
-micro-architecture-specific, so regenerate `docs/crossover_data.csv` from
-`spsc_pipeline --proc-sweep` on your own box before a pass elsewhere means anything.
+**How close is `W*` to the measured crossover?** ~1.65 µs predicted vs ~2.4–3.7 µs measured (it
+wanders run-to-run): same order of magnitude, within a factor of ~2 — all a compile-time screen
+that runs *nothing* can honestly claim. The overlay at the top is `sibling_analyze --emit-model`
+(dashed) against the measured curves; `scripts/plot_crossover.py --check` asserts they agree
+numerically — but since the model's `C` barely moves the curve, that check mostly confirms the
+Δh/ε constants line up, not that the port model is right. It's same-machine only (the mca model is
+µarch-specific), so regenerate `docs/crossover_data.csv` from `spsc_pipeline --proc-sweep` on your
+own box first.
 
 **It's a screening linter, not an oracle — and the limits are load-bearing.** `llvm-mca` sees
 execution ports and front-end dispatch and *nothing else*: it assumes perfect caches and store

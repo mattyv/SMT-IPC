@@ -399,23 +399,50 @@ static inline bool pace_until(uint64_t deadline_tsc) {
 // ===========================================================================
 
 // The matched-pacing gap for a proc-sweep level whose calibrated per-message
-// processing cost is `proc_ns`. See PipeCfg::PROC_SWEEP_HEADROOM and
-// PROC_SWEEP_HANDOFF_ALLOWANCE_NS for the rationale; this function is just
-// the formula, kept separate and pure so it's independently testable
-// (monotonicity, exactness at proc_ns=0) without running a real pass.
-static inline double proc_sweep_gap_ns(double proc_ns) {
+// CONSUMER processing cost is `consumer_proc_ns`. See
+// PipeCfg::PROC_SWEEP_HEADROOM and PROC_SWEEP_HANDOFF_ALLOWANCE_NS for the
+// rationale; this function is just the formula, kept separate and pure so
+// it's independently testable (monotonicity, exactness at proc_ns=0)
+// without running a real pass.
+//
+// `producer_proc_ns` (default 0.0, --both-busy only — see the file-header
+// "SHAPE OF THE EXPERIMENT" note): the producer's OWN per-message
+// processing cost, when it's a genuine busy tenant instead of an idle
+// PAUSE-waiting pacer. Folding it into the gap (rather than sizing the gap
+// from the consumer's cost alone) matters because in --both-busy mode the
+// producer cannot publish faster than its own per-message work takes,
+// regardless of how the consumer is paced — omitting it would undersize the
+// gap, drive the producer into backpressure/saturation, and invalidate the
+// cell (see proc_sweep_cell_valid). Defaulting to 0.0 makes this an EXACT
+// no-op for the default (polite-producer) --proc-sweep and the fixed
+// --producer-rounds N variant: both call the single-argument form, so their
+// gap arithmetic, and therefore their entire output, is unchanged.
+static inline double proc_sweep_gap_ns(double consumer_proc_ns,
+                                       double producer_proc_ns = 0.0) {
   return PipeCfg::PROC_SWEEP_HEADROOM *
-         (proc_ns + PipeCfg::PROC_SWEEP_HANDOFF_ALLOWANCE_NS);
+         (consumer_proc_ns + producer_proc_ns +
+          PipeCfg::PROC_SWEEP_HANDOFF_ALLOWANCE_NS);
 }
 
 // Builds one gap_ns per calibrated-ns entry, via proc_sweep_gap_ns, rounded
 // to the nearest ns (run_pass takes an integer ns gap).
+//
+// `producer_proc_ns` (default empty, --both-busy only): parallel vector of
+// the producer's own per-level processing cost, same indexing as
+// `calibrated_proc_ns`. Missing/short entries (including the default empty
+// vector) contribute 0.0, i.e. today's polite-producer formula — so every
+// existing caller that passes only `calibrated_proc_ns` gets byte-identical
+// gaps.
 static std::vector<uint64_t>
-proc_sweep_cells(const std::vector<double> &calibrated_proc_ns) {
+proc_sweep_cells(const std::vector<double> &calibrated_proc_ns,
+                 const std::vector<double> &producer_proc_ns = {}) {
   std::vector<uint64_t> gaps;
   gaps.reserve(calibrated_proc_ns.size());
-  for (double proc_ns : calibrated_proc_ns)
-    gaps.push_back(uint64_t(std::lround(proc_sweep_gap_ns(proc_ns))));
+  for (size_t i = 0; i < calibrated_proc_ns.size(); i++) {
+    double p_ns = i < producer_proc_ns.size() ? producer_proc_ns[i] : 0.0;
+    gaps.push_back(
+        uint64_t(std::lround(proc_sweep_gap_ns(calibrated_proc_ns[i], p_ns))));
+  }
   return gaps;
 }
 
@@ -710,12 +737,22 @@ struct CliArgs {
   bool test = false;
   bool proc_sweep = false; // explicit --proc-sweep, or implied (see below)
   int producer_rounds = 0; // --producer-rounds N; 0 = default polite producer
+  // --both-busy (symmetric both-busy sweep, see the file-header "SHAPE OF
+  // THE EXPERIMENT" note): at EACH sweep level the producer runs
+  // process_msg_lanes for the SAME rounds as the consumer's level, instead
+  // of a fixed --producer-rounds N. Mutually exclusive with an explicit
+  // --producer-rounds N (their meanings conflict: one fixed N for every
+  // level vs. "match whatever level we're on"); --producer-rounds 0 (the
+  // default) is harmless to combine with --both-busy since it's
+  // indistinguishable from not passing the flag at all.
+  bool both_busy = false;
   bool ok = true;
   std::string error;
 };
 
 static const char *const kUsage =
-    "usage: %s [--test | [--proc-sweep] [--producer-rounds N]]\n";
+    "usage: %s [--test | [--proc-sweep] [--producer-rounds N] "
+    "[--both-busy]]\n";
 
 static CliArgs parse_cli_args(int argc, char **argv) {
   CliArgs a;
@@ -725,6 +762,8 @@ static CliArgs parse_cli_args(int argc, char **argv) {
       a.test = true;
     } else if (arg == "--proc-sweep") {
       a.proc_sweep = true;
+    } else if (arg == "--both-busy") {
+      a.both_busy = true;
     } else if (arg == "--producer-rounds") {
       if (i + 1 >= argc) {
         a.ok = false;
@@ -757,13 +796,29 @@ static CliArgs parse_cli_args(int argc, char **argv) {
     }
   }
   // No-arg and --proc-sweep are aliases (this binary now runs exactly one
-  // experiment, see the file-scope comment); a bare --producer-rounds N with
-  // neither --test nor --proc-sweep also implies --proc-sweep.
+  // experiment, see the file-scope comment); a bare --producer-rounds N or
+  // --both-busy with neither --test nor --proc-sweep also implies
+  // --proc-sweep.
   if (!a.test && !a.proc_sweep)
     a.proc_sweep = true;
-  if (a.test && (a.proc_sweep || a.producer_rounds != 0)) {
+  if (a.test && (a.proc_sweep || a.producer_rounds != 0 || a.both_busy)) {
     a.ok = false;
-    a.error = "--test cannot be combined with --proc-sweep/--producer-rounds";
+    a.error = "--test cannot be combined with "
+              "--proc-sweep/--producer-rounds/--both-busy";
+    return a;
+  }
+  // --both-busy sets producer_rounds PER LEVEL (matching the consumer's
+  // rounds at each sweep step, see run_proc_sweep) — an explicit, non-zero
+  // fixed --producer-rounds N would silently be ignored by that per-level
+  // override, which is exactly the kind of "flag that silently did nothing"
+  // parse_cli_args already refuses to allow elsewhere (see the
+  // --producer-rounds overflow-narrowing comment above).
+  if (a.both_busy && a.producer_rounds != 0) {
+    a.ok = false;
+    a.error = "--both-busy cannot be combined with an explicit non-zero "
+              "--producer-rounds N (--both-busy sets producer rounds "
+              "per-level automatically)";
+    return a;
   }
   return a;
 }
@@ -877,6 +932,50 @@ static void run_self_tests() {
         exit(1);
       }
       prev = g;
+    }
+  }
+
+  // proc_sweep_gap_ns two-argument (--both-busy) form: folds the producer's
+  // own proc_ns into the gap on top of the consumer's, and the one-argument
+  // call site is an EXACT alias for producer_proc_ns=0.0 (byte-identical
+  // default --proc-sweep / fixed --producer-rounds N gap arithmetic).
+  {
+    // producer_proc_ns=0.0 explicit must equal the one-argument form
+    // exactly, for every consumer_proc_ns in the real ladder's range.
+    double sample_ns[] = {0, 10, 50, 200, 800, 3000, 12000};
+    for (double ns : sample_ns) {
+      if (proc_sweep_gap_ns(ns, 0.0) != proc_sweep_gap_ns(ns)) {
+        fprintf(stderr,
+                "FAIL proc_sweep_gap_ns: two-arg producer_proc_ns=0.0 must "
+                "equal one-arg form at consumer_proc_ns=%.1f\n",
+                ns);
+        exit(1);
+      }
+    }
+    // Symmetric both-busy case: consumer and producer at the SAME level
+    // (e.g. both 800ns, matching PROC_SWEEP_ROUNDS[3]'s ~800ns) -> exact
+    // formula, both terms folded in.
+    double want_symmetric =
+        PipeCfg::PROC_SWEEP_HEADROOM *
+        (800.0 + 800.0 + PipeCfg::PROC_SWEEP_HANDOFF_ALLOWANCE_NS);
+    if (proc_sweep_gap_ns(800.0, 800.0) != want_symmetric) {
+      fprintf(stderr, "FAIL proc_sweep_gap_ns(800, 800): got %.4f want %.4f\n",
+              proc_sweep_gap_ns(800.0, 800.0), want_symmetric);
+      exit(1);
+    }
+    // Adding producer_proc_ns must never DECREASE the gap (a busier
+    // producer needs at least as much pacing room, never less).
+    double prev2 = proc_sweep_gap_ns(200.0, 0.0);
+    for (double p_ns : {0.0, 50.0, 200.0, 800.0}) {
+      double g = proc_sweep_gap_ns(200.0, p_ns);
+      if (g < prev2) {
+        fprintf(stderr,
+                "FAIL proc_sweep_gap_ns: not monotonic in producer_proc_ns "
+                "(got %.1f < prev %.1f at p_ns=%.1f)\n",
+                g, prev2, p_ns);
+        exit(1);
+      }
+      prev2 = g;
     }
   }
 
@@ -1182,6 +1281,61 @@ static void run_self_tests() {
     if (parse({"spsc_pipeline", "--test", "--producer-rounds", "8"}).ok) {
       fprintf(stderr, "FAIL parse_cli_args: --test + --producer-rounds must "
                       "be rejected\n");
+      exit(1);
+    }
+
+    // Bare --both-busy (no --proc-sweep) implies --proc-sweep, sets
+    // both_busy, leaves producer_rounds at 0 (per-level override, not a
+    // fixed value).
+    {
+      CliArgs a = parse({"spsc_pipeline", "--both-busy"});
+      if (!a.ok || a.test || !a.proc_sweep || !a.both_busy ||
+          a.producer_rounds != 0) {
+        fprintf(stderr,
+                "FAIL parse_cli_args: bare --both-busy wrong (ok=%d "
+                "proc_sweep=%d both_busy=%d producer_rounds=%d)\n",
+                a.ok, a.proc_sweep, a.both_busy, a.producer_rounds);
+        exit(1);
+      }
+    }
+    // --proc-sweep --both-busy: both explicit, same result.
+    {
+      CliArgs a = parse({"spsc_pipeline", "--proc-sweep", "--both-busy"});
+      if (!a.ok || a.test || !a.proc_sweep || !a.both_busy) {
+        fprintf(stderr,
+                "FAIL parse_cli_args: --proc-sweep --both-busy wrong\n");
+        exit(1);
+      }
+    }
+    // --both-busy --producer-rounds 0: explicit-zero is harmless, accepted.
+    {
+      CliArgs a =
+          parse({"spsc_pipeline", "--both-busy", "--producer-rounds", "0"});
+      if (!a.ok || !a.both_busy || a.producer_rounds != 0) {
+        fprintf(stderr, "FAIL parse_cli_args: --both-busy + "
+                        "--producer-rounds 0 should be accepted\n");
+        exit(1);
+      }
+    }
+    // --both-busy + non-zero --producer-rounds -> rejected (conflicting
+    // meanings: fixed N vs. per-level match).
+    if (parse({"spsc_pipeline", "--both-busy", "--producer-rounds", "512"})
+            .ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --both-busy + non-zero "
+                      "--producer-rounds must be rejected\n");
+      exit(1);
+    }
+    // Order shouldn't matter for the same rejection.
+    if (parse({"spsc_pipeline", "--producer-rounds", "512", "--both-busy"})
+            .ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --producer-rounds + --both-busy "
+                      "(reversed order) must be rejected\n");
+      exit(1);
+    }
+    // --test combined with --both-busy -> rejected.
+    if (parse({"spsc_pipeline", "--test", "--both-busy"}).ok) {
+      fprintf(stderr,
+              "FAIL parse_cli_args: --test + --both-busy must be rejected\n");
       exit(1);
     }
     // Unknown flag -> rejected.
