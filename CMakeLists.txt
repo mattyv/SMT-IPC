@@ -34,7 +34,14 @@ FetchContent_MakeAvailable(spscqueue)
 add_executable(spsc_pipeline spsc_pipeline.cpp)
 target_link_libraries(spsc_pipeline PRIVATE Threads::Threads SPSCQueue::SPSCQueue)
 
+# sibling_analyze: the STATIC placement linter. No threads/hardware — it shells
+# out to g++ and llvm-mca at RUN time (for real analysis), but the binary itself
+# and its --test self-check need only the standard library. Kept dependency-free
+# on purpose so `--test` runs in any CI image without llvm installed.
+add_executable(sibling_analyze sibling_analyze.cpp)
+
 enable_testing()
 add_test(NAME self_test COMMAND smt_pingpong --test)
 add_test(NAME sibling_noise_self_test COMMAND sibling_noise --test)
 add_test(NAME spsc_pipeline_self_test COMMAND spsc_pipeline --test)
+add_test(NAME sibling_analyze_self_test COMMAND sibling_analyze --test)

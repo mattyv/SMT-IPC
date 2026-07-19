@@ -181,10 +181,62 @@ softer part.
 - **Keep tightly-coupled threads inside one CCX regardless** — the cross-CCX cliff is ~8× and
   dwarfs any of this.
 
+## Step 5 — predicting it for *your* threads, without running anything
+
+Steps 1–4 *measure* the crossover on this box. But the crossover point depends on what your
+consumer actually does per message — and you'd rather not build the whole timing rig for every
+candidate workload. `sibling_analyze` is a **static** tool: you mark the hot loops of your real
+producer and consumer (`sibling_marks.hpp`), and it predicts — from the compiled instructions,
+via `llvm-mca` — whether those two specific regions will contend on a shared core, and roughly
+where their placement budget `W*` lands. It's the two-thread analogue of a static
+`optimal_N` calc: derive it from the port model instead of discovering it by sweep.
+
+```cpp
+#include "sibling_marks.hpp"
+// consumer's steady-state loop:
+for (;;) { auto* m = q.front(); if (!m) { _mm_pause(); continue; }
+  SIBLING_REGION_BEGIN("consumer");
+  process(*m);                       // <-- the per-message work being judged
+  SIBLING_REGION_END("consumer");
+  q.pop(); }
+```
+
+```
+$ ./sibling_analyze mythreads.cpp --profile my.profile
+combined demand (producer+consumer utilisation, >1.0 = oversubscribed):
+    SKXPort1               1.25   <== bottleneck
+    dispatch(front-end)    0.95
+VERDICT: COLLIDES on 'SKXPort1' (combined demand 1.25).
+placement budget W*: mid 1332 ns  (range 887–2664 ns)
+=> consumer does ~3 ns/msg < W*: SIBLING is the faster placement.
+```
+
+**How it maps to the four measured steps.** The friction multiplier `C` comes from overlaying
+the two regions' per-port utilisation (a port over 1.0 = a clash), plus a synthetic
+*dispatch* row that catches two port-*disjoint* streams still colliding on shared front-end
+width. The budget is the same crossover as Step 4 —
+`W* = Δh / (ε + duty(W)·(C−1))` — with `Δh` (one-way handoff edge) from Step 1/4, `ε` (presence
+tax) from Step 2's polite-sibling row, and `duty(W)` solved as a fixed point from the
+producer's own cycle count. **`--calibrate` ties it back to Step 2's ground truth**: it runs the
+`sibling_noise` victim kernel through the static path and prints the `calib_scale` that maps
+the predicted `C` onto your measured busy-sibling multiplier (the README's 1.81×).
+
+**It is a screening linter, not an oracle — the caveats are load-bearing, not boilerplate.**
+`llvm-mca` sees execution ports and front-end dispatch and *nothing else*: it models ideal
+caches, infinite MSHRs/store-buffer, and a single stream (no notion of two siblings sharing).
+Every one of those blind spots makes it *under*-predict friction, so **`W*` is an upper bound**
+and the tool errs toward recommending the sibling. Therefore a `COLLIDES` verdict is
+trustworthy; a "no port collision" verdict only clears the *compute ports* and prints the
+memory caveat explicitly. For any load-bearing "safe" on a memory-flavoured region, confirm
+with `sibling_noise`/`spsc_pipeline` — they remain ground truth. The tool also **lints the
+marked regions** (hard error on a `call`, whose callee is invisible to mca; warnings on
+in-region atomics/fences that belong to `Δh`, and on branches) and **diffs marked-vs-unmarked
+codegen** to catch a marker that perturbed what ships (e.g. blocked vectorisation).
+
 ## Build & run
 
 ```sh
-cmake -B build && cmake --build build && ctest --test-dir build   # builds all 3 + self-tests
+cmake -B build && cmake --build build && ctest --test-dir build   # builds all 4 + self-tests
 ```
 
 ```sh
@@ -193,12 +245,17 @@ cmake -B build && cmake --build build && ctest --test-dir build   # builds all 3
 ./sibling_noise           # busy-sibling contention (tenant on the SMT sibling)
 ./sibling_noise --same-ccx  # control: tenant on a same-CCX core instead
 ./spsc_pipeline           # the placement × processing-weight crossover (Step 4)
+./sibling_analyze t.cpp --profile p   # STATIC: predict placement for marked threads (Step 5)
+./sibling_analyze --calibrate 1.81    # derive calib_scale from a measured busy-sibling ratio
 <tool> --test             # pure-logic self-checks, no timing hardware needed
 ```
 
-All three share `pp_core.hpp` (TSC calibration, pinning, percentiles, sysfs topology
-discovery). Bad CPU args and pin failures are always fatal — an unpinned pair measures
-nothing. **x86-64 Linux only** (`rdtsc`, `_mm_pause`, sysfs).
+The three runtime tools share `pp_core.hpp` (TSC calibration, pinning, percentiles, sysfs
+topology discovery). Bad CPU args and pin failures are always fatal — an unpinned pair measures
+nothing. **x86-64 Linux only** (`rdtsc`, `_mm_pause`, sysfs). `sibling_analyze` is separate and
+dependency-light: its `--test` needs only a C++ compiler, and its analysis path additionally
+needs `g++` and `llvm-mca` (pinned to LLVM 18's report format) on `PATH`; edit `example.profile`
+into your own machine's numbers first.
 
 *(An earlier, larger version of `spsc_pipeline` also carried a separate wait-strategy study —
 spin vs pause vs futex-blocking consumers under steady and bursty arrival. It answered a
