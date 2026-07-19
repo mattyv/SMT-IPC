@@ -1,5 +1,12 @@
 # SMT-IPC — where do you put two threads that talk to each other?
 
+> *Heads up: this is a weekend rabbit hole, not a best-practices guide. I got curious about where
+> you should put two threads that talk to each other on a big modern AMD chip, and chased it further
+> than was strictly reasonable. It only really matters when nanoseconds of thread-to-thread handoff
+> are on your critical path — HFT, market-data decoders, lock-free pipelines — and for normal code
+> the answer here is lost in the noise. Read it for the "huh, neat," not as a checklist. Half the
+> fun was seeing how well a static model could call the result before running anything.*
+>
 > **TL;DR — for two threads that pass messages to each other, the fastest place is the *same
 > physical core* (its two SMT siblings), as long as the sibling stays *quiet*.** A sibling that's
 > only cooperating — mostly `pause`-waiting for its partner — costs about **3%**, and in exchange
@@ -33,7 +40,7 @@ L1." The folklore is half right, and chasing down the other half is what this re
 is. Three small x86-64 Linux microbenchmarks, run on an AMD Zen 5 box, that build to one
 measured answer:
 
-![Sibling vs same-CCX placement crossover: sibling−same-CCX latency as consumer work grows, for three producer regimes. Polite and paced-both-busy track each other and cross zero in a ~2–3.7 µs band (sibling wins below it). The overlapping-both-busy line crosses below ~0.5 µs and shoots off the top (+781 ns at 1.7 µs, then saturates). Two dashed lines are sibling_analyze's static estimates — purple for the polite/paced regime (its W* band is shaded) and red for the overlap regime.](docs/crossover.svg)
+![Sibling vs same-CCX placement crossover: sibling−same-CCX latency as consumer work grows, for three producer regimes. Polite and paced-both-busy track each other and cross zero in a ~2–3.7 µs band (sibling wins below it). The overlapping-both-busy line crosses below ~0.5 µs and shoots off the top (+781 ns at 1.7 µs, then saturates). Two dashed lines are sibling_analyze's static estimates — purple for the polite/paced regime (its W* band is shaded) and red for the overlap regime. Whiskers on the measured points show the run-to-run spread (min–max over 9 runs), which is widest right at the crossovers.](docs/crossover.svg)
 
 *Reading the three measured lines:* the x-axis is a ladder of per-message work from ~20 ns to
 ~7 µs; the y-axis is how much slower the SMT-sibling placement is than a same-CCX core (below zero
@@ -46,6 +53,11 @@ polite result even with a busy producer). **Both busy, overlapping** (red): same
 but the gap is sized for the consumer alone, so the producer's work genuinely *overlaps* the
 consumer's — the real "both threads are victims of each other" case. That one crosses below ~0.5 µs
 and rockets up. See Step 4 for the full story.
+
+The **whiskers** are the honest part: they're the run-to-run spread of each measured point (min–max
+over 9 runs on an un-isolated box), and they fatten right where each line crosses zero. At the
+crossover the delta straddles zero *inside its own whisker* — which is exactly why "where does the
+sibling stop winning?" only ever has a fuzzy, few-hundred-ns answer, not a crisp one.
 
 **A processing consumer is faster on the producer's SMT sibling — but only up to a couple
 of microseconds of work per message. Past that, a separate core in the same CCX wins.** For

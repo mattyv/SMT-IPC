@@ -1,0 +1,29 @@
+# Run-to-run jitter of the measured sibling−same-CCX delta, per regime and work
+# level, from `spsc_pipeline` on this repo's AMD Zen 5 box (no core isolation).
+# Each row: the min / median / max of the per-run p50 delta (sibling_p50 −
+# sameccx_p50) across N independent runs. This is the source of the min–max
+# whiskers on docs/crossover.svg — it makes visible that the crossover is
+# noise-limited (the delta straddles zero WITHIN its own spread at the crossover
+# rung, which is why the interpolated crossing wanders run-to-run).
+#
+# Regenerate: run each regime N times, take the SUMMARY table's delta_ns column
+# per rung, and record min/median/max. The overlap 6933 ns rung SATURATES
+# (queue-drift dominated, INVALID, spread in the hundreds of µs) and is excluded
+# from the figure — its row is kept here only to document that exclusion.
+# machine=zen5
+regime,work_ns,delta_min,delta_median,delta_max,n
+polite,50,-40.1,-40.1,-40.1,9
+polite,130,-50.1,-40.1,-40.1,9
+polite,451,-50.1,-40.1,-30.1,9
+polite,1743,-40.1,-10.0,0.0,9
+polite,6933,50.1,180.3,180.3,9
+paced,50,-50.1,-50.1,-40.1,9
+paced,130,-60.1,-50.1,-40.1,9
+paced,451,-50.1,-40.1,-30.1,9
+paced,1743,-30.1,0.0,0.0,9
+paced,6933,170.3,170.3,180.3,9
+overlap,50,-50.1,-40.1,-40.1,9
+overlap,130,-50.1,-40.1,-40.1,9
+overlap,451,0.0,0.0,20.0,9
+overlap,1743,761.4,781.4,811.5,9
+overlap,6933,12473.0,188609.4,258252.9,9
