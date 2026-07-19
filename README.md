@@ -1,5 +1,20 @@
 # SMT-IPC — where do you put two threads that talk to each other?
 
+> **TL;DR — for two threads that pass messages to each other, the fastest place is the *same
+> physical core* (its two SMT siblings), as long as the sibling stays *quiet*.** A sibling that's
+> only cooperating — mostly `pause`-waiting for its partner — costs about **3%**, and in exchange
+> you get the ~50 ns shared-L1/L2 handoff, roughly **2× faster** than putting the two threads on
+> separate cores. That holds for realistic per-message work (up to ~2–3 µs). The whole trick is
+> keeping that sibling quiet: a *busy, independent* tenant on it — another process, an IRQ, or your
+> own second thread grinding flat-out — flips the ~2× win into a **~1.8× loss**.
+>
+> **How to milk it in your design:**
+> 1. **Pin your producer and consumer to the two SMT threads of one physical core** — that buys the shared-L1/L2 handoff.
+> 2. **Keep everything else off that core.** Pinning steers *your* threads only; the kernel still lands IRQs and other work on the sibling. Isolate it (`isolcpus` + `nohz_full` + `irqaffinity`) or offline the neighbours — a quiet sibling *is* the trick.
+> 3. **Keep the relationship asymmetric — one side mostly waits.** If *both* threads grind at once they become each other's victim and the edge collapses (crossover falls from ~3 µs to the low hundreds of ns). A producer that waits on a queue feeding a consumer that does the work is the ideal shape.
+> 4. **Stay under a few µs of work per message.** Past the crossover — or whenever both sides must be busy — step out to a *same-CCX* core instead (~40 ns slower handoff, but immune to on-core contention).
+> 5. **Check before you commit:** `sibling_analyze` predicts, statically from your compiled loops, whether your two specific threads will collide or fit — no timing rig required.
+
 If one thread hands messages to another — a reader feeding a processor, a market-data
 decoder feeding a strategy — you get to choose where those two threads run on a modern
 many-core chip. Same physical core (the two SMT threads of one core)? Two cores sharing
