@@ -9,7 +9,9 @@
 > busy, **as long as they're paced so they never execute at the same instant** (a paced pipeline's
 > consumer waits ~98% of the time, so the two just alternate). The one thing that kills it is
 > genuine **overlap** — the two threads grinding on the shared core at the same instant. That
-> happens when an *independent* port-hungry tenant lands on the sibling (another process, an IRQ) —
+> happens when an *independent* port-hungry tenant (hungry for the core's *execution* ports — the
+> CPU's instruction-issue slots, not network ports; see Step 2) lands on the sibling (another
+> process, an IRQ) —
 > the full-time, worst case, up to **~1.8×** slower compute (Step 2) — or when your own two threads
 > run hot enough that pacing can no longer keep their work windows apart, a milder **~1.45×** at the
 > partial duty a paced pipeline reaches (measured). Either way the sibling stops being worth it, and
@@ -111,7 +113,9 @@ compare rows only within one run.)*
 ## Step 2 — but a busy sibling is poison
 
 The catch: those two SMT threads don't just share cache, they share the physical core's
-execution ports, store buffer, and front-end. In the ping-pong the sibling is a *cooperative*
+**execution ports** — the ALU / load-store issue slots *inside* the core where instructions
+actually dispatch (nothing to do with TCP/network ports; "port" throughout this repo means these) —
+plus the store buffer and front-end. In the ping-pong the sibling is a *cooperative*
 responder, so you never see the downside. `sibling_noise` isolates it: it runs a genuinely
 port-hungry victim (8 independent multiply lanes, L1-resident) on one thread and puts a
 *tenant* on its sibling — idle, politely pausing, or busy with the same port-hungry work.
