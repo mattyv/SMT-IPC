@@ -40,7 +40,7 @@ L1." The folklore is half right, and chasing down the other half is what this re
 is. Three small x86-64 Linux microbenchmarks, run on an AMD Zen 5 box, that build to one
 measured answer:
 
-![Sibling vs same-CCX placement crossover: sibling−same-CCX latency as consumer work grows, for three producer regimes. Polite and paced-both-busy track each other and cross zero in a ~2–3.7 µs band (sibling wins below it). The overlapping-both-busy line crosses below ~0.5 µs and shoots off the top (+781 ns at 1.7 µs, then saturates). Two dashed lines are sibling_analyze's static estimates — purple for the polite/paced regime (its W* band is shaded) and red for the overlap regime. Whiskers on the measured points show the run-to-run spread (min–max over 9 runs), which is widest right at the crossovers.](docs/crossover.svg)
+![Sibling vs same-CCX placement crossover: sibling−same-CCX latency as consumer work grows, for three producer regimes. Polite and paced-both-busy track each other and cross zero in a ~2–3.7 µs band (sibling wins below it). The overlapping-both-busy line crosses below ~0.5 µs and shoots off the top (+781 ns at 1.7 µs, then saturates). Two dashed lines are sibling_analyze's static estimates — purple for the polite/paced regime (its W* band is shaded) and red for the overlap regime. The shaded band around each measured line is the run-to-run spread (min–max over 9 runs), widest right at the crossovers.](docs/crossover.svg)
 
 *Reading the three measured lines:* the x-axis is a ladder of per-message work from ~20 ns to
 ~7 µs; the y-axis is how much slower the SMT-sibling placement is than a same-CCX core (below zero
@@ -54,10 +54,13 @@ but the gap is sized for the consumer alone, so the producer's work genuinely *o
 consumer's — the real "both threads are victims of each other" case. That one crosses below ~0.5 µs
 and rockets up. See Step 4 for the full story.
 
-The **whiskers** are the honest part: they're the run-to-run spread of each measured point (min–max
+The **shaded bands** are the honest part: they're the run-to-run spread of each measured line (min–max
 over 9 runs on an un-isolated box), and they fatten right where each line crosses zero. At the
-crossover the delta straddles zero *inside its own whisker* — which is exactly why "where does the
-sibling stop winning?" only ever has a fuzzy, few-hundred-ns answer, not a crisp one.
+crossover the delta straddles zero *inside its own band* — which is exactly why "where does the
+sibling stop winning?" only ever has a fuzzy, few-hundred-ns answer, not a crisp one. (The line is
+the *mean* of the 9 runs; where a band looks lopsided, that's real — the p50 delta is quantized to
+~10 ns and often skewed, so most runs cluster near one edge with a stray run forming the tail on the
+other side.)
 
 **A processing consumer is faster on the producer's SMT sibling — but only up to a couple
 of microseconds of work per message. Past that, a separate core in the same CCX wins.** For

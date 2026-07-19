@@ -13,7 +13,7 @@ Inputs, all committed so the headline image is auditable and regenerable:
     are fixed independently; its C is calibrated, not predicted).
   * the three measured series below, inline as (work_ns, median, min, max) over 9
     `spsc_pipeline` runs on this repo's Zen 5 box (delta = sibling_p50 - sameccx_p50);
-    min/max are the run-to-run jitter whiskers, sourced from docs/crossover_jitter.csv:
+    min/max drive the run-to-run jitter band (shaded), sourced from docs/crossover_jitter.csv:
       polite  : ./spsc_pipeline --proc-sweep
       paced   : ./spsc_pipeline --both-busy           (gap widened to fit both -> disjoint windows)
       overlap : ./spsc_pipeline --both-busy-overlap   (consumer-only gap -> genuine overlap)
@@ -24,7 +24,7 @@ Inputs, all committed so the headline image is auditable and regenerable:
 
 Run from the repo root:  python3 scripts/gen_crossover_svg.py
 p50s wander ~10ns run-to-run (no core isolation) — that wander is exactly what the
-whiskers show; re-measure and update the medians/spreads on your own box.
+band shows; re-measure and update the medians/spreads on your own box.
 """
 import csv
 import math
@@ -35,14 +35,18 @@ MODEL_CSV = os.path.join(REPO, "docs", "crossover_model.csv")
 MODEL_OVERLAP_CSV = os.path.join(REPO, "docs", "crossover_model_overlap.csv")
 OUT_SVG = os.path.join(REPO, "docs", "crossover.svg")
 
-# --- measured: (work_ns, delta_median, delta_min, delta_max) over 9 runs each,
-# from docs/crossover_jitter.csv (min/max drive the run-to-run jitter whiskers).
-# The line + dot are drawn at the median; the whisker spans [min, max]. Note the
-# spread is WIDEST at each crossover — the delta straddles zero within its own
-# whisker there, which is why the crossover is noise-limited / wanders. ---
-POLITE_SERIES = [(50, -40, -40, -40), (130, -40, -50, -40), (451, -40, -50, -30), (1743, -10, -40, 0), (6933, 180, 50, 180)]
-PACED_SERIES = [(50, -50, -50, -40), (130, -50, -60, -40), (451, -40, -50, -30), (1743, 0, -30, 0), (6933, 170, 170, 180)]
-OVERLAP_SERIES = [(50, -40, -50, -40), (130, -40, -50, -40), (451, 0, 0, 20), (1743, 781, 761, 811)]  # 6933 rung dropped: saturates/INVALID
+# --- measured: (work_ns, delta_mean, delta_min, delta_max) over 9 runs each,
+# from docs/crossover_jitter.csv (min/max drive the run-to-run jitter band).
+# The line + dot are drawn at the MEAN, not the median: the mean of differing
+# runs always sits strictly INSIDE [min, max], so the central line never lands
+# on the band edge. (Median would — the delta is quantized to ~10 ns and often
+# skewed, so the median can equal the min or max, which then reads as "the
+# average is at the worst case." The mean avoids that.) The spread is WIDEST at
+# each crossover — the delta straddles zero within its own band there, which is
+# why the crossover is noise-limited / wanders. ---
+POLITE_SERIES = [(50, -40.1, -40, -40), (130, -44.5, -50, -40), (451, -42.3, -50, -30), (1743, -10.0, -40, 0), (6933, 164.7, 50, 180)]
+PACED_SERIES = [(50, -45.7, -50, -40), (130, -51.2, -60, -40), (451, -39.0, -50, -30), (1743, -6.7, -30, 0), (6933, 174.7, 170, 180)]
+OVERLAP_SERIES = [(50, -41.2, -50, -40), (130, -42.3, -50, -40), (451, 3.3, 0, 20), (1743, 781.4, 761, 812)]  # 6933 rung dropped: saturates/INVALID
 
 # --- model W* band (from crossover_model.csv header) ---
 WSTAR_LO, WSTAR_HI = 1100, 3315
@@ -57,12 +61,13 @@ OVERLAP_WSTAR_MID = 405
 OVERLAP_MODEL_DASH = "3 3"
 OVERLAP_MODEL_OPACITY = 0.75
 
-# Run-to-run jitter whiskers (min–max of the per-run p50 delta, from
-# docs/crossover_jitter.csv). Drawn in the series colour, semi-transparent so
-# the median line stays dominant.
-WHISKER_OPACITY = 0.55
-WHISKER_CAP_PX = 3.0      # half-width of the horizontal end caps
-WHISKER_MIN_PX = 1.5      # don't draw a whisker shorter than this (spread ~0)
+# Run-to-run jitter shown as a translucent min–max BAND (per-run p50 delta over
+# 9 runs, from docs/crossover_jitter.csv) filling between each series' min and
+# max. A band (rather than error-bar whiskers) is used deliberately: the delta
+# is quantized to ~10 ns and often skewed, so the median can sit at the edge of
+# the observed range — with a band that reads as "the line hugged one side of
+# its range," whereas a one-sided whisker reads as a broken error bar.
+JITTER_BAND_OPACITY = 0.15
 
 # theme-safe palette (legible on GitHub light #fff and dark #0d1117)
 MUTED = "#8b949e"
@@ -144,20 +149,18 @@ def build_svg(model, model_overlap):
              f'stroke-dasharray="{OVERLAP_MODEL_DASH}" opacity="{OVERLAP_MODEL_OPACITY}"/>')
 
     def series(data, color):
-        # whiskers first (behind the line/dots): vertical min–max span + caps,
-        # clipped to the plot so an off-scale point (e.g. overlap +781) whiskers
-        # to the top edge rather than off-canvas.
-        for w, med, lo, hi in data:
-            x = X(w)
-            ylo, yhi = clip(Yv(lo), top, bot), clip(Yv(hi), top, bot)
-            if abs(ylo - yhi) >= WHISKER_MIN_PX:  # skip a zero-height whisker (spread 0)
-                s.append(f'<line x1="{x:.1f}" y1="{yhi:.1f}" x2="{x:.1f}" y2="{ylo:.1f}" stroke="{color}" stroke-width="1.3" opacity="{WHISKER_OPACITY}"/>')
-                for yc in (ylo, yhi):
-                    s.append(f'<line x1="{x-WHISKER_CAP_PX:.1f}" y1="{yc:.1f}" x2="{x+WHISKER_CAP_PX:.1f}" y2="{yc:.1f}" stroke="{color}" stroke-width="1.3" opacity="{WHISKER_OPACITY}"/>')
-        path = " ".join(f'{"M" if i==0 else "L"}{X(w):.1f} {clip(Yv(med),top,bot):.1f}' for i, (w, med, lo, hi) in enumerate(data))
+        # translucent min–max band (behind the line/dots), clipped to the plot:
+        # top edge = max across runs, bottom edge = min. An off-scale point
+        # (overlap +781) pins to the top edge rather than running off-canvas.
+        top_edge = [(X(w), clip(Yv(hi), top, bot)) for w, ctr, lo, hi in data]
+        bot_edge = [(X(w), clip(Yv(lo), top, bot)) for w, ctr, lo, hi in data]
+        poly = " ".join(f"{x:.1f},{y:.1f}" for x, y in top_edge + bot_edge[::-1])
+        s.append(f'<polygon points="{poly}" fill="{color}" opacity="{JITTER_BAND_OPACITY}" stroke="none"/>')
+        # mean line + dots on top (ctr = per-rung mean over the runs)
+        path = " ".join(f'{"M" if i==0 else "L"}{X(w):.1f} {clip(Yv(ctr),top,bot):.1f}' for i, (w, ctr, lo, hi) in enumerate(data))
         s.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.2"/>')
-        for w, med, lo, hi in data:
-            s.append(f'<circle cx="{X(w):.1f}" cy="{clip(Yv(med),top,bot):.1f}" r="4.3" fill="{color}" stroke="#0d1117" stroke-width="0.6"/>')
+        for w, ctr, lo, hi in data:
+            s.append(f'<circle cx="{X(w):.1f}" cy="{clip(Yv(ctr),top,bot):.1f}" r="4.3" fill="{color}" stroke="#0d1117" stroke-width="0.6"/>')
 
     series(POLITE_SERIES, POLITE)
     series(PACED_SERIES, PACED)
