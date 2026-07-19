@@ -345,17 +345,15 @@ as `detail:` lines, and any lint warning rides right next to the verdict. *(One 
 `llvm-mca` counts iterations, not messages; without it, it prints the budget but withholds the
 recommendation rather than guess.)*
 
-**What's actually predicted, and what isn't — read this before trusting the budget.** The `W*`
-number is *mostly not* the llvm-mca model. It's `W* = Δh / (ε + duty·(C−1))`, and at the crossover
-the `duty` term is tiny, so `W*` collapses to **Δh/ε ≈ 50 ns / 3% ≈ 1.67 µs** — the *measured*
-handoff edge (Step 1) over the *measured* presence tax (Step 2). Plugging in the model's
-contention `C` moves that by **~0.8%** (13 ns). So the budget is ~99% two measured constants, not a
-static prediction; and `calib_scale` is *fit* so the model's `C` reproduces Step 2's 1.81× — that
-magnitude agrees by construction, not by independent check. **The genuinely predictive output is
-the verdict** — *does a specific execution port oversubscribe when these two loops run together,
-and which one* — read straight from llvm-mca on your compiled code. Trust the `COLLIDES`/`fit`
-call and the named port; treat `W*` as an order-of-magnitude budget seeded by the measured
-handoff numbers — roughly the crossover Steps 1–4 already give you, not a separate result.
+**A quick honesty note on that budget number.** For the paced case, `W*` is barely the llvm-mca
+model at all. It's `W* = Δh / (ε + duty·(C−1))`, and at the crossover the `duty` term is tiny, so it
+basically collapses to **Δh/ε ≈ 50 ns / 3% ≈ 1.67 µs** — the *measured* handoff edge (Step 1) over
+the *measured* presence tax (Step 2). The model's contention term `C` only nudges that by **~0.8%**
+(13 ns), and `calib_scale` is *fit* to reproduce Step 2's 1.81× anyway, so that magnitude agrees by
+construction. What the tool genuinely *predicts* is the **verdict** — does a specific execution port
+oversubscribe when these two loops run at once, and which one — read straight off llvm-mca on your
+compiled code. So trust the `COLLIDES`/`fit` call and the named port, and take `W*` as a ballpark:
+roughly the same crossover Steps 1–4 already give you.
 
 **How close is `W*` to the measured crossover?** ~1.65 µs predicted vs ~2.4–3.7 µs measured (it
 wanders run-to-run): same order of magnitude, within a factor of ~2 — all a compile-time screen
@@ -383,23 +381,18 @@ by the two measured constants alone. On this box: `C_ov ≈ 1.80`, predicted `W*
 adjacent sweep rungs that straddle zero). The linearly-interpolated crossing wanders run-to-run —
 ~400 ns on the committed session, ~450–470 ns on repeats — because the rising rung sits one ~10 ns
 `rdtsc` quantum from zero, so the interpolated point is noise-limited and sometimes falls just
-outside the predicted band. Don't read it as a bullseye; read it as "the predicted sub-µs collapse
-is confirmed, and the location agrees to within the measurement's resolution." That collapse is
-~4× relative to the paced `W*` (~1.65 µs) — the whole point: overlap turns a multi-µs budget into a
-sub-µs one.
+outside the predicted band. Not a bullseye, then — but the predicted sub-µs collapse is confirmed
+and the location agrees to within the measurement's resolution. That collapse is ~4× relative to the
+paced `W*` (~1.65 µs), which is the whole point: overlap turns a multi-µs budget into a sub-µs one.
 
-**The calibration caveat, stated plainly.** `duty_overlap`'s *shape* — where it turns on, how it
-grows, that it saturates at `2−H` — comes only from `H`, `A_gap`, and `h_sib`, all fixed
-independently of the overlap measurements it's checked against. Its *scale* does not: `C_ov`'s
-magnitude rides on `calib_scale`, which is fit against `sibling_noise`'s busy-sibling ratio (1.81×)
-— an experiment that has nothing to do with `spsc_pipeline --both-busy-overlap`. So this is an
-honest out-of-sample test of the *mechanism* (does a duty-growing-with-`W` model predict the right
-order of magnitude and the right collapse direction?), not an independently-predicted *number*.
-**Never re-run `--calibrate` against the overlap ladder** — that would fit the answer to the
-question instead of checking it, and silently turn this from a validation into a tautology.
-`scripts/run_crossover_check.sh`'s overlap pass keeps the tolerance deliberately loose
-(`OVERLAP_REL_TOL`, a factor-of-2 bar) for exactly this reason — it is not, and doesn't claim to
-be, a tight fit.
+**One honest catch on the overlap line.** Its *shape* — the turn-on, the growth, the `2−H` ceiling
+— comes only from `H`, `A_gap`, and `h_sib`, all fixed before the overlap experiment ever ran. Its
+*scale* doesn't: `C_ov`'s magnitude rides on `calib_scale`, fit against `sibling_noise`'s
+busy-sibling ratio (1.81×) — a totally separate experiment. So it's an out-of-sample test of the
+*mechanism* (does a duty-growing-with-`W` model land the right order of magnitude and collapse
+direction?), not a from-scratch number. Which is also why you should never re-run `--calibrate`
+against the overlap ladder — that'd just fit the answer to the question. The `--check` tolerance is
+loose on purpose (`OVERLAP_REL_TOL`, a factor-of-2 bar) for the same reason.
 
 **Scope: sub-saturation only.** Both dashed lines stop being meaningful once the queue itself
 saturates — the 6.9 µs rung on the overlap measured series is EXCLUDED from
@@ -410,8 +403,8 @@ contention number. The model has its own echo of that boundary: as `W` grows, `d
 prediction near there too — the formula is a first-order geometry, not a queueing model, and was
 never meant to reach into saturation.
 
-**It's a screening linter, not an oracle — and the limits are load-bearing.** `llvm-mca` sees
-execution ports and front-end dispatch and *nothing else*: it assumes perfect caches and store
+**It's a screening linter, not an oracle.** `llvm-mca` sees execution ports and front-end dispatch
+and *nothing else*: it assumes perfect caches and store
 buffers and a single instruction stream. So a `COLLIDES` verdict (the ports genuinely
 oversubscribe) is trustworthy, while a "no collision" only clears the *compute* side — for
 anything memory-heavy, confirm with `sibling_noise`/`spsc_pipeline`, which stay the ground
