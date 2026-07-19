@@ -1,0 +1,18 @@
+# Measured end-to-end p50 latency, sibling vs same-CCX placement, from
+# spsc_pipeline --proc-sweep on this repo's AMD Zen 5 box. These are the same
+# numbers as README Step 4's table (the source of docs/crossover.svg).
+#
+# Regenerate on your target: run `./spsc_pipeline --proc-sweep`, read the
+# SUMMARY table's rounds / sibling_p50 / sameccx_p50 columns, and transcribe the
+# calibrated per-message work ns (from the "rounds -> calibrated processing ns"
+# block printed just above) into work_ns here. One machine, one session — do NOT
+# mix rows from different boxes (see the machine-mismatch note in the plot script).
+#
+# machine: AMD Zen 5 (README box); no core isolation (p50 wanders run-to-run;
+# the robust signal is the sign-change bracket 1.7us..6.9us, not the exact point).
+work_ns,sibling_p50_ns,sameccx_p50_ns
+20,70,120
+120,180,220
+451,511,561
+1700,1833,1853
+6900,7093,7033

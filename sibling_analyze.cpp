@@ -513,8 +513,53 @@ extract_regions_asm(const std::string &asm_text) {
   return out;
 }
 
-// Histogram of instruction mnemonics over a whole .s (skips directives, labels,
-// comments). Used for the marked-vs-unmarked perturbation diff.
+// Is this mnemonic pure data movement / stack shuffling (as opposed to work
+// that lands on an execution port)? The perturbation diff ignores these: a
+// "memory"-clobber marker legitimately forces a few boundary spills/reloads and
+// register repacks, and flagging those would cry wolf on every real region. The
+// perturbation we DO care about — blocked vectorisation or hoisting of the
+// actual arithmetic — changes the COMPUTE mnemonics (scalar imul vs packed
+// vpmuludq, etc.), which are kept.
+static bool is_data_movement(const std::string &op) {
+  static const char *prefixes[] = {
+      "mov",        "vmov",    "lea",      "push",   "pop",
+      "vzero",      "vinsert", "vextract", "vpinsr", "vpextr",
+      "vperm",      "vpunpck", "vshuf",    "shuf",   "vpbroadcast",
+      "vbroadcast", "vpblend", "vblend",   "vpack",  "vpalignr"};
+  for (const char *p : prefixes)
+    if (op.rfind(p, 0) == 0)
+      return true;
+  return op == "nop" || op == "endbr64" || op == "ret" || op == "vzeroupper";
+}
+
+// Fraction of COMPUTE instructions that changed between two builds' histograms.
+// 0 = identical compute; ~1 = wholly different. A vectorisation flip or a
+// hoist moves many arithmetic mnemonics and scores high; a ±1 loop-induction
+// wobble from a boundary spill scores near zero. The driver warns above a
+// threshold so the perturbation check fires on real changes, not noise.
+static double perturbation_ratio(const std::map<std::string, int> &on,
+                                 const std::map<std::string, int> &off) {
+  std::map<std::string, int> keys;
+  for (auto &[k, v] : on)
+    keys[k] = 0;
+  for (auto &[k, v] : off)
+    keys[k] = 0;
+  long diff = 0, base = 0;
+  for (auto &[k, _] : keys) {
+    int a = on.count(k) ? on.at(k) : 0;
+    int b = off.count(k) ? off.at(k) : 0;
+    diff += std::labs(a - b);
+    base += b;
+  }
+  if (base == 0)
+    return diff > 0 ? 1.0 : 0.0;
+  return (double)diff / (double)base;
+}
+
+// Histogram of COMPUTE instruction mnemonics over a whole .s (skips directives,
+// labels, comments, and data-movement per is_data_movement). Used for the
+// marked-vs-unmarked perturbation diff, which should fire on a changed
+// computation, not on benign boundary spills.
 static std::map<std::string, int>
 mnemonic_histogram(const std::string &asm_text) {
   std::map<std::string, int> h;
@@ -526,8 +571,11 @@ mnemonic_histogram(const std::string &asm_text) {
     if (t.back() == ':')
       continue;
     auto toks = tokens(t);
-    if (!toks.empty())
-      h[toks[0]]++;
+    if (toks.empty())
+      continue;
+    if (is_data_movement(toks[0]))
+      continue;
+    h[toks[0]]++;
   }
   return h;
 }
@@ -694,6 +742,37 @@ static void print_json(const RegionProfile &prod, const RegionProfile &cons,
   printf("}\n");
 }
 
+// Emit the predicted model curve as CSV on stdout: for a log-spaced sweep of
+// consumer work W, the predicted end-to-end delta (sibling - same-CCX) in ns,
+// i.e. g_of(W). This is the SINGLE SOURCE of the model shape (it reuses the
+// same g_of()/duty_of() the W* solve uses); the plot script only draws it, so
+// the picture can never drift from the tool's own math. Header comment lines
+// carry C, the W* band, and Dh so the plotter can render the band + zero line
+// without re-deriving anything.
+static void emit_model(const RegionProfile &prod, const Profile &prof,
+                       const Overlay &o, const Budget &b) {
+  double t_prod = producer_busy_ns(prod, prof);
+  auto opt = [](const std::optional<double> &w) {
+    return w ? std::to_string((long)llround(*w)) : std::string("nan");
+  };
+  printf("# sibling_analyze model curve (predicted sibling - same-CCX, ns)\n");
+  printf("# C=%.4f calib_scale=%.4f dh_ns=%.2f presence_tax=%.4f "
+         "producer_ns=%.2f freq_ghz=%.3f\n",
+         o.c, prof.calib_scale, prof.Dh(), prof.presence_tax, t_prod,
+         prof.freq_ghz);
+  printf("# wstar_mid=%s wstar_lo=%s wstar_hi=%s\n", opt(b.mid).c_str(),
+         opt(b.lo).c_str(), opt(b.hi).c_str());
+  printf("w_ns,delta_ns\n");
+  // Log sweep 10 ns .. 100 us, 80 points.
+  const int N = 80;
+  double loW = 10.0, hiW = 100000.0;
+  for (int i = 0; i < N; i++) {
+    double f = (double)i / (N - 1);
+    double W = loW * std::pow(hiW / loW, f);
+    printf("%.3f,%.4f\n", W, g_of(W, prof, o.c, t_prod));
+  }
+}
+
 // ===========================================================================
 // SECTION 6 — self-tests (pure; no compiler / mca / hardware needed).
 // ===========================================================================
@@ -847,6 +926,20 @@ static int run_self_tests() {
     check(ok.errors.empty() && ok.warnings.empty(), "clean region is clean");
   }
 
+  // Perturbation ratio: a ±1 induction wobble is ~0; a vectorisation flip is
+  // large. is_data_movement keeps movq/vmov out of the score.
+  {
+    std::map<std::string, int> a{{"imulq", 8}, {"addq", 8}, {"incq", 5}};
+    std::map<std::string, int> b{{"imulq", 8}, {"addq", 8}, {"incq", 6}};
+    check(perturbation_ratio(a, b) < 0.10, "small induction wobble is benign");
+    std::map<std::string, int> vec{{"vpmuludq", 2}, {"vpaddq", 2}};
+    std::map<std::string, int> scal{{"imulq", 8}, {"addq", 8}};
+    check(perturbation_ratio(vec, scal) > 0.5, "vectorisation flip is flagged");
+    check(is_data_movement("movq") && is_data_movement("vmovdqa") &&
+              !is_data_movement("imulq") && !is_data_movement("vpmuludq"),
+          "data-movement classification");
+  }
+
   // Region asm extraction from a tiny .s.
   {
     std::string s = "foo:\n  # LLVM-MCA-BEGIN consumer\n  imulq %rax, %rdx\n"
@@ -946,7 +1039,7 @@ int main(int argc, char **argv) {
 
   std::string source, mca_file, profile_path, cflags = "-I.";
   std::string producer = "producer", consumer = "consumer";
-  bool as_json = false;
+  bool as_json = false, emit_model_csv = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&](const char *what) -> std::string {
@@ -968,6 +1061,8 @@ int main(int argc, char **argv) {
       mca_file = next("--mca-file");
     else if (a == "--json")
       as_json = true;
+    else if (a == "--emit-model")
+      emit_model_csv = true;
     else if (a[0] == '-') {
       fprintf(stderr, "unknown flag %s\n", a.c_str());
       usage(argv[0]);
@@ -999,13 +1094,17 @@ int main(int argc, char **argv) {
     if (ok) {
       auto h_on = mnemonic_histogram(asm_on);
       auto h_off = mnemonic_histogram(asm_off);
-      if (h_on != h_off)
+      // 15% of the compute mnemonics changed => a real codegen difference
+      // (vectorisation blocked, work hoisted), not a boundary spill.
+      double pr = perturbation_ratio(h_on, h_off);
+      if (pr > 0.15)
         fprintf(stderr,
-                "\n*** WARNING: marked and unmarked builds have different "
-                "instruction mixes — the markers perturbed codegen (likely "
-                "blocked vectorisation or hoisting). The analysed code may not "
-                "be what ships. Move markers to wrap the loop, not its body. "
-                "***\n");
+                "\n*** WARNING: markers perturbed codegen — %.0f%% of compute "
+                "instructions differ between the marked and unmarked builds "
+                "(likely blocked vectorisation or hoisting). The analysed code "
+                "may not be what ships; move markers to wrap the loop, not its "
+                "body. ***\n",
+                pr * 100.0);
     }
 
     // Region lint.
@@ -1060,7 +1159,9 @@ int main(int argc, char **argv) {
   Overlay o = overlay(*prod, *cons, prof);
   Budget b = solve_budget(prof, o, producer_busy_ns(*prod, prof));
 
-  if (as_json)
+  if (emit_model_csv)
+    emit_model(*prod, prof, o, b);
+  else if (as_json)
     print_json(*prod, *cons, prof, o, b);
   else
     print_report(*prod, *cons, prof, o, b);

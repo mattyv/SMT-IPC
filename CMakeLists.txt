@@ -45,3 +45,23 @@ add_test(NAME self_test COMMAND smt_pingpong --test)
 add_test(NAME sibling_noise_self_test COMMAND sibling_noise --test)
 add_test(NAME spsc_pipeline_self_test COMMAND spsc_pipeline --test)
 add_test(NAME sibling_analyze_self_test COMMAND sibling_analyze --test)
+
+# Optional: end-to-end crossover check (static model vs measured curve). Needs
+# llvm-mca (the analysis engine) and python3, so it is registered ONLY when both
+# are present — the plain gcc CI image skips it and runs just the pure --test
+# above. This is a SAME-MACHINE self-consistency check (see the script header);
+# a generous tolerance keeps it robust across the uarch it happens to run on.
+find_program(LLVM_MCA NAMES llvm-mca llvm-mca-18)
+find_program(PYTHON3 NAMES python3)
+if(LLVM_MCA AND PYTHON3)
+  add_test(NAME crossover_check
+    COMMAND ${CMAKE_COMMAND} -E env sh
+      ${CMAKE_SOURCE_DIR}/scripts/run_crossover_check.sh
+      $<TARGET_FILE:sibling_analyze>
+      ${CMAKE_SOURCE_DIR}/examples/spsc_marked.cpp
+      ${CMAKE_SOURCE_DIR}/example.profile
+      ${CMAKE_SOURCE_DIR}/docs/crossover_data.csv
+      ${CMAKE_SOURCE_DIR}/scripts/plot_crossover.py)
+  set_tests_properties(crossover_check PROPERTIES WORKING_DIRECTORY
+    ${CMAKE_SOURCE_DIR})
+endif()

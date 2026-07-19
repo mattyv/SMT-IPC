@@ -221,6 +221,18 @@ producer's own cycle count. **`--calibrate` ties it back to Step 2's ground trut
 `sibling_noise` victim kernel through the static path and prints the `calib_scale` that maps
 the predicted `C` onto your measured busy-sibling multiplier (the README's 1.81×).
 
+**Seeing the prediction against the measurement.** `sibling_analyze --emit-model` dumps the
+predicted `Δ(W)` curve as CSV (the C++ tool stays the single source of the model math), and
+`scripts/plot_crossover.py` overlays it on the measured curve — dashed model line, measured
+points, a shaded `W*` band, the measured sign-change bracket — and, with `--check`, asserts the
+two *agree by numbers, not pixels*: the `W*` band must overlap the measured bracket and the
+model residuals at each work point must be within tolerance. That check is wired as an optional
+`ctest` (`crossover_check`, skipped where `llvm-mca` isn't present). It is only honest on
+**same-machine** data — an mca model is uarch-specific, so `docs/crossover_data.csv` (this box's
+Zen 5 numbers) must be regenerated from `spsc_pipeline --proc-sweep` on your target before a pass
+elsewhere means anything. `examples/spsc_marked.cpp` is a worked marking of the pipeline's own
+producer/consumer.
+
 **It is a screening linter, not an oracle — the caveats are load-bearing, not boilerplate.**
 `llvm-mca` sees execution ports and front-end dispatch and *nothing else*: it models ideal
 caches, infinite MSHRs/store-buffer, and a single stream (no notion of two siblings sharing).
