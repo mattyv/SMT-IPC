@@ -162,7 +162,15 @@ static std::string validate_profile(const Profile &p) {
 // per-iteration pressure on every named processor resource.
 struct RegionProfile {
   std::string name;           // region name, or "" for an unnamed region
-  double cycles_per_iter = 0; // Block RThroughput
+  double cycles_per_iter = 0; // Block RThroughput — a THROUGHPUT LOWER BOUND
+                              // only; ignores dependency-chain latency. Kept
+                              // for display and as the defensive fallback in
+                              // effective_cycles_per_iter() below.
+  double total_cycles = 0;    // Total Cycles — the block's ACTUAL cycle count
+                              // (accounts for latency chains); total_cycles /
+                              // iterations is the real per-iteration cycle
+                              // cost and is what utilisation()/
+                              // producer_busy_ns() must divide by.
   double dispatch_width = 0;  // Dispatch Width
   double uops_per_cycle = 0;  // uOps Per Cycle
   long instructions = 0;      // total (all iterations)
@@ -191,11 +199,16 @@ struct Overlay {
 
 // ===========================================================================
 // SECTION 1 — llvm-mca TEXT parser (pure).
-// Parses the default `llvm-mca` textual report. We target the LLVM 18 format
-// (pinned in CMake/CI); the fields we read — "Code Region", the summary block,
-// the "Resources:" index->name table, and "Resource pressure per iteration:" —
-// have been stable across many releases, but the version is pinned so a format
-// drift is a loud build failure rather than a silent misparse.
+// Parses the default `llvm-mca` textual report. The fields we read — "Code
+// Region", the summary block ("Total Cycles", "Block RThroughput", "Dispatch
+// Width", "uOps Per Cycle"), the "Resources:" index->name table, and
+// "Resource pressure per iteration:" — have been validated against LLVM
+// 18, 19, and 20's output and are stable across that range. NOTHING pins the
+// llvm-mca version in CMake or CI, though: this parser does not detect a
+// format drift on its own. The actual safety net is validate_region() at
+// call time, which fails LOUDLY (a named error, not a silent misparse) if a
+// future format leaves cycles_per_iter <= 0 or the pressure table empty — see
+// its comment for exactly which fields it checks.
 // ===========================================================================
 
 // Trim ASCII whitespace from both ends.
@@ -268,6 +281,8 @@ static std::vector<RegionProfile> parse_mca_text(const std::string &text) {
         r.uops_per_cycle = v;
       else if (scalar(line, "Block RThroughput:", v))
         r.cycles_per_iter = v;
+      else if (scalar(line, "Total Cycles:", v))
+        r.total_cycles = v;
       else if (std::smatch rm; std::regex_match(line, rm, res_decl)) {
         idx2name[rm[1].str()] = rm[2].str();
         // Each sub-index declaration of a name adds one parallel unit of
@@ -306,11 +321,27 @@ static std::vector<RegionProfile> parse_mca_text(const std::string &text) {
 // SECTION 2 — the overlay model (pure).
 // ===========================================================================
 
+// Real per-iteration cycle cost. llvm-mca's "Total Cycles" is the block's
+// ACTUAL cycle count (it accounts for dependency-chain latency); "Block
+// RThroughput" is a pure THROUGHPUT LOWER BOUND that ignores latency chains
+// entirely. Dividing utilisation/duty math by RThroughput on a latency-bound
+// region divides by a denominator far smaller than reality: utilisation is
+// over-predicted (it can even exceed 1.0 for a SINGLE region alone, which is
+// physically impossible — a region cannot be more than 100% busy on its own
+// port). Prefer Total Cycles/Iterations; fall back to Block RThroughput only
+// when Total Cycles is absent/degenerate (e.g. a hand-edited --mca-file dump
+// from a format that omits it) — a defensive path, not the common case.
+static double effective_cycles_per_iter(const RegionProfile &r) {
+  if (r.total_cycles > 0 && r.iterations > 0)
+    return r.total_cycles / (double)r.iterations;
+  return r.cycles_per_iter > 0 ? r.cycles_per_iter : 1.0;
+}
+
 // Per-resource utilisation for one region: pressure/cycles, plus the synthetic
 // "dispatch" resource = uOpsPerCycle/DispatchWidth (front-end/retire width).
 static std::map<std::string, double> utilisation(const RegionProfile &r) {
   std::map<std::string, double> u;
-  double cyc = r.cycles_per_iter > 0 ? r.cycles_per_iter : 1.0;
+  double cyc = effective_cycles_per_iter(r);
   for (auto &[name, p] : r.pressure) {
     // Divide the summed pressure by the resource's CAPACITY (cycles * units):
     // a 3-unit group at 3.0 cycles of pressure over a 1-cycle block is 100%
@@ -372,7 +403,7 @@ static Overlay overlay(const RegionProfile &producer,
 // of the marked asm block, which may be a single loop iteration).
 static double producer_busy_ns(const RegionProfile &producer,
                                const Profile &prof, double blocks_per_msg) {
-  return producer.cycles_per_iter * blocks_per_msg / prof.freq_ghz;
+  return effective_cycles_per_iter(producer) * blocks_per_msg / prof.freq_ghz;
 }
 
 // duty(W): fraction of the consumer's window during which the producer is hot.
@@ -430,6 +461,23 @@ static std::optional<double> solve_wstar(const Profile &prof, double C,
   return 0.5 * (lo + hi);
 }
 
+// Band sensitivity factors for solve_budget()'s W* range. The band is a
+// deliberately coarse eps/C sensitivity sweep, NOT a statistical confidence
+// interval: since g(W) is dominated by the presence_tax (eps) term (see the
+// module header — eps sets the crossover's existence, C only steepens it),
+// the printed "W* range" is really an EPS-SENSITIVITY band with a secondary
+// C wobble layered on. Named here (not inline) so the sensitivity magnitude
+// is discoverable/adjustable in one place.
+struct BudgetBandCfg {
+  // Low-budget (sibling looks worse) scenario: presence tax scaled up...
+  static constexpr double kLoPresenceTaxMul = 1.5;
+  // ...and C_raw's excess-over-1 scaled up (stronger port contention).
+  static constexpr double kLoCExcessMul = 1.3;
+  // High-budget (sibling looks better) scenario: the mirror-image weaker case.
+  static constexpr double kHiPresenceTaxMul = 0.5;
+  static constexpr double kHiCExcessMul = 0.7;
+};
+
 // W* as a range: propagate the dominant input uncertainties (calib_scale on C,
 // and the handoff/presence terms) into a low/high budget. Deliberately coarse —
 // the point of the band is to show that the placement decision is robust across
@@ -445,13 +493,13 @@ static Budget solve_budget(const Profile &prof, const Overlay &o,
   b.mid = solve_wstar(prof, o.c, t_prod_ns);
   // Low budget (sibling looks worse): stronger contention, bigger presence tax.
   Profile pw = prof;
-  pw.presence_tax = prof.presence_tax * 1.5;
-  double c_hi = 1.0 + 1.3 * (o.c - 1.0);
+  pw.presence_tax = prof.presence_tax * BudgetBandCfg::kLoPresenceTaxMul;
+  double c_hi = 1.0 + BudgetBandCfg::kLoCExcessMul * (o.c - 1.0);
   b.lo = solve_wstar(pw, c_hi, t_prod_ns);
   // High budget (sibling looks better): weaker contention, smaller tax.
   Profile pb = prof;
-  pb.presence_tax = prof.presence_tax * 0.5;
-  double c_lo = 1.0 + 0.7 * (o.c - 1.0);
+  pb.presence_tax = prof.presence_tax * BudgetBandCfg::kHiPresenceTaxMul;
+  double c_lo = 1.0 + BudgetBandCfg::kHiCExcessMul * (o.c - 1.0);
   b.hi = solve_wstar(pb, c_lo, t_prod_ns);
   return b;
 }
@@ -798,12 +846,20 @@ static Profile load_profile(const std::string &path) {
 // interpolated token (source path, each cflag) is shell-quoted, and outputs go
 // to unique per-run paths inside `tmpdir`. Returns the .s text; sets ok=false
 // and prints the compiler's stderr on failure.
+// `cxx` is the compiler driver (default "g++", override via --cxx or $CXX).
+// Base flags default to the SAME flags this repo's other binaries are
+// measured with (-O3 -std=c++23, no -march=native — see CMakeLists.txt: no
+// -march is set there, so the measured crossover was produced by a scalar,
+// non-AVX-512-vectorised build). Hardcoding -march=native here used to
+// analyse a DIFFERENT, more-vectorised port profile than the one that
+// produced the measured numbers; pass `--cflags -march=native` explicitly if
+// you want that (and re-measure to match).
 static std::string compile_to_asm(const std::string &src,
                                   const std::vector<std::string> &cflags,
                                   bool markers_off, const std::string &tmpdir,
-                                  bool &ok) {
+                                  const std::string &cxx, bool &ok) {
   std::string sfile = tmpdir + "/" + (markers_off ? "off" : "on") + ".s";
-  std::string cmd = "g++ -O3 -std=c++23 -march=native -S";
+  std::string cmd = shell_quote(cxx) + " -O3 -std=c++23 -S";
   for (auto &f : cflags)
     cmd += " " + shell_quote(f);
   if (markers_off)
@@ -839,11 +895,16 @@ static void remove_tmpdir(const std::string &dir) {
 // Run llvm-mca on a .s file with an explicit -mcpu. stdout -> `out`, stderr ->
 // `err` (surfaced, since a wrong/unrecognised -mcpu warning must reach the user
 // rather than be parsed as report text). Returns exit code.
+// `mca_bin` is the llvm-mca binary to invoke (default "llvm-mca"; override via
+// --mca-bin or $SIBLING_ANALYZE_MCA — bare "llvm-mca" is often the WRONG
+// binary: distros ship versioned names like llvm-mca-20 with no unversioned
+// symlink, so a bare invocation can silently pick up a stale/absent tool
+// instead of the one CMake actually discovered).
 static int run_mca(const std::string &sfile, const std::string &mcpu,
-                   const std::string &tmpdir, std::string &out,
-                   std::string &err) {
-  std::string cmd =
-      "llvm-mca -mcpu=" + shell_quote(mcpu) + " " + shell_quote(sfile);
+                   const std::string &mca_bin, const std::string &tmpdir,
+                   std::string &out, std::string &err) {
+  std::string cmd = shell_quote(mca_bin) + " -mcpu=" + shell_quote(mcpu) + " " +
+                    shell_quote(sfile);
   return run_capture(cmd, out, err, tmpdir);
 }
 
@@ -892,45 +953,149 @@ struct Iters {
   bool prod_explicit = false; // --producer-iters-per-msg given
 };
 
+// ---------------------------------------------------------------------------
+// Human-friendly names for the resource groups llvm-mca reports, so the
+// headline verdict can say "load/store unit" instead of "Zn4LSU" to a reader
+// who doesn't know AMD's internal port naming. Single named table (not
+// scattered literals) so new mappings are added in one place. `is_prefix`
+// entries match any resource name STARTING WITH `raw` (e.g. all of
+// Zn4ALU0/Zn4ALU1/... collapse to one human name); exact entries must match
+// in full. An unmapped resource falls back to printing its raw mca name
+// rather than hiding it.
+// ---------------------------------------------------------------------------
+struct ResourceNameEntry {
+  const char *raw;   // exact name, or a prefix when is_prefix is true
+  const char *human; // plain-English name for the headline
+  bool is_prefix;
+};
+static const ResourceNameEntry kResourceHumanNames[] = {
+    {"Zn4LSU", "load/store unit", false},
+    {"Zn4FP45", "FP/vector units", false},
+    {"Zn4ALU", "integer ALU", true},
+    {"dispatch(front-end)", "front-end dispatch width", false},
+};
+
+static std::string human_resource_name(const std::string &raw) {
+  for (const auto &e : kResourceHumanNames) {
+    if (e.is_prefix) {
+      if (raw.rfind(e.raw, 0) == 0) // raw starts with e.raw
+        return e.human;
+    } else if (raw == e.raw) {
+      return e.human;
+    }
+  }
+  return raw; // unmapped: fall back to the raw mca name, don't hide it
+}
+
 static void print_report(const RegionProfile &prod, const RegionProfile &cons,
                          const Profile &prof, const Overlay &o, const Budget &b,
-                         const Iters &it) {
+                         const Iters &it,
+                         const std::vector<std::string> &lint_warnings = {}) {
   auto ns = [&](double cyc) { return cyc / prof.freq_ghz; };
-  double W_block = ns(cons.cycles_per_iter); // one marked block
-  double W_msg = W_block * it.cons;          // per message (if known)
+  // The consumer's per-message WORK estimate — what the bottom-line
+  // recommendation compares against W* — must use the same real-cycle
+  // denominator as utilisation()/producer_busy_ns() (Total Cycles/Iterations),
+  // NOT Block RThroughput. RThroughput is a throughput lower bound that is
+  // blind to dependency-chain latency; on a latency-bound consumer it
+  // understates W_msg (this repo's own real numbers: RThroughput=6.0 cyc vs
+  // effective=24.05 cyc, a 4x gap), which would silently push the "sibling
+  // wins" recommendation past where it actually holds. See
+  // effective_cycles_per_iter()'s comment for the full rationale.
+  double W_block = ns(effective_cycles_per_iter(cons)); // one marked block
+  double W_msg = W_block * it.cons; // per message (if known)
   double t_prod = producer_busy_ns(prod, prof, it.prod);
 
   printf("\n=== sibling_analyze — STATIC, ports+dispatch only ===\n");
-  printf(
-      "producer '%s': %.1f cyc/block (%.1f ns/msg @ %.2f GHz, %gx blocks/msg)"
-      "\n",
-      prod.name.c_str(), prod.cycles_per_iter, t_prod, prof.freq_ghz, it.prod);
-  printf("consumer '%s': %.1f cyc/block (%.1f ns/block), bottleneck below\n",
-         cons.name.c_str(), cons.cycles_per_iter, W_block);
+  // Two DISTINCT cyc/block figures, labelled, same as the consumer line
+  // below: RThroughput (the mca-reported throughput lower bound) vs
+  // effective (Total Cycles/Iterations). t_prod (the ns/msg figure) is
+  // derived from EFFECTIVE cycles (producer_busy_ns() above), so it must sit
+  // next to the effective cyc/block, not RThroughput — printing RThroughput
+  // cyc unlabeled next to an effective-derived ns figure reads as internally
+  // inconsistent on a latency-bound producer (e.g. "6.0 cyc/block (4.8
+  // ns/msg @ 4.98 GHz)" looks like 6.0 cyc == 4.8 ns, which at 4.98 GHz would
+  // be ~1.2 ns — the two numbers actually come from different denominators).
+  printf("producer '%s': %.1f cyc/block RThroughput, %.1f cyc/block effective "
+         "(%.1f ns/msg effective @ %.2f GHz, %gx blocks/msg)\n",
+         prod.name.c_str(), prod.cycles_per_iter,
+         effective_cycles_per_iter(prod), t_prod, prof.freq_ghz, it.prod);
+  printf("consumer '%s': %.1f cyc/block RThroughput, %.1f cyc/block effective "
+         "(%.1f ns/block effective), bottleneck below\n",
+         cons.name.c_str(), cons.cycles_per_iter,
+         effective_cycles_per_iter(cons), W_block);
 
-  printf("\ncombined demand (producer+consumer utilisation, >1.0 = "
+  // -------------------------------------------------------------------------
+  // RESULT: plain English a non-expert can act on, LEADING the report. The
+  // precise numbers (combined demand table, C_raw/C, W* mid/range) are kept
+  // below under "detail:" for the reader who wants them — this headline is
+  // the one-line takeaway, folding in what used to be a separate bare
+  // "VERDICT:" line plus a separate bottom "=>" recommendation.
+  //
+  // A port/dispatch COLLISION is a static, message-rate-independent fact
+  // (the two blocks alone already oversubscribe a shared resource), so its
+  // action (separate cores) is unconditional and does not depend on the
+  // duty-cycle/W* budget below — that budget only answers "how much work
+  // before same-CCX beats sibling", a question that presupposes no
+  // collision in the first place.
+  // -------------------------------------------------------------------------
+  if (o.collides) {
+    printf("\nRESULT: these two loops will contend on the %s (together they "
+           "demand %.2fx what one core supplies) -> place them on SEPARATE "
+           "cores.\n",
+           human_resource_name(o.bottleneck).c_str(), o.bottleneck_demand);
+  } else if (!it.explicit_msg) {
+    // The bottom-line recommendation compares the consumer's PER-MESSAGE work
+    // to W*. That requires knowing blocks-per-message; without
+    // --consumer-iters-per-msg we refuse to guess (a marked loop body is
+    // ~one iteration, so assuming 1 would make the answer
+    // near-unconditionally "sibling").
+    printf("\nRESULT: no port collision. Per-message work is UNKNOWN, so "
+           "there's no placement recommendation yet -> pass "
+           "--consumer-iters-per-msg N (blocks per message); the consumer's "
+           "marked block alone is ~%.1f ns.\n",
+           W_block);
+  } else if (b.mid) {
+    if (W_msg < *b.mid)
+      printf("\nRESULT: no port collision. Placement budget ~%.0f ns of "
+             "work per message; your consumer does ~%.0f ns/msg -> the SMT "
+             "SIBLING is the faster placement (with ~%.0f ns to spare).\n",
+             *b.mid, W_msg, *b.mid - W_msg);
+    else
+      printf("\nRESULT: no port collision, but your consumer's ~%.0f ns/msg "
+             "exceeds the ~%.0f ns placement budget -> place on a SAME-CCX "
+             "core instead; on-core contention now outweighs the sibling's "
+             "handoff edge.\n",
+             W_msg, *b.mid);
+  } else {
+    printf("\nRESULT: no port collision, and no contention crossover found "
+           "up to a millisecond of per-message work -> the SMT SIBLING is "
+           "the faster placement across the modelled range.\n");
+  }
+
+  // Lint caveats travel WITH the verdict (not buried earlier in build output)
+  // so the reader never separates a warning like "shrink region to the true
+  // steady-state body" from the number it qualifies.
+  for (const std::string &w : lint_warnings)
+    printf("  caveat: %s\n", w.c_str());
+
+  // ---- detail: the precise numbers behind the RESULT headline above. ----
+  printf("\ndetail: combined demand (producer+consumer utilisation, >1.0 = "
          "oversubscribed):\n");
   for (auto &[k, d] : o.top)
     printf("    %-22s %.2f%s\n", k.c_str(), d,
            k == o.bottleneck ? "   <== bottleneck" : "");
+  printf("  friction: C_raw=%.2f -> C=%.2f (calib_scale=%.2f); bottleneck "
+         "'%s' (%s)\n",
+         o.c_raw, o.c, prof.calib_scale, o.bottleneck.c_str(),
+         human_resource_name(o.bottleneck).c_str());
+  if (!o.collides)
+    printf("  NOTE: this checks execution ports + front end ONLY — cache "
+           "bandwidth, MSHRs, store buffer and L1 aliasing are unchecked. "
+           "Confirm with sibling_noise/spsc_pipeline if either region "
+           "touches >L1 data or is store-heavy.\n");
 
-  printf("\nfriction: C_raw=%.2f  -> C=%.2f (calib_scale=%.2f)\n", o.c_raw, o.c,
-         prof.calib_scale);
-  if (o.collides)
-    printf("VERDICT: COLLIDES on '%s' (combined demand %.2f). The two threads "
-           "fight for this resource on a shared core.\n",
-           o.bottleneck.c_str(), o.bottleneck_demand);
-  else
-    printf(
-        "VERDICT: no PORT/DISPATCH collision (max demand %.2f). NOTE: this "
-        "checks execution ports + front end ONLY — cache bandwidth, MSHRs, "
-        "store buffer and L1 aliasing are unchecked. Confirm with "
-        "sibling_noise/spsc_pipeline if either region touches >L1 data or is "
-        "store-heavy.\n",
-        o.bottleneck_demand);
-
-  printf("\nplacement budget W* (consumer ns of WORK PER MESSAGE below which "
-         "the sibling wins):\n");
+  printf("\ndetail: placement budget W* (consumer ns of WORK PER MESSAGE "
+         "below which the sibling wins):\n");
   auto show = [](const char *tag, const std::optional<double> &w) {
     if (w)
       printf("    %-8s W* = %.0f ns\n", tag, *w);
@@ -948,33 +1113,6 @@ static void print_report(const RegionProfile &prod, const RegionProfile &cons,
     printf("  (producer assumed 1 block/msg — if its marked span is one loop "
            "iteration, pass --producer-iters-per-msg N; too low under-counts "
            "duty and INFLATES W*.)\n");
-
-  // The bottom-line recommendation compares the consumer's PER-MESSAGE work to
-  // W*. That requires knowing blocks-per-message; without --consumer-iters-per-
-  // msg we refuse to guess (a marked loop body is ~one iteration, so assuming
-  // 1 would make the answer near-unconditionally "sibling").
-  if (!it.explicit_msg) {
-    printf("\n=> per-message work UNKNOWN: pass --consumer-iters-per-msg N "
-           "(blocks per message) for a placement recommendation. Budget above "
-           "is per message; the consumer's marked block is %.1f ns.\n",
-           W_block);
-    return;
-  }
-  if (b.mid) {
-    if (W_msg < *b.mid)
-      printf(
-          "\n=> your consumer does ~%.0f ns/msg < W*~%.0f ns: SIBLING is the "
-          "faster placement (subject to the memory caveat above).\n",
-          W_msg, *b.mid);
-    else
-      printf(
-          "\n=> your consumer does ~%.0f ns/msg >= W*~%.0f ns: step OUT to a "
-          "same-CCX core; on-core contention now outweighs the handoff edge.\n",
-          W_msg, *b.mid);
-  } else {
-    printf("\n=> no crossover in range: for this pair the sibling's handoff "
-           "edge is not overtaken by contention up to 1 ms/msg of work.\n");
-  }
 }
 
 static void print_json(const RegionProfile &prod, const RegionProfile &cons,
@@ -989,9 +1127,13 @@ static void print_json(const RegionProfile &prod, const RegionProfile &cons,
   printf("  \"producer_ns_per_msg\": %.1f, \"iters_per_msg_explicit\": %s,\n",
          producer_busy_ns(prod, prof, it.prod),
          it.explicit_msg ? "true" : "false");
+  // Same F1 fix as print_report(): effective cycles (Total Cycles/Iterations),
+  // NOT Block RThroughput — see effective_cycles_per_iter()'s comment. Field
+  // NAMES/shape are unchanged (scripts depend on them); only the previously-
+  // wrong VALUES are fixed.
   printf("  \"consumer_ns_per_block\": %.1f, \"consumer_ns_per_msg\": %.1f,\n",
-         cons.cycles_per_iter / prof.freq_ghz,
-         cons.cycles_per_iter * it.cons / prof.freq_ghz);
+         effective_cycles_per_iter(cons) / prof.freq_ghz,
+         effective_cycles_per_iter(cons) * it.cons / prof.freq_ghz);
   printf("  \"c_raw\": %.3f, \"c\": %.3f, \"calib_scale\": %.3f,\n", o.c_raw,
          o.c, prof.calib_scale);
   printf("  \"bottleneck\": \"%s\", \"bottleneck_demand\": %.3f, \"collides\": "
@@ -1055,7 +1197,7 @@ static const char *kCannedMca = R"MCA(
 
 Iterations:        100
 Instructions:      400
-Total Cycles:      205
+Total Cycles:      200
 Total uOps:        400
 Dispatch Width:    6
 uOps Per Cycle:    1.95
@@ -1082,7 +1224,7 @@ Resource pressure per iteration:
 
 Iterations:        100
 Instructions:      800
-Total Cycles:      808
+Total Cycles:      800
 Total uOps:        800
 Dispatch Width:    6
 uOps Per Cycle:    0.99
@@ -1104,6 +1246,38 @@ Resources:
 Resource pressure per iteration:
 [0]    [1]    [2]    [3]    [4]    [5]    [6]    [7]    [8]    [9]
  -      -      -     8.00    -      -      -      -      -      -
+)MCA";
+
+// A canned llvm-mca report for a LATENCY-BOUND region: Total Cycles (2405) is
+// far above Block RThroughput * Iterations (6.0*100=600) because the six
+// output words are filled by a SERIAL dependency chain (s = s*MIX+1, each word
+// depending on the previous), not independent lanes — mca's Block RThroughput
+// only sees the throughput ceiling of the busiest port and is blind to that
+// chain. These are the REAL numbers llvm-mca-20 (znver5) reports for
+// examples/spsc_marked.cpp's "producer" region — not invented — so this is the
+// exact shape that let F1 ship: with the old cycles_per_iter-only denominator,
+// u = 6.00/6.0 = 1.00 (single region reads as 100% saturated); the correct
+// denominator (Total Cycles/Iterations = 24.05) gives u = 6.00/24.05 ~= 0.25,
+// matching the real occupancy.
+static const char *kCannedMcaLatencyBound = R"MCA(
+[0] Code Region - latency_producer
+
+Iterations:        100
+Instructions:      1900
+Total Cycles:      2405
+Total uOps:        1900
+Dispatch Width:    6
+uOps Per Cycle:    0.79
+IPC:               0.79
+Block RThroughput: 6.0
+
+Resources:
+[0]   - Zn4ALU0
+[1]   - Zn4ALU1
+
+Resource pressure per iteration:
+[0]    [1]
+ -     6.00
 )MCA";
 
 static int run_self_tests() {
@@ -1207,6 +1381,83 @@ Resource pressure per iteration:
       Profile prof;
       Overlay og = overlay(light, gr[0], prof);
       check(!og.collides, "light+grouped region does NOT false-collide");
+    }
+  }
+
+  // F1 REGRESSION — Total Cycles must be the utilisation/duty denominator, NOT
+  // Block RThroughput (a throughput lower bound that is blind to dependency
+  // chains). kCannedMcaLatencyBound is llvm-mca-20's REAL report for
+  // examples/spsc_marked.cpp's serial-chain "producer" region: Block
+  // RThroughput=6.0 but Total Cycles=2405 over 100 iterations (24.05 cyc/iter)
+  // because the chain is latency-, not throughput-, bound. None of the OTHER
+  // canned regions above has Total Cycles != Block RThroughput*Iterations, so
+  // this is the exact blind spot that let the bug ship.
+  {
+    auto lat = parse_mca_text(kCannedMcaLatencyBound);
+    check(lat.size() == 1 && lat[0].name == "latency_producer",
+          "latency-bound region parsed");
+    if (lat.size() == 1) {
+      const RegionProfile &r = lat[0];
+      check(std::fabs(r.total_cycles - 2405.0) < 1e-6,
+            "Total Cycles parsed (2405, distinct from RThroughput*Iters=600)");
+
+      // (a) u <= 1.0 for a single region: with the buggy RThroughput-only
+      // denominator, u = 6.00/6.0 = 1.00 exactly (already borderline); the
+      // real bug manifests when RThroughput is smaller than pressure alone
+      // would need, or — as caught by the exact-value assert below — the
+      // computed utilisation must match Total Cycles math, not RThroughput
+      // math, and no resource utilisation may exceed 1.0 for one region alone
+      // (a region cannot be >100% busy on its own port).
+      auto u = utilisation(r);
+      double u_alu1 = u.count("Zn4ALU1") ? u.at("Zn4ALU1") : -1.0;
+      check(u_alu1 > 0.0 && u_alu1 <= 1.0 + 1e-9,
+            "single latency-bound region: u(Zn4ALU1) in (0,1]");
+      // Exact value: 6.00 / (2405/100) = 6.00/24.05 ~= 0.2495 — the ~0.25
+      // real-occupancy figure the fable review measured. The OLD (buggy) code
+      // would have computed 6.00/6.0 = 1.0, i.e. 4x too high.
+      check(std::fabs(u_alu1 - (6.00 / 24.05)) < 1e-6,
+            "utilisation uses Total Cycles/Iterations, not Block RThroughput");
+
+      // (b) a serial-chain (latency-bound) pair does NOT collide: overlaying
+      // this light-occupancy (~0.25) region with itself combines to ~0.50,
+      // well under the 1.05 collide_margin. Under the OLD bug (u=1.0 alone)
+      // this overlay would combine to ~2.0 and falsely COLLIDE.
+      Profile prof;
+      Overlay self_lat = overlay(r, r, prof);
+      check(!self_lat.collides,
+            "serial-chain pair does NOT false-collide (real occupancy ~0.25 "
+            "each)");
+      check(self_lat.bottleneck_demand < 1.0,
+            "serial-chain pair combined demand stays under 1.0");
+
+      // (c) producer_busy_ns must reflect ACTUAL cycles, not RThroughput: at
+      // 1 GHz and 1 block/msg, busy ns == effective cycles/iter == 24.05, NOT
+      // the RThroughput-derived 6.0.
+      Profile ghz1;
+      ghz1.freq_ghz = 1.0;
+      double busy = producer_busy_ns(r, ghz1, 1.0);
+      check(std::fabs(busy - 24.05) < 1e-6,
+            "producer_busy_ns uses Total Cycles/Iterations (24.05 ns @ 1GHz), "
+            "not Block RThroughput (would be 6.0 ns)");
+
+      // (d) F1 RESIDUAL — the CONSUMER-side per-message work estimate (what
+      // print_report's W_block/W_msg and print_json's consumer_ns_per_block/
+      // consumer_ns_per_msg compute, and what the final placement
+      // recommendation compares against W*) must ALSO use effective cycles
+      // (Total Cycles/Iterations), not Block RThroughput. The producer side
+      // was fixed first ((c) above); this mirrors it for the consumer side,
+      // which the review found the original fix missed. At 1 GHz,
+      // consumer_ns_per_block == effective cycles/iter == 24.05, NOT the
+      // RThroughput-derived 6.0.
+      double consumer_ns_per_block =
+          effective_cycles_per_iter(r) / ghz1.freq_ghz;
+      check(std::fabs(consumer_ns_per_block - 24.05) < 1e-6,
+            "consumer_ns_per_block uses Total Cycles/Iterations (24.05 ns "
+            "@ 1GHz), not Block RThroughput (would be 6.0 ns)");
+      check(std::fabs(consumer_ns_per_block -
+                      r.cycles_per_iter / ghz1.freq_ghz) > 1.0,
+            "sanity: effective and RThroughput-derived denominators actually "
+            "differ for this canned latency-bound region");
     }
   }
 
@@ -1357,7 +1608,8 @@ Resource pressure per iteration:
 // SECTION 7 — --calibrate: reproduce a measured busy-sibling multiplier through
 // the static path, and print the scale factor to put in your profile.
 // ===========================================================================
-static int run_calibrate(double measured_multiplier, const std::string &mcpu) {
+static int run_calibrate(double measured_multiplier, const std::string &mcpu,
+                         const std::string &mca_bin, const std::string &cxx) {
   // Emit a tiny TU whose single marked region is the sibling_noise victim: 8
   // independent imul-accumulate lanes, PURE REGISTER (no memory loads, so it
   // exercises only the multiply port and does not drag in grouped Load/LSU
@@ -1387,7 +1639,7 @@ uint64_t k(uint64_t n){
   std::string cppfile = tmpdir + "/calib.cpp";
   std::ofstream(cppfile) << src;
   bool ok = false;
-  std::string asm_on = compile_to_asm(cppfile, {}, false, tmpdir, ok);
+  std::string asm_on = compile_to_asm(cppfile, {}, false, tmpdir, cxx, ok);
   if (!ok) {
     remove_tmpdir(tmpdir);
     return 1;
@@ -1395,7 +1647,7 @@ uint64_t k(uint64_t n){
   std::string sfile = tmpdir + "/calib.s";
   std::ofstream(sfile) << asm_on;
   std::string mca, err;
-  int rc = run_mca(sfile, mcpu, tmpdir, mca, err);
+  int rc = run_mca(sfile, mcpu, mca_bin, tmpdir, mca, err);
   if (!err.empty())
     fprintf(stderr, "llvm-mca (mcpu=%s) messages:\n%s\n", mcpu.c_str(),
             err.c_str());
@@ -1438,11 +1690,19 @@ static void usage(const char *a0) {
           "usage:\n"
           "  %s <source.cpp> [--producer NAME] [--consumer NAME] "
           "[--profile FILE] [--cflags TOK]... [--consumer-iters-per-msg N] "
-          "[--producer-iters-per-msg N] [--json|--emit-model]\n"
+          "[--producer-iters-per-msg N] [--mca-bin PATH] [--cxx PATH] "
+          "[--json|--emit-model]\n"
           "  %s --mca-file <llvm-mca-dump.txt> [--producer NAME] "
           "[--consumer NAME] [--profile FILE] [--json]\n"
-          "  %s --calibrate [MEASURED_MULTIPLIER] [--profile FILE]\n"
-          "  %s --test\n",
+          "  %s --calibrate [MEASURED_MULTIPLIER] [--profile FILE] "
+          "[--mca-bin PATH] [--cxx PATH]\n"
+          "  %s --test\n"
+          "\n"
+          "  --mca-bin PATH   llvm-mca binary to invoke (default: "
+          "$SIBLING_ANALYZE_MCA if set, else \"llvm-mca\"). Distros often ship "
+          "only a versioned name (llvm-mca-20) with no bare symlink.\n"
+          "  --cxx PATH       C++ compiler driver (default: $CXX if set, else "
+          "\"g++\").\n",
           a0, a0, a0, a0);
 }
 
@@ -1457,6 +1717,14 @@ int main(int argc, char **argv) {
   bool as_json = false, emit_model_csv = false, calibrate = false;
   double calib_measured = 1.81;
   Iters iters;
+  // Defaults for the mca binary / compiler driver: an explicit --flag wins
+  // over the environment, which wins over the bare-name fallback.
+  std::string mca_bin = "llvm-mca";
+  if (const char *e = std::getenv("SIBLING_ANALYZE_MCA"); e && *e)
+    mca_bin = e;
+  std::string cxx = "g++";
+  if (const char *e = std::getenv("CXX"); e && *e)
+    cxx = e;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&](const char *what) -> std::string {
@@ -1480,6 +1748,10 @@ int main(int argc, char **argv) {
       cflags.push_back(next("--cflags"));
     else if (a == "--mca-file")
       mca_file = next("--mca-file");
+    else if (a == "--mca-bin")
+      mca_bin = next("--mca-bin");
+    else if (a == "--cxx")
+      cxx = next("--cxx");
     else if (a == "--consumer-iters-per-msg") {
       iters.cons = std::atof(next("--consumer-iters-per-msg").c_str());
       iters.explicit_msg = true;
@@ -1519,7 +1791,7 @@ int main(int argc, char **argv) {
               calib_measured);
       return 1;
     }
-    return run_calibrate(calib_measured, prof.mca_mcpu);
+    return run_calibrate(calib_measured, prof.mca_mcpu, mca_bin, cxx);
   }
 
   if (source.empty() && mca_file.empty()) {
@@ -1534,6 +1806,12 @@ int main(int argc, char **argv) {
             prof.Dh(), prof.presence_tax);
 
   std::string mca_text, tmpdir;
+  // Collected region-lint warnings (e.g. "shrink region to the true
+  // steady-state body"), re-surfaced next to the final verdict in
+  // print_report() so the caveat travels with the number instead of being
+  // lost earlier in the build/lint output above. Empty on the --mca-file
+  // path, which skips the asm lint entirely (see the note printed below).
+  std::vector<std::string> lint_warnings;
   if (!mca_file.empty()) {
     // A pre-saved dump has no source asm, so the region lint (call/atomic/
     // empty-region checks) and the perturbation diff cannot run — only the
@@ -1549,7 +1827,7 @@ int main(int argc, char **argv) {
       return 1;
     }
     bool ok = false;
-    std::string asm_on = compile_to_asm(source, cflags, false, tmpdir, ok);
+    std::string asm_on = compile_to_asm(source, cflags, false, tmpdir, cxx, ok);
     if (!ok) {
       remove_tmpdir(tmpdir);
       return 1;
@@ -1559,7 +1837,7 @@ int main(int argc, char **argv) {
 
     // Perturbation diff, scoped to the marked functions only (so a regional
     // vectorisation loss isn't diluted by the rest of the TU).
-    std::string asm_off = compile_to_asm(source, cflags, true, tmpdir, ok);
+    std::string asm_off = compile_to_asm(source, cflags, true, tmpdir, cxx, ok);
     if (ok) {
       double pr = marked_function_perturbation(asm_on, asm_off);
       if (pr > 0.15)
@@ -1599,8 +1877,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "LINT ERROR: %s\n", e.c_str());
         fatal = true;
       }
-      for (auto &w : L.warnings)
+      for (auto &w : L.warnings) {
         fprintf(stderr, "lint warning: %s\n", w.c_str());
+        lint_warnings.push_back(w);
+      }
     }
     if (fatal) {
       fprintf(stderr, "aborting: a region's port vector is untrustworthy (see "
@@ -1610,8 +1890,9 @@ int main(int argc, char **argv) {
     }
 
     std::string err;
-    int rc = run_mca(sfile, prof.mca_mcpu, tmpdir, mca_text, err);
-    fprintf(stderr, "llvm-mca: -mcpu=%s", prof.mca_mcpu.c_str());
+    int rc = run_mca(sfile, prof.mca_mcpu, mca_bin, tmpdir, mca_text, err);
+    fprintf(stderr, "llvm-mca (%s): -mcpu=%s", mca_bin.c_str(),
+            prof.mca_mcpu.c_str());
     if (!err.empty())
       fprintf(stderr, " (messages: %s)", trim(err).c_str());
     fprintf(stderr, "\n");
@@ -1651,7 +1932,7 @@ int main(int argc, char **argv) {
   else if (as_json)
     print_json(*prod, *cons, prof, o, b, iters);
   else
-    print_report(*prod, *cons, prof, o, b, iters);
+    print_report(*prod, *cons, prof, o, b, iters, lint_warnings);
   remove_tmpdir(tmpdir);
   return 0;
 }

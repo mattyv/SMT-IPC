@@ -35,8 +35,28 @@ usage:
       --model model.csv --check --tol 80
 """
 import argparse
+import json
 import math
 import sys
+
+# Default measured busy-sibling multiplier (sibling_noise 'hot'/'idle' ratio),
+# README's Zen 5 figure. Mirrors sibling_analyze.cpp's own `--calibrate`
+# default (search main() for `calib_measured = 1.81`) — the two constants are
+# NOT programmatically shared (different languages/binaries) but are the same
+# ground-truth number by construction, so keep them in sync by hand if either
+# changes.
+DEFAULT_MEASURED_MULTIPLIER = 1.81
+
+# Default relative-error tolerance for the self-overlay C-term check (--check
+# with a --self-overlay-json report): how far the calibrated mca port-
+# contention term C is allowed to drift from the measured busy-sibling
+# multiplier before run_check() fails it. 20% is loose on purpose — this is
+# the SAME loose-tolerance discipline as --tol/--rel-tol for the delta_ns
+# residuals above (the model is a coarse upper-bound tool, not a tight fit).
+# Named once here (was previously duplicated as a bare 0.20 literal in both
+# run_check()'s default arg and the --c-rel-tol argparse default) so the two
+# can never drift apart.
+DEFAULT_C_REL_TOL = 0.20
 
 
 def read_measured(path):
@@ -86,11 +106,19 @@ def read_model(path):
 
 
 def sign_change_bracket(pts):
-    """First adjacent pair whose delta crosses zero (neg->pos). Returns
-    (lo_w, hi_w) or None. This is the honest 'measured crossover interval'."""
+    """First adjacent pair whose delta crosses zero, in EITHER direction
+    (neg->pos: sibling gets worse than same-CCX as work grows — the usual
+    contention-dominated shape; or pos->neg: same-CCX starts out ahead but the
+    sibling's handoff edge overtakes it as work grows — happens on boxes where
+    Dh is small/negative-leaning relative to eps*W at low W). Returns (lo_w,
+    hi_w, direction) or None. `direction` is "rising" (neg->pos) or "falling"
+    (pos->neg) so callers can report which shape was measured rather than
+    silently treating either the same as "no crossover"."""
     for (w0, d0), (w1, d1) in zip(pts, pts[1:]):
         if d0 <= 0 <= d1 and d0 != d1:
-            return (w0, w1)
+            return (w0, w1, "rising")
+        if d0 >= 0 >= d1 and d0 != d1:
+            return (w0, w1, "falling")
     return None
 
 
@@ -114,13 +142,45 @@ def _finite(x):
         and x == x and abs(x) != float("inf")
 
 
-def run_check(measured, curve, m_machine, meta, tol_ns, rel_tol, force):
+def read_self_overlay_c(path):
+    """Read a sibling_analyze --json report (self-overlay: --producer NAME
+    --consumer NAME with the SAME region on both sides) and return its
+    calibrated "c" field. This is the mca port-contention prediction alone —
+    the same shape --calibrate exercises — so asserting it against a measured
+    busy-sibling multiplier validates the mca ENGINE (parsing + pressure
+    math), not just the closed-form Δh/ε/duty constants the rest of --check
+    exercises. Returns None if the field is missing (caller then skips the
+    C-term assertion but still reports it as skipped, not silently)."""
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("c")
+
+
+def run_check(measured, curve, m_machine, meta, tol_ns, rel_tol, force,
+              self_overlay_c=None, measured_multiplier=DEFAULT_MEASURED_MULTIPLIER,
+              c_rel_tol=DEFAULT_C_REL_TOL):
     """Numeric agreement check. Returns (ok, lines). Compares machine
     fingerprints, the W* band vs the measured sign-change bracket (with a
-    both-sides-no-crossover case that PASSES), and per-point residuals with a
-    scale-aware tolerance max(tol_ns, rel_tol*|measured|)."""
+    both-sides-no-crossover case that PASSES), per-point residuals with a
+    scale-aware tolerance max(tol_ns, rel_tol*|measured|), and — if
+    self_overlay_c is given — the calibrated mca port-contention term C
+    against a measured busy-sibling multiplier. Without that last term, the
+    numeric check only exercises Δh/ε/duty: the mca C contribution is small at
+    every measured proc-sweep work point in this repo's example, so a check
+    without it would pass even with a garbage/misparsing mca engine."""
     lines = []
     ok = True
+
+    terms = ["Δh + ε (handoff/presence-tax closed-form constants, via the W* "
+             "band vs measured bracket)",
+             "per-point residual (model curve vs measured, scale-aware "
+             "tolerance)"]
+    terms.append("mca C (port-contention engine, via self-overlay vs measured "
+                 "busy-sibling multiplier)" if self_overlay_c is not None else
+                 "mca C — SKIPPED (no --self-overlay-json given): this run "
+                 "does NOT validate the mca engine itself, only the "
+                 "closed-form constants above")
+    lines.append("checking: " + "; ".join(terms))
 
     # Machine fingerprint: an mca model is uarch-specific, so refuse to validate
     # a cross-machine overlay unless explicitly forced.
@@ -154,13 +214,19 @@ def run_check(measured, curve, m_machine, meta, tol_ns, rel_tol, force):
         ok = False
     elif not model_has_band:
         lines.append("mismatch: model predicts NO crossover but measured "
-                     f"crosses in [{bracket[0]:.0f},{bracket[1]:.0f}] — FAIL")
+                     f"crosses in [{bracket[0]:.0f},{bracket[1]:.0f}] "
+                     f"({bracket[2]}) — FAIL")
         ok = False
     else:
+        direction = bracket[2]
         overlap = (lo <= bracket[1]) and (bracket[0] <= hi)
+        dir_note = ("" if direction == "rising" else
+                     " [pos->neg: same-CCX starts ahead, sibling's handoff "
+                     "edge overtakes it as work grows — not a 'no crossover' "
+                     "case]")
         lines.append(
             f"W* band [{lo:.0f},{hi:.0f}] ns vs measured bracket "
-            f"[{bracket[0]:.0f},{bracket[1]:.0f}] ns: "
+            f"[{bracket[0]:.0f},{bracket[1]:.0f}] ns ({direction}){dir_note}: "
             f"{'OVERLAP ok' if overlap else 'DISJOINT — FAIL'}"
         )
         ok = ok and overlap
@@ -178,6 +244,18 @@ def run_check(measured, curve, m_machine, meta, tol_ns, rel_tol, force):
     lines.append(f"residual/tol worst {worst_ratio:.2f}: "
                  f"{'ok' if worst_ratio <= 1.0 else 'FAIL'}")
     ok = ok and (worst_ratio <= 1.0)
+
+    if self_overlay_c is not None:
+        c_rel_err = abs(self_overlay_c - measured_multiplier) / measured_multiplier
+        c_ok = c_rel_err <= c_rel_tol
+        lines.append(
+            f"mca C (self-overlay, calibrated) = {self_overlay_c:.3f} vs "
+            f"measured busy-sibling multiplier {measured_multiplier:.3f}: "
+            f"rel err {c_rel_err:.1%} (tol {c_rel_tol:.0%}): "
+            f"{'ok' if c_ok else 'FAIL'}"
+        )
+        ok = ok and c_ok
+
     return ok, lines
 
 
@@ -291,6 +369,23 @@ def main():
                     help="relative residual tolerance (fraction of |measured|)")
     ap.add_argument("--force", action="store_true",
                     help="proceed even if machine fingerprints mismatch")
+    ap.add_argument("--self-overlay-json",
+                    help="sibling_analyze --json output from a SELF-overlay "
+                    "(--producer NAME --consumer NAME, same region both "
+                    "sides) of the port-bound region. When given, --check "
+                    "ALSO asserts its calibrated 'c' against "
+                    "--measured-multiplier — this is what validates the mca "
+                    "engine itself, not just the closed-form Δh/ε constants.")
+    ap.add_argument("--measured-multiplier", type=float,
+                    default=DEFAULT_MEASURED_MULTIPLIER,
+                    help="measured busy-sibling multiplier (sibling_noise "
+                    "hot/idle ratio) to compare --self-overlay-json's "
+                    "calibrated C against")
+    ap.add_argument("--c-rel-tol", type=float, default=DEFAULT_C_REL_TOL,
+                    help="relative tolerance for the self-overlay C "
+                    "assertion — generous by default because the self-"
+                    "overlaid region need not be the exact kernel shape "
+                    "--calibrate was run against")
     a = ap.parse_args()
 
     measured, m_machine = read_measured(a.measured)
@@ -305,8 +400,11 @@ def main():
         print(f"wrote {a.out}")
 
     if a.check:
+        self_overlay_c = (read_self_overlay_c(a.self_overlay_json)
+                          if a.self_overlay_json else None)
         ok, lines = run_check(measured, curve, m_machine, meta, a.tol,
-                              a.rel_tol, a.force)
+                              a.rel_tol, a.force, self_overlay_c,
+                              a.measured_multiplier, a.c_rel_tol)
         print("\n".join(lines))
         print("CHECK:", "PASS" if ok else "FAIL")
         return 0 if ok else 1

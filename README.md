@@ -8,7 +8,7 @@ L1." The folklore is half right, and chasing down the other half is what this re
 is. Three small x86-64 Linux microbenchmarks, run on an AMD Zen 5 box, that build to one
 measured answer:
 
-![Placement crossover: sibling vs same-CCX end-to-end latency as consumer work grows](docs/crossover.svg)
+![Sibling vs same-CCX placement crossover: the static llvm-mca prediction (dashed) overlaid on the measured curves — a polite producer (crossover ~3.7 µs) and both threads busy (crossover into the low hundreds of ns), with the model's W* band between them](docs/crossover.svg)
 
 **A processing consumer is faster on the producer's SMT sibling — but only up to a couple
 of microseconds of work per message. Past that, a separate core in the same CCX wins.** For
@@ -159,6 +159,14 @@ nanoseconds you'd guess from the 1.8× busy-sibling figure. The practical readin
 doing less than a couple of µs of work per message — the common case — is faster on the SMT
 sibling, provided the producer stays polite and nothing else runs on that core.
 
+**But "polite" is doing real work in that sentence.** Make the producer busy too and both
+threads become each other's victim — `--proc-sweep --producer-rounds 512` runs exactly that, and
+the crossover *collapses from ~3.7 µs to the low hundreds of ns* (with `proc_ratio` measured at ~1.5, genuine
+mutual contention, not the ~3 % polite tax). So the real rule is: siblings win only while one
+side stays polite; once both are heavy, step to separate cores. Both regimes — polite and
+both-busy — are the two solid lines in the graph at the top; the dashed line is Step 5's static
+prediction of the same crossover, landing between them.
+
 **Scope, so this isn't over-read:** the message source is an in-memory ring, *by design* — a
 real socket's `recv()` is microseconds and would swamp this nanosecond-scale placement signal
 entirely. This answers "given a message already in hand, does placement or processing weight
@@ -183,77 +191,84 @@ softer part.
 
 ## Step 5 — predicting it for *your* threads, without running anything
 
-Steps 1–4 *measure* the crossover on this box. But the crossover point depends on what your
-consumer actually does per message — and you'd rather not build the whole timing rig for every
-candidate workload. `sibling_analyze` is a **static** tool: you mark the hot loops of your real
-producer and consumer (`sibling_marks.hpp`), and it predicts — from the compiled instructions,
-via `llvm-mca` — whether those two specific regions will contend on a shared core, and roughly
-where their placement budget `W*` lands. It's the two-thread analogue of a static
-`optimal_N` calc: derive it from the port model instead of discovering it by sweep.
+Steps 1–4 *measure* the crossover — but measuring means building the timing rig and running a
+sweep, on the target hardware, for every workload you're curious about. `sibling_analyze` asks
+the same question **statically**: given your actual producer and consumer loops, can you tell —
+from the compiled instructions, before running anything — whether they'll be faster as SMT
+siblings or on separate cores? It's a linter for thread placement.
+
+**You point it at your two hot loops.** Bracket each thread's steady-state loop with a matched
+pair of markers from `sibling_marks.hpp`:
 
 ```cpp
 #include "sibling_marks.hpp"
-// consumer's steady-state loop — markers wrap the LOOP, not its body (a
-// "memory"-clobber marker inside the body can block vectorisation):
-for (;;) { auto* m = q.front(); if (!m) { _mm_pause(); continue; }
-  SIBLING_REGION_BEGIN("consumer");
-  for (int r = 0; r < rounds; r++) process(*m);   // the per-message work
-  SIBLING_REGION_END("consumer");
-  q.pop(); }
+for (;;) {
+  auto* m = q.front(); if (!m) { _mm_pause(); continue; }
+  SIBLING_REGION_BEGIN("consumer");                 // opens the region
+  for (int r = 0; r < rounds; r++) process(*m);     // the per-message work
+  SIBLING_REGION_END("consumer");                   // closes it (matched by name)
+  q.pop();
+}
 ```
 
+`SIBLING_REGION_BEGIN("consumer")` and `SIBLING_REGION_END("consumer")` are a pair — the name
+string ties them together, so you can mark the producer's loop and the consumer's loop
+distinctly in one file. They expand to assembler-comment markers that tag *exactly which
+instructions* the tool analyses. Three rules keep that honest, and the tool lints for all three:
+**wrap the whole loop, not one iteration** (the model treats the marked span as a steady-state
+body repeated forever); **keep the queue push/pop and any fences *outside* the region** (their
+cost is the cross-core handoff, already counted separately — including them here would
+double-count it); and **no un-inlined `call` inside** (its callee is invisible to the model, so
+the tool refuses rather than analyse half the work).
+
+**How it works, in a sentence:** the tool compiles your marked loops, feeds their instructions
+to `llvm-mca` — a model of the CPU's execution ports — and asks *if these two loops ran at the
+same time on one physical core, would they demand more of any execution port than the core can
+supply?* If yes, they'll fight, and it says split them; if no, the sibling's faster handoff
+wins, and it estimates how much work-per-message you can afford before the fight would outweigh
+the handoff savings.
+
+**The output tells you what to do, in plain words** (the shipped `examples/spsc_marked.cpp`):
+
 ```
-$ ./sibling_analyze mythreads.cpp --profile my.profile --consumer-iters-per-msg 64
-llvm-mca: -mcpu=native
-combined demand (producer+consumer utilisation, >1.0 = oversubscribed):
-    SKXPort1               2.01   <== bottleneck
-VERDICT: COLLIDES on 'SKXPort1' (combined demand 2.01).
-placement budget W* (ns of WORK PER MESSAGE): mid 1641 ns  (range 1089–3296 ns)
-=> your consumer does ~64 ns/msg < W*~1641 ns: SIBLING is the faster placement.
+RESULT: these two loops will contend on the load/store unit (together they
+        demand 1.15x what one core supplies) -> place them on SEPARATE cores.
 ```
 
-Note **`--consumer-iters-per-msg`**: mca's "iteration" is one repeat of the marked *asm block*
-(usually one loop iteration), which is not one message. To turn the per-block cost into
-per-message work — the quantity the recommendation compares against `W*` — you tell the tool how
-many blocks make a message. Without it, the tool prints the budget but withholds the
-recommendation rather than assume `1` (which would make almost any loop-marked consumer read as
-"sibling wins").
+When the loops *don't* oversubscribe a port, it flips to a budget instead — *"Placement budget
+~1650 ns of work per message; your consumer does ~100 ns/msg → the SMT sibling is faster."* The
+raw numbers (which port, the contention multiplier, the budget and its range) print underneath
+as `detail:` lines, and any lint warning rides right next to the verdict. *(One knob:
+`--consumer-iters-per-msg N` tells it how many loop iterations make one message, since
+`llvm-mca` counts iterations, not messages; without it, it prints the budget but withholds the
+recommendation rather than guess.)*
 
-**How it maps to the four measured steps.** The friction multiplier `C` comes from overlaying
-the two regions' per-port utilisation — each resource's pressure divided by its *unit count*, so
-a multi-unit group (AMD's `Zn4LSU`/`Zn4FP45`) isn't mistaken for oversubscribed — plus a
-synthetic *dispatch* row that catches two port-*disjoint* streams still colliding on shared
-front-end width. The budget is the same crossover as Step 4 — `W* = Δh / (ε + duty(W)·(C−1))` —
-with `Δh` (one-way handoff edge) from Step 1/4, `ε` (presence tax) from Step 2's polite-sibling
-row, and `duty(W)` solved in closed form from the producer's own cycle count. **`--calibrate`
-ties it back to Step 2's ground truth**: it runs the `sibling_noise` victim kernel through the
-static path and prints the `calib_scale` that maps the predicted `C` onto your measured
-busy-sibling multiplier (the README's 1.81×). Set `mca_mcpu` in your profile if `-mcpu=native`
-mis-resolves (LLVM < 19 has no `znver5` model).
+**It takes the "both threads are victims of each other" view — which is the point.** The tool
+*sums* both loops' demand on each port, so it models mutual contention, not one thread
+victimising a passive one. That's why its estimate lands *between* the two regimes we measured:
+with a **polite** producer the crossover measured ~3.7 µs (the producer barely competes, so the
+sibling wins far out), and with **both threads busy** it collapsed into the low hundreds of ns (each taxes the
+other — `spsc_pipeline --proc-sweep --producer-rounds 512` measures exactly that mutual case).
+The static ~1.7 µs estimate is the safe, both-competing default.
 
-**Seeing the prediction against the measurement.** `sibling_analyze --emit-model` dumps the
-predicted `Δ(W)` curve as CSV (the C++ tool stays the single source of the model math), and
-`scripts/plot_crossover.py` overlays it on the measured curve — dashed model line, measured
-points, a shaded `W*` band, the measured sign-change bracket — and, with `--check`, asserts the
-two *agree by numbers, not pixels*: the `W*` band must overlap the measured bracket and the
-model residuals at each work point must be within tolerance. That check is wired as an optional
-`ctest` (`crossover_check`, skipped where `llvm-mca` isn't present). It is only honest on
-**same-machine** data — an mca model is uarch-specific, so `docs/crossover_data.csv` (this box's
-Zen 5 numbers) must be regenerated from `spsc_pipeline --proc-sweep` on your target before a pass
-elsewhere means anything. `examples/spsc_marked.cpp` is a worked marking of the pipeline's own
-producer/consumer.
+**How accurate is it?** On this box, for that example, it predicts a budget of **~1.65 µs**; the
+measured crossover runs **~2.4–3.7 µs** (polite) down to **the low hundreds of ns** (both busy). So it's right
+on *direction* and *order of magnitude*, and within ~2× of the polite measurement — good for a
+compile-time screen that runs nothing. Its port model is validated separately: `--calibrate`
+maps the predicted contention onto the *measured* 1.81× busy-sibling ratio from Step 2, and
+lands within 0.7%. The overlay at the top of this README is `sibling_analyze --emit-model` (the
+dashed prediction) plotted against both measured curves; `scripts/plot_crossover.py --check`
+asserts they agree by numbers, not pixels — on **same-machine** data only, since the model is
+micro-architecture-specific, so regenerate `docs/crossover_data.csv` from
+`spsc_pipeline --proc-sweep` on your own box before a pass elsewhere means anything.
 
-**It is a screening linter, not an oracle — the caveats are load-bearing, not boilerplate.**
-`llvm-mca` sees execution ports and front-end dispatch and *nothing else*: it models ideal
-caches, infinite MSHRs/store-buffer, and a single stream (no notion of two siblings sharing).
-Every one of those blind spots makes it *under*-predict friction, so **`W*` is an upper bound**
-and the tool errs toward recommending the sibling. Therefore a `COLLIDES` verdict is
-trustworthy; a "no port collision" verdict only clears the *compute ports* and prints the
-memory caveat explicitly. For any load-bearing "safe" on a memory-flavoured region, confirm
-with `sibling_noise`/`spsc_pipeline` — they remain ground truth. The tool also **lints the
-marked regions** (hard error on a `call`, whose callee is invisible to mca; warnings on
-in-region atomics/fences that belong to `Δh`, and on branches) and **diffs marked-vs-unmarked
-codegen** to catch a marker that perturbed what ships (e.g. blocked vectorisation).
+**It's a screening linter, not an oracle — and the limits are load-bearing.** `llvm-mca` sees
+execution ports and front-end dispatch and *nothing else*: it assumes perfect caches and store
+buffers and a single instruction stream. So a `COLLIDES` verdict (the ports genuinely
+oversubscribe) is trustworthy, while a "no collision" only clears the *compute* side — for
+anything memory-heavy, confirm with `sibling_noise`/`spsc_pipeline`, which stay the ground
+truth. The tool also diffs your code compiled with and without the markers, to catch a marker
+that accidentally changed what ships (e.g. blocked vectorisation).
 
 ## Build & run
 
@@ -276,7 +291,7 @@ The three runtime tools share `pp_core.hpp` (TSC calibration, pinning, percentil
 topology discovery). Bad CPU args and pin failures are always fatal — an unpinned pair measures
 nothing. **x86-64 Linux only** (`rdtsc`, `_mm_pause`, sysfs). `sibling_analyze` is separate and
 dependency-light: its `--test` needs only a C++ compiler, and its analysis path additionally
-needs `g++` and `llvm-mca` (pinned to LLVM 18's report format) on `PATH`; edit `example.profile`
+needs `g++` and `llvm-mca` (report format validated against LLVM 18–20) on `PATH`; edit `example.profile`
 into your own machine's numbers first.
 
 *(An earlier, larger version of `spsc_pipeline` also carried a separate wait-strategy study —

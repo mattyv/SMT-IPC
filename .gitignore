@@ -8,3 +8,7 @@
 # Per-collaborator local Claude Code permission overrides (already covered
 # by this user's global ignore, but not everyone's).
 /.claude/settings.local.json
+
+# Python bytecode cache
+__pycache__/
+*.pyc

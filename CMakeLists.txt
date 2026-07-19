@@ -46,12 +46,29 @@ add_test(NAME sibling_noise_self_test COMMAND sibling_noise --test)
 add_test(NAME spsc_pipeline_self_test COMMAND spsc_pipeline --test)
 add_test(NAME sibling_analyze_self_test COMMAND sibling_analyze --test)
 
+# Finding-1 regression probe: an INTEGRATION check (runs the real binary's
+# --mca-file -> --json path) that print_report()/print_json() actually emit
+# the effective-cycles consumer work figure, not just that a helper function
+# computes it correctly in isolation. See scripts/check_f1_residual.sh for
+# the full rationale — needs only sh/awk, no llvm-mca, so it runs
+# unconditionally alongside the other --test self-checks.
+add_test(NAME sibling_analyze_f1_residual_probe
+  COMMAND sh ${CMAKE_SOURCE_DIR}/scripts/check_f1_residual.sh
+    $<TARGET_FILE:sibling_analyze>
+    ${CMAKE_SOURCE_DIR}/examples/f1_residual_latency_bound.mca
+    ${CMAKE_SOURCE_DIR}/examples/f1_residual_latency_bound.profile)
+
 # Optional: end-to-end crossover check (static model vs measured curve). Needs
 # llvm-mca (the analysis engine) and python3, so it is registered ONLY when both
 # are present — the plain gcc CI image skips it and runs just the pure --test
 # above. This is a SAME-MACHINE self-consistency check (see the script header);
 # a generous tolerance keeps it robust across the uarch it happens to run on.
-find_program(LLVM_MCA NAMES llvm-mca llvm-mca-18)
+# NAMES lists the versioned binaries this parser is validated against (18-20;
+# see sibling_analyze.cpp's parser header) before the unversioned name, since
+# most distros ship ONLY the versioned binary (no "llvm-mca" symlink) — a bare
+# "llvm-mca" NAMES-only search silently finds nothing on those systems and the
+# whole crossover_check test goes missing without a word.
+find_program(LLVM_MCA NAMES llvm-mca-20 llvm-mca-19 llvm-mca-18 llvm-mca)
 find_program(PYTHON3 NAMES python3)
 if(LLVM_MCA AND PYTHON3)
   add_test(NAME crossover_check
@@ -61,7 +78,8 @@ if(LLVM_MCA AND PYTHON3)
       ${CMAKE_SOURCE_DIR}/examples/spsc_marked.cpp
       ${CMAKE_SOURCE_DIR}/example.profile
       ${CMAKE_SOURCE_DIR}/docs/crossover_data.csv
-      ${CMAKE_SOURCE_DIR}/scripts/plot_crossover.py)
+      ${CMAKE_SOURCE_DIR}/scripts/plot_crossover.py
+      ${LLVM_MCA})
   set_tests_properties(crossover_check PROPERTIES WORKING_DIRECTORY
     ${CMAKE_SOURCE_DIR})
 endif()

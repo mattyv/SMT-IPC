@@ -8,8 +8,9 @@
 # How to obtain each value on your box:
 
 # Core clock the HOT loop actually holds, GHz. Converts mca cycles -> ns. Read
-# the boost clock your pinned hot core sustains (not the invariant TSC rate).
-freq_ghz = 4.0
+# the boost clock your pinned hot core sustains (not the invariant TSC rate) —
+# this box (governor=performance) sustains ~4.98 GHz under sibling load.
+freq_ghz = 4.98
 
 # One-way handoff latency, ns, on an SMT sibling vs a same-CCX core. ONLY THE
 # DIFFERENCE enters the model (the sibling's handoff advantage on the critical
@@ -37,7 +38,7 @@ allowance_ns = 40
 # Calibration scale: maps mca's raw combined-demand C_raw onto a measured
 # busy-sibling multiplier. Run `sibling_analyze --calibrate <your measured
 # hot/idle ratio>` and paste the value it prints. 1.0 means "trust mca as-is".
-calib_scale = 0.81
+calib_scale = 0.820
 
 # The -mcpu model llvm-mca uses. "native" auto-detects the host, BUT LLVM < 19
 # has no znver5 model, so on a Zen 5 box native silently falls back to a

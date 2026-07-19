@@ -207,6 +207,19 @@ struct PipeCfg {
   // rejects genuinely contaminated cells (e.g. cross-CCX low-rounds rows run
   // 0.26-0.67 waited-fraction with sojourn-inflated medians).
   static constexpr double PROC_SWEEP_WAITED_FRACTION_MIN = 0.90;
+
+  // --producer-rounds (both-busy variant, see the file-header "SHAPE OF THE
+  // EXPERIMENT" note): a suggested "genuinely busy" rounds value for the
+  // producer's OWN process_msg_lanes call before publishing, so it becomes a
+  // real port-hungry tenant instead of a polite PAUSE-waiting pacer. 512
+  // matches one of PROC_SWEEP_ROUNDS' own mid-ladder levels (~800ns of
+  // processing per the calibrated-ns table --proc-sweep prints), so producer
+  // and consumer contend on a comparable timescale rather than one dwarfing
+  // the other. This is only a SUGGESTED value surfaced in --help text; the
+  // actual rounds count for a run always comes from the required
+  // --producer-rounds N argument (default N=0, i.e. today's polite-producer
+  // behavior, unchanged).
+  static constexpr int PROC_SWEEP_PRODUCER_ROUNDS_BUSY = 512;
 };
 
 // Per-pass metrics the consumer/producer accumulate. Plain struct, no
@@ -521,8 +534,18 @@ static Topology discover_topology() {
 // the sibling-vs-same-CCX delta this sweep reports (verified: original and
 // fence-removed builds gave statistically indistinguishable per-cell deltas).
 // ===========================================================================
+// `producer_rounds`: the BOTH-BUSY variant (see the file-header "SHAPE OF
+// THE EXPERIMENT" note and PipeCfg::PROC_SWEEP_PRODUCER_ROUNDS_BUSY). 0 (the
+// default) reproduces today's polite-producer behavior exactly — the
+// producer only ever busy-waits via pace_until()/relax<true>(). >0 makes the
+// producer run the SAME port-bound kernel the consumer uses
+// (process_msg_lanes) for that many rounds on each message, right before
+// publishing it: real port-contending work instead of an idle PAUSE spin, so
+// the two threads genuinely victimize each other on a shared core rather
+// than measuring the asymmetric "one busy thread" regime.
 static PassMetrics run_pass(int consumer_cpu, int producer_cpu, uint64_t gap_ns,
-                            int proc_rounds, const std::vector<Msg> &ring) {
+                            int proc_rounds, const std::vector<Msg> &ring,
+                            int producer_rounds = 0) {
   Queue q(PipeCfg::QUEUE_CAPACITY);
   const uint64_t total_msgs = PipeCfg::WARM_MSGS + PipeCfg::SAMPLE_MSGS;
 
@@ -589,6 +612,23 @@ static PassMetrics run_pass(int consumer_cpu, int producer_cpu, uint64_t gap_ns,
 
     Msg msg = ring[n % PipeCfg::SOURCE_RING_ELEMS];
     msg.seq = n;
+
+    // BOTH-BUSY variant (producer_rounds > 0, see run_pass's doc comment):
+    // run the same port-bound kernel the consumer uses, BEFORE publishing,
+    // so the producer genuinely contends for ports right up to the handoff
+    // instead of idly PAUSE-waiting. Deliberately done before pub_tsc is
+    // stamped, so this busy time is NOT counted in the message's own
+    // end-to-end latency — it only changes how busy the shared core is.
+    // g_process_sink is the same elision-guard sink the consumer folds its
+    // own results into (see its declaration): reusing it here is
+    // intentional, not a bug — its only job is to keep the compiler from
+    // proving either side's work is dead, and a single atomic add serves
+    // both.
+    if (producer_rounds > 0) {
+      uint64_t p_sink = process_msg_lanes(msg, uint32_t(producer_rounds));
+      g_process_sink.fetch_add(p_sink, std::memory_order_relaxed);
+    }
+
     msg.pub_tsc = rdtsc_now(); // stamped ONCE, before the first try_emplace
 
     if (n >= PipeCfg::WARM_MSGS && late)
@@ -657,6 +697,76 @@ static double calibrate_proc_level_ns(int consumer_cpu, uint32_t rounds,
 // pure and self-contained enough to unit-test directly from
 // run_self_tests() here. PassMetrics itself is already fully defined above.
 static bool proc_sweep_cell_valid(const PassMetrics &m);
+
+// CLI parsing (WP: --producer-rounds plumbing, both-busy variant). Defined
+// here (ahead of run_self_tests()) rather than alongside main() because
+// parse_cli_args() is pure (no hardware, no exit()) and self-contained
+// enough to unit-test directly below — and a by-value CliArgs return means
+// the struct must be COMPLETE at every call site, so a bare forward
+// declaration (as used elsewhere in this file for hardware-touching
+// functions) won't do here. main() is the only caller that turns
+// a.ok==false into an exit(1); parse_cli_args() itself just reports.
+struct CliArgs {
+  bool test = false;
+  bool proc_sweep = false; // explicit --proc-sweep, or implied (see below)
+  int producer_rounds = 0; // --producer-rounds N; 0 = default polite producer
+  bool ok = true;
+  std::string error;
+};
+
+static const char *const kUsage =
+    "usage: %s [--test | [--proc-sweep] [--producer-rounds N]]\n";
+
+static CliArgs parse_cli_args(int argc, char **argv) {
+  CliArgs a;
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "--test") {
+      a.test = true;
+    } else if (arg == "--proc-sweep") {
+      a.proc_sweep = true;
+    } else if (arg == "--producer-rounds") {
+      if (i + 1 >= argc) {
+        a.ok = false;
+        a.error = "--producer-rounds requires an integer argument";
+        return a;
+      }
+      const char *val = argv[++i];
+      char *endp = nullptr;
+      errno = 0;
+      long v = std::strtol(val, &endp, 10);
+      // Reject both negative values AND anything that won't survive the
+      // int(v) narrowing below (out-of-range strtol, or a value > INT_MAX
+      // that strtol itself parsed cleanly): a silently-truncated N used to
+      // let e.g. --producer-rounds 4294967296 (2^32) narrow to 0 and run the
+      // POLITE sweep instead of erroring — a flag that silently did nothing,
+      // exactly what this parser refactor was meant to prevent.
+      if (endp == val || *endp != '\0' || v < 0 || errno == ERANGE ||
+          v > INT_MAX) {
+        a.ok = false;
+        a.error = std::string(
+                      "--producer-rounds requires a non-negative integer <= ") +
+                  std::to_string(INT_MAX) + ", got '" + val + "'";
+        return a;
+      }
+      a.producer_rounds = int(v);
+    } else {
+      a.ok = false;
+      a.error = "unknown argument: " + arg;
+      return a;
+    }
+  }
+  // No-arg and --proc-sweep are aliases (this binary now runs exactly one
+  // experiment, see the file-scope comment); a bare --producer-rounds N with
+  // neither --test nor --proc-sweep also implies --proc-sweep.
+  if (!a.test && !a.proc_sweep)
+    a.proc_sweep = true;
+  if (a.test && (a.proc_sweep || a.producer_rounds != 0)) {
+    a.ok = false;
+    a.error = "--test cannot be combined with --proc-sweep/--producer-rounds";
+  }
+  return a;
+}
 
 // ===========================================================================
 // WP3/WP4 pure-logic self-tests.
@@ -967,6 +1077,120 @@ static void run_self_tests() {
     exit(1);
   }
 
+  // parse_cli_args (--producer-rounds plumbing, both-busy variant): every
+  // accepted/rejected shape, hardware-free.
+  {
+    auto parse = [](std::vector<const char *> tokens) -> CliArgs {
+      std::vector<char *> argv;
+      argv.reserve(tokens.size());
+      for (const char *t : tokens)
+        argv.push_back(const_cast<char *>(t));
+      return parse_cli_args(int(argv.size()), argv.data());
+    };
+
+    // No args: implies --proc-sweep, producer_rounds default 0.
+    {
+      CliArgs a = parse({"spsc_pipeline"});
+      if (!a.ok || a.test || !a.proc_sweep || a.producer_rounds != 0) {
+        fprintf(stderr,
+                "FAIL parse_cli_args: no-arg default wrong (ok=%d "
+                "test=%d proc_sweep=%d producer_rounds=%d)\n",
+                a.ok, a.test, a.proc_sweep, a.producer_rounds);
+        exit(1);
+      }
+    }
+    // --test alone: test=true, nothing else set.
+    {
+      CliArgs a = parse({"spsc_pipeline", "--test"});
+      if (!a.ok || !a.test || a.proc_sweep || a.producer_rounds != 0) {
+        fprintf(stderr, "FAIL parse_cli_args: --test wrong\n");
+        exit(1);
+      }
+    }
+    // --proc-sweep --producer-rounds 512: both explicit, N parsed.
+    {
+      CliArgs a =
+          parse({"spsc_pipeline", "--proc-sweep", "--producer-rounds", "512"});
+      if (!a.ok || a.test || !a.proc_sweep || a.producer_rounds != 512) {
+        fprintf(stderr,
+                "FAIL parse_cli_args: --proc-sweep "
+                "--producer-rounds 512 wrong (producer_rounds=%d)\n",
+                a.producer_rounds);
+        exit(1);
+      }
+    }
+    // Bare --producer-rounds N (no --proc-sweep) implies --proc-sweep.
+    {
+      CliArgs a = parse({"spsc_pipeline", "--producer-rounds", "128"});
+      if (!a.ok || a.test || !a.proc_sweep || a.producer_rounds != 128) {
+        fprintf(stderr, "FAIL parse_cli_args: bare --producer-rounds must "
+                        "imply --proc-sweep\n");
+        exit(1);
+      }
+    }
+    // --producer-rounds 0 is accepted (explicit polite-producer request).
+    {
+      CliArgs a = parse({"spsc_pipeline", "--producer-rounds", "0"});
+      if (!a.ok || a.producer_rounds != 0) {
+        fprintf(stderr, "FAIL parse_cli_args: --producer-rounds 0 rejected\n");
+        exit(1);
+      }
+    }
+    // Missing value after --producer-rounds -> rejected.
+    if (parse({"spsc_pipeline", "--producer-rounds"}).ok) {
+      fprintf(stderr,
+              "FAIL parse_cli_args: --producer-rounds with no value must be "
+              "rejected\n");
+      exit(1);
+    }
+    // Negative value -> rejected (rounds cannot be negative).
+    if (parse({"spsc_pipeline", "--producer-rounds", "-1"}).ok) {
+      fprintf(stderr,
+              "FAIL parse_cli_args: --producer-rounds -1 must be rejected\n");
+      exit(1);
+    }
+    // Non-numeric value -> rejected.
+    if (parse({"spsc_pipeline", "--producer-rounds", "abc"}).ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --producer-rounds abc must be "
+                      "rejected\n");
+      exit(1);
+    }
+    // Value > INT_MAX -> rejected (Finding 2 regression: 2^32 used to
+    // silently narrow to 0 via int(v) truncation and run the POLITE sweep
+    // instead of erroring).
+    if (parse({"spsc_pipeline", "--producer-rounds", "4294967296"}).ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --producer-rounds 4294967296 "
+                      "(> INT_MAX) must be rejected, not silently "
+                      "truncated\n");
+      exit(1);
+    }
+    // A value that overflows even `long` (strtol sets ERANGE) -> rejected.
+    if (parse(
+            {"spsc_pipeline", "--producer-rounds", "999999999999999999999999"})
+            .ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --producer-rounds overflowing "
+                      "long (ERANGE) must be rejected\n");
+      exit(1);
+    }
+    // --test combined with --proc-sweep -> rejected (mutually exclusive).
+    if (parse({"spsc_pipeline", "--test", "--proc-sweep"}).ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --test + --proc-sweep must be "
+                      "rejected\n");
+      exit(1);
+    }
+    // --test combined with --producer-rounds -> rejected.
+    if (parse({"spsc_pipeline", "--test", "--producer-rounds", "8"}).ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --test + --producer-rounds must "
+                      "be rejected\n");
+      exit(1);
+    }
+    // Unknown flag -> rejected.
+    if (parse({"spsc_pipeline", "--bogus"}).ok) {
+      fprintf(stderr, "FAIL parse_cli_args: unknown flag must be rejected\n");
+      exit(1);
+    }
+  }
+
   printf("all tests passed\n");
 }
 
@@ -1005,16 +1229,16 @@ static bool proc_sweep_cell_valid(const PassMetrics &m) {
          waited_fraction_of(m) >= PipeCfg::PROC_SWEEP_WAITED_FRACTION_MIN;
 }
 
-static ProcSweepCellResult run_proc_sweep_cell(int rounds, double calibrated_ns,
-                                               uint64_t gap_ns,
-                                               int consumer_cpu,
-                                               int producer_cpu,
-                                               const std::vector<Msg> &ring) {
+static ProcSweepCellResult
+run_proc_sweep_cell(int rounds, double calibrated_ns, uint64_t gap_ns,
+                    int consumer_cpu, int producer_cpu,
+                    const std::vector<Msg> &ring, int producer_rounds = 0) {
   // Pause only (see the file-scope "WAIT POLICY" note): a bare spin would
   // port-starve an SMT-sibling producer, and a futex-based block/wake's
   // microsecond-scale round trip would swamp the ns-scale processing-weight
   // signal this sweep is trying to isolate.
-  PassMetrics m = run_pass(consumer_cpu, producer_cpu, gap_ns, rounds, ring);
+  PassMetrics m = run_pass(consumer_cpu, producer_cpu, gap_ns, rounds, ring,
+                           producer_rounds);
   return {rounds, calibrated_ns, gap_ns, std::move(m),
           proc_sweep_cell_valid(m)};
 }
@@ -1034,7 +1258,8 @@ static void print_proc_sweep_cell(const ProcSweepCellResult &r) {
          r.valid ? "" : "  INVALID (wait-path contaminated)");
 }
 
-static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring) {
+static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring,
+                           int producer_rounds = 0) {
   // Fail-fast: both a sibling and a same-CCX peer are required, or the
   // headline question ("where does sibling vs same-CCX cross over?") has
   // nothing to compare and is unanswerable on this box.
@@ -1063,11 +1288,39 @@ static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring) {
   // pacing (PAUSE-waiting through the consumer's processing window costs
   // only ~3%, so crossover ~= 40ns/0.03). This sweep's ladder (see
   // PipeCfg::PROC_SWEEP_ROUNDS) brackets both.
-  printf("prediction: crossover between ~50ns (producer ran HOT: ~81%% "
-         "sibling-contention tax, crossover ~= 40ns/0.81) and ~1.3us "
-         "(producer stays POLITE under this sweep's matched pacing: ~3%% "
-         "tax, crossover ~= 40ns/0.03). See the README (\"Step 4\") for the "
-         "derivation.\n\n");
+  //
+  // This POLITE-producer prediction only holds when producer_rounds == 0
+  // (the default, PAUSE-waiting producer). With producer_rounds > 0
+  // (BOTH-BUSY variant, see below) the producer is a genuine port-hungry
+  // tenant instead, so this banner is stale/wrong for that run (nit fix:
+  // it used to always claim POLITE pacing even under --producer-rounds N) —
+  // print the mutual-contention framing instead.
+  if (producer_rounds > 0)
+    printf("note: BOTH THREADS BUSY (producer_rounds=%d) — the producer "
+           "runs a port-bound kernel on every message instead of "
+           "PAUSE-waiting, so this run is mutual contention between two "
+           "busy tenants, not the POLITE-producer regime the README's "
+           "\"Step 4\" ~50ns/~1.3us crossover prediction assumes; expect "
+           "the sibling's advantage to shrink or invert.\n\n",
+           producer_rounds);
+  else
+    printf("prediction: crossover between ~50ns (producer ran HOT: ~81%% "
+           "sibling-contention tax, crossover ~= 40ns/0.81) and ~1.3us "
+           "(producer stays POLITE under this sweep's matched pacing: ~3%% "
+           "tax, crossover ~= 40ns/0.03). See the README (\"Step 4\") for "
+           "the derivation.\n\n");
+  // BOTH-BUSY variant marker: producer_rounds > 0 means the producer runs
+  // process_msg_lanes(producer_rounds) on every message before publishing
+  // (see run_pass's doc comment) instead of idly PAUSE-waiting — a genuine
+  // port-hungry tenant, so proc_insitu_ratio in the SUMMARY below is
+  // expected to rise well above 1 (mutual contention) and the sibling's
+  // advantage to shrink/invert vs. the default polite-producer sweep.
+  printf(producer_rounds > 0
+             ? "producer-rounds: %d (BOTH-BUSY variant — producer runs the "
+               "port-bound kernel before every publish)\n\n"
+             : "producer-rounds: %d (default — polite, mostly PAUSE-waiting "
+               "producer)\n\n",
+         producer_rounds);
 
   // Calibration: solo, contention-free, on the pinned consumer CPU.
   printf("rounds -> calibrated processing ns (solo, on cpu%d):\n", topo.base);
@@ -1100,9 +1353,9 @@ static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring) {
     std::vector<ProcSweepCellResult> tier_results;
     tier_results.reserve(n_levels);
     for (size_t i = 0; i < n_levels; i++) {
-      ProcSweepCellResult r =
-          run_proc_sweep_cell(PipeCfg::PROC_SWEEP_ROUNDS[i], calibrated[i],
-                              gaps[i], topo.base, tier.producer_cpu, ring);
+      ProcSweepCellResult r = run_proc_sweep_cell(
+          PipeCfg::PROC_SWEEP_ROUNDS[i], calibrated[i], gaps[i], topo.base,
+          tier.producer_cpu, ring, producer_rounds);
       print_proc_sweep_cell(r);
       tier_results.push_back(std::move(r));
     }
@@ -1188,19 +1441,15 @@ static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 2 && std::strcmp(argv[1], "--test") == 0) {
+  CliArgs args = parse_cli_args(argc, argv);
+  if (!args.ok) {
+    fprintf(stderr, "%s\n", args.error.c_str());
+    fprintf(stderr, kUsage, argv[0]);
+    return 1;
+  }
+  if (args.test) {
     run_self_tests();
     return 0;
-  }
-  // No-arg and --proc-sweep are aliases: this binary now runs exactly one
-  // experiment (see the file-scope comment).
-  if (argc == 2 && std::strcmp(argv[1], "--proc-sweep") != 0) {
-    fprintf(stderr, "usage: %s [--test | --proc-sweep]\n", argv[0]);
-    return 1;
-  }
-  if (argc > 2) {
-    fprintf(stderr, "usage: %s [--test | --proc-sweep]\n", argv[0]);
-    return 1;
   }
 
   check_invariant_tsc();
@@ -1213,6 +1462,6 @@ int main(int argc, char **argv) {
 
   auto ring = build_source_ring();
 
-  run_proc_sweep(topo, ring);
+  run_proc_sweep(topo, ring, args.producer_rounds);
   return 0;
 }

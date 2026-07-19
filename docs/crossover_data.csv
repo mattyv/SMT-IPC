@@ -14,8 +14,8 @@
 # CSV's stamp) or plot_crossover.py --check refuses the overlay as a mismatch.
 # machine=zen5
 work_ns,sibling_p50_ns,sameccx_p50_ns
-20,70,120
-120,180,220
+50,70,120
+130,180,230
 451,511,561
-1700,1833,1853
-6900,7093,7033
+1743,1833,1863
+6933,7093,7043

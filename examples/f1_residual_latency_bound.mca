@@ -1,0 +1,45 @@
+[0] Code Region - producer
+
+Iterations:        100
+Instructions:      400
+Total Cycles:      200
+Total uOps:        400
+Dispatch Width:    6
+uOps Per Cycle:    1.95
+IPC:               1.95
+Block RThroughput: 2.0
+
+Resources:
+[0]   - SKXDivider
+[1]   - SKXFPDivider
+[2]   - SKXPort0
+[3]   - SKXPort1
+[4]   - SKXPort2
+[5]   - SKXPort3
+[6]   - SKXPort4
+[7]   - SKXPort5
+[8]   - SKXPort6
+[9]   - SKXPort7
+
+Resource pressure per iteration:
+[0]    [1]    [2]    [3]    [4]    [5]    [6]    [7]    [8]    [9]
+ -      -     1.00    -      -      -      -     1.00    -      -
+
+[1] Code Region - consumer
+
+Iterations:        100
+Instructions:      1900
+Total Cycles:      2405
+Total uOps:        1900
+Dispatch Width:    6
+uOps Per Cycle:    0.79
+IPC:               0.79
+Block RThroughput: 6.0
+
+Resources:
+[0]   - Zn4ALU0
+[1]   - Zn4ALU1
+
+Resource pressure per iteration:
+[0]    [1]
+ -     6.00
