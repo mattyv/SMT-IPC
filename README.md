@@ -62,16 +62,16 @@ sibling stop winning?" only ever has a fuzzy, few-hundred-ns answer, not a crisp
 **A processing consumer is faster on the producer's SMT sibling — but only up to a couple
 of microseconds of work per message. Past that, a separate core in the same CCX wins.** For
 most real pipelines, which do well under a few µs of work per message, the sibling wins —
-*if* you keep everything else off that core. Getting to that sentence takes four steps, each its
-own experiment.
+*if* you keep everything else off that core. Everything below is me poking at that one sentence
+from four angles, one little experiment each.
 
 ## Step 1 — siblings really do give the fastest handoff
 
-`smt_pingpong` measures the raw thing: two pinned threads bounce a cache line back and
-forth (a monotonically increasing sequence number through two 128-byte-isolated flags,
-so a stale value can never satisfy the wait), both hot-spinning, and it times the round
-trip with fenced `rdtsc`. No wakeups, no work — the best-case handoff between two live
-spinners.
+Start with the raw handoff, nothing else. `smt_pingpong` does the simplest possible thing:
+two pinned threads bounce a cache line back and forth (a monotonically increasing sequence
+number through two 128-byte-isolated flags, so a stale value can never satisfy the wait), both
+hot-spinning, timed with fenced `rdtsc`. No wakeups, no work — just the best case, two live
+spinners passing a line.
 
 ```
 INITIATOR (timed)                RESPONDER
@@ -178,12 +178,12 @@ is invisible.
 
 ## Step 4 — but a real partner is polite, so who actually wins?
 
-Steps 2 and 3 make the sibling look dangerous — but they used an *independent* busy tenant.
-In a real pipeline the partner isn't independent: the producer spends most of its time
-*waiting* for the consumer, and a polite `pause`-waiter costs only ~3% (Step 2's middle row),
-not 1.8×. So the worst case rarely fires. Which means the honest question isn't "is the
-sibling risky" — it's **at what amount of consumer work does the sibling's ~40 ns handoff
-edge get eaten by the contention on that work?**
+So far the sibling looks like a trap — but Steps 2 and 3 loaded it with an *independent* hog,
+which is the wrong picture. Your real partner isn't independent: the producer spends most of its
+life *waiting* for the consumer, and a polite `pause`-waiter costs only ~3% (Step 2's middle row),
+not 1.8×. The scary case mostly doesn't fire. So the real question isn't "is the sibling risky,"
+it's **how much consumer work does it take before the sibling's ~40 ns handoff edge gets eaten by
+the contention on that work?**
 
 `spsc_pipeline --proc-sweep` measures it directly: a producer paces messages through a real
 [SPSC queue](https://github.com/rigtorp/SPSCQueue) to a consumer doing a tunable, port-bound
@@ -290,11 +290,11 @@ staying polite and the sign can flip); the exact point (~2–3 µs) is the softe
 
 ## Step 5 — predicting it for *your* threads, without running anything
 
-Steps 1–4 *measure* the crossover — but measuring means building the timing rig and running a
-sweep, on the target hardware, for every workload you're curious about. `sibling_analyze` asks
-the same question **statically**: given your actual producer and consumer loops, can you tell —
-from the compiled instructions, before running anything — whether they'll be faster as SMT
-siblings or on separate cores? It's a linter for thread placement.
+Measuring the crossover (Steps 1–4) is a chore — you build the timing rig and run a sweep on the
+real hardware for every workload you're curious about. So here's the fun shortcut: can you just
+*read* the answer off the compiled loops, before running anything? `sibling_analyze` tries. Given
+your actual producer and consumer loops, it guesses — from the instructions alone — whether they'll
+be faster as SMT siblings or on separate cores. Basically a linter for thread placement.
 
 **You point it at your two hot loops.** Bracket each thread's steady-state loop with a matched
 pair of markers from `sibling_marks.hpp`:
@@ -462,3 +462,9 @@ branch to keep this one focused on the placement result.)*
 - **`mwaitx` was evaluated and dropped:** the consumer waits with `_mm_pause`, not the AMD
   hardware wait-on-address — on this Zen 5 box `mwaitx` woke at ~260 ns p50 vs ~60 ns for a
   plain spin (>4× slower, ~350–480 ns timeout floor), so it isn't viable for a sub-µs handoff.
+
+---
+
+That's the whole rabbit hole. It's niche and I mostly just wanted to know where the sibling
+stops winning — and, honestly, how well a static model could call it before I ran anything. If
+you spot something wrong, I'd genuinely like to hear it.
