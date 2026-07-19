@@ -203,11 +203,25 @@ def run_check(measured, curve, m_machine, meta, tol_ns, rel_tol, force,
     lo, hi = meta.get("wstar_lo"), meta.get("wstar_hi")
     model_has_band = _finite(lo) and _finite(hi)
     bracket = sign_change_bracket(measured)
+    measured_deltas = [d for _, d in measured]
     if bracket is None and not model_has_band:
-        # Perfect agreement: neither side crosses zero in range (sibling always
-        # wins). This is a PASS, not a failure.
-        lines.append("both measured and model predict NO crossover in range "
-                     "(sibling wins throughout): agree")
+        # No sign change on either side. "No crossover" is AMBIGUOUS: it means
+        # "sibling wins throughout" only if the measured deltas are all <= 0.
+        # If they're all >= 0, same-CCX wins throughout — the opposite verdict —
+        # and a model that predicts no crossover (i.e. sibling always wins) then
+        # DISAGREES with the measurement. Check the sign; don't assume sibling.
+        if all(d <= 0 for d in measured_deltas) and any(d < 0 for d in measured_deltas):
+            lines.append("both predict NO crossover; measured deltas all <= 0 "
+                         "(sibling wins throughout): agree")
+        elif all(d >= 0 for d in measured_deltas) and any(d > 0 for d in measured_deltas):
+            lines.append("mismatch: model predicts NO crossover (sibling always "
+                         "wins) but measured deltas are all >= 0 (same-CCX wins "
+                         "throughout) — FAIL")
+            ok = False
+        else:
+            # all deltas exactly 0 within resolution: a tie, not a sibling win.
+            lines.append("measured deltas ~0 across the range (sibling and "
+                         "same-CCX tie): no crossover to validate — treat with care")
     elif bracket is None:
         lines.append("mismatch: measured shows NO crossover but model predicts "
                      f"W* in [{lo:.0f},{hi:.0f}] — FAIL")

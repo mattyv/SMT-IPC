@@ -8,16 +8,19 @@
 > couple of µs), and — measured, and it surprised me — it holds whether *one or both* threads are
 > busy, **as long as they're paced so they never execute at the same instant** (a paced pipeline's
 > consumer waits ~98% of the time, so the two just alternate). The one thing that kills it is
-> genuine **overlap**: an *independent* port-hungry tenant on the sibling (another process, an IRQ)
-> — or your own two threads under saturation, continuously running at once — slows the
-> sibling-placed thread's compute by ~1.8× (Step 2), and the sibling stops being worth it. Keeping
-> the sibling *quiet* — only your cooperating, mostly-waiting partner on it — is the whole trick.
+> genuine **overlap** — the two threads grinding on the shared core at the same instant. That
+> happens when an *independent* port-hungry tenant lands on the sibling (another process, an IRQ) —
+> the full-time, worst case, up to **~1.8×** slower compute (Step 2) — or when your own two threads
+> run hot enough that pacing can no longer keep their work windows apart, a milder **~1.45×** at the
+> partial duty a paced pipeline reaches (measured). Either way the sibling stops being worth it, and
+> it bites at **overlap** — well before the queue ever *saturates*.
+> Keeping the sibling *quiet* — only your cooperating, mostly-waiting partner on it — is the trick.
 >
 > **How to milk it in your design:**
 > 1. **Pin your producer and consumer to the two SMT threads of one physical core** — that buys the shared-L1/L2 handoff.
 > 2. **Keep everything else off that core.** Pinning steers *your* threads only; the kernel still lands IRQs and other work on the sibling. Isolate it (`isolcpus` + `nohz_full` + `irqaffinity`) or offline the neighbours — a quiet sibling *is* the trick.
-> 3. **Don't let them execute at the same instant.** Under matched pacing the two threads alternate, so *both-busy is fine* — the sibling still wins. You only lose it if the load saturates the queue and the two overlap continuously (then Step 2's 1.8× contention kicks in). Pace the feed, or keep one side mostly waiting, so they never grind simultaneously.
-> 4. **Stay under a few µs of work per message.** Past the crossover — or whenever both sides must be busy — step out to a *same-CCX* core instead (~40 ns slower handoff, but immune to on-core contention).
+> 3. **Don't let them execute at the same instant.** Under matched pacing the two threads alternate, so *both-busy is fine below the crossover* — the sibling still wins even when the producer works as hard as the consumer, because the pacer keeps their work windows *disjoint* (measured: the paced both-busy line lands right on polite). You lose it the moment they actually **overlap** — grind at the same instant because the load outpaces the gap — and that hits *well before* the queue saturates (in the overlap measurement the crossover collapses from ~2 µs to below ~0.5 µs, on rungs the tool confirms are queue-free). Pace the feed, or keep one side mostly waiting, so they never grind simultaneously.
+> 4. **Stay under a few µs of work per message.** Past the crossover — or whenever the two must **overlap** (both grinding with no gap to interleave in) — step out to a *same-CCX* core instead (~40 ns slower handoff, but immune to on-core contention).
 > 5. **Check before you commit:** `sibling_analyze` predicts, statically from your compiled loops, whether your two specific threads will collide or fit — no timing rig required.
 
 If one thread hands messages to another — a reader feeding a processor, a market-data
@@ -28,14 +31,19 @@ L1." The folklore is half right, and chasing down the other half is what this re
 is. Three small x86-64 Linux microbenchmarks, run on an AMD Zen 5 box, that build to one
 measured answer:
 
-![Sibling vs same-CCX placement crossover: end-to-end latency difference as consumer work grows. The two measured curves nearly coincide (both cross ~2.5–3 µs): "polite producer" is the producer doing almost nothing per message, "producer works as hard as consumer" has the producer matching the consumer's per-message work at every level of the sweep — yet still fed on a schedule, so the two threads interleave rather than overlap. The dashed line is sibling_analyze's static estimate; its W* band is shaded.](docs/crossover.svg)
+![Sibling vs same-CCX placement crossover: sibling−same-CCX latency as consumer work grows, for three producer regimes. Polite and paced-both-busy track each other and cross zero in a ~2–3.7 µs band (sibling wins below it). The overlapping-both-busy line crosses below ~0.5 µs and shoots off the top (+781 ns at 1.7 µs, then saturates). The dashed line is sibling_analyze's static estimate; its W* band is shaded.](docs/crossover.svg)
 
-*Reading the two solid lines:* the x-axis is a ladder of per-message work from ~20 ns to ~7 µs.
-On the **polite-producer** line the producer just stamps and pushes each message (near-zero work);
-on the **producer-works-as-hard-as-consumer** line the producer does the *same* work as the
-consumer at every point on the ladder — so at the "2 µs" mark, both threads are doing ~2 µs per
-message. Both lines are still *paced* (the producer is released roughly once per message rather
-than blasting them out), which is why even the both-busy case doesn't collide — see Step 4.
+*Reading the three measured lines:* the x-axis is a ladder of per-message work from ~20 ns to
+~7 µs; the y-axis is how much slower the SMT-sibling placement is than a same-CCX core (below zero
+= sibling wins). All three feed the *same* consumer; they differ in what the **producer** does.
+**Polite** (teal): the producer just stamps and pushes each message — near-zero work. **Both busy,
+paced apart** (amber): the producer does the *same* work as the consumer at every rung, but the
+pacer widens the arrival gap to fit both, so their work windows stay *disjoint* — they never run at
+the same instant. It lands right on top of polite (that's the point: pacing recovers the
+polite result even with a busy producer). **Both busy, overlapping** (red): same symmetric work,
+but the gap is sized for the consumer alone, so the producer's work genuinely *overlaps* the
+consumer's — the real "both threads are victims of each other" case. That one crosses below ~0.5 µs
+and rockets up. See Step 4 for the full story.
 
 **A processing consumer is faster on the producer's SMT sibling — but only up to a couple
 of microseconds of work per message. Past that, a separate core in the same CCX wins.** For
@@ -186,21 +194,60 @@ nanoseconds you'd guess from the 1.8× busy-sibling figure. The practical readin
 doing less than a couple of µs of work per message — the common case — is faster on the SMT
 sibling, provided the producer stays polite and nothing else runs on that core.
 
-**Does that survive *both* threads being busy?** `--both-busy` reruns the same ladder but makes
-the producer do the *same* per-message work as the consumer at every level — so at the 2 µs rung
-both threads spend ~2 µs per message, at the 500 ns rung both spend ~500 ns, and so on (a symmetric
-sweep, not a fixed number). This surprised me — the crossover barely moves (~2.5 µs,
-`proc_ratio ≈ 1.0`): the two solid lines in the graph nearly coincide. The reason is **overlap**.
-Matched pacing keeps the queue near-empty (`waited-fraction ≈ 0.98`), so the two threads
-*alternate* — the producer works during the gap while the consumer waits — rather than execute at
-the same instant, and threads that don't overlap don't contend. The real mutual-contention
-penalty (Step 2's 1.8×) needs them to genuinely run *simultaneously*, which happens only under
-**saturation / continuous load** — a throughput regime where the queue is never empty and this
-handoff crossover is no longer the metric. (An earlier version of this experiment did report a
-"collapse to hundreds of ns," but that was a pacing bug — the producer's fixed work didn't fit the
-consumer-sized gap, forcing an artificial overlap. The valid symmetric sweep removes it.) So the
-honest rule: a **paced** pipeline keeps the sibling winning whether one *or both* sides are busy;
-you lose the sibling only when the load is high enough that the two threads overlap continuously.
+**Does that survive *both* threads being busy?** This is the "both threads are victims of each
+other" question, and the answer turns entirely on one thing: **do they actually run at the same
+instant?** Both `--both-busy` variants make the producer do the *same* per-message work as the
+consumer at every rung (a symmetric sweep — at the 2 µs rung both spend ~2 µs, at the 500 ns rung
+both spend ~500 ns). They differ only in the pacing gap, and that difference is the whole story.
+
+**Paced apart (`--both-busy`, the amber line).** The arrival gap is widened to fit *both* threads'
+work (visible in the tool's `gap` column — roughly double the polite gap). That is enough to keep
+the two work windows **disjoint**: the producer works during the gap while the consumer waits, and
+they never execute simultaneously (`waited-fraction ≈ 0.99`, `proc_ratio ≈ 1.0`). Result: the line
+lands right on top of polite — sibling still wins below the ~2–3 µs crossover. This isn't luck, it's
+the schedule: if you space two busy threads so their compute never overlaps, they don't contend,
+full stop. (The amber and teal lines *do* pull apart slightly at the 6.9 µs rung — +170 ns vs
++50 ns — but not because the sibling suffers: its latency there is identical to the polite run to
+within the ~10 ns measurement quantum. The gap comes from the *same-CCX* line getting ~110 ns
+**faster** than its own solo baseline when the neighbouring core is grinding — a CPU-boost/residency
+quirk on the other tier, not a sibling contention tax. Don't read it as "busy producer hurts the
+sibling.")
+
+**Overlapping (`--both-busy-overlap`, the red line).** Same symmetric work, but the gap is sized for
+the consumer *alone*, so the producer's compute genuinely overlaps the consumer's. Now the two
+grind on the same physical core's execution ports at the same instant — and the sibling falls apart:
+the crossover collapses from ~2 µs to **below ~0.5 µs**, and the sibling runs **+781 ns slower** at
+1.7 µs. That +781 is genuine on-core port contention, measured directly: the consumer's own compute
+(`proc-insitu`, timed around just the kernel — no queue wait in the bracket) runs `proc_ratio ≈ 1.45`,
+i.e. ~45 % slower than solo. That's the *same mechanism* as Step 2's busy-sibling tax but at partial
+duty — the producer only occupies the core ~55–65 % of each gap — so it's milder than Step 2's
+**1.8×**, which is what a *full-time* independent tenant costs. (In other words the red line isn't
+even the worst case; a continuously-busy neighbour is worse.) By the 6.9 µs rung the contention
+(~1.54×) exceeds the sweep's 1.5× pacing headroom (`PROC_SWEEP_HEADROOM`), so the queue can no longer
+be kept empty and end-to-end latency becomes queue-drift dominated (tens to hundreds of µs,
+run-dependent) — the tool flags that rung `INVALID` and it's dropped from the graph. That drop is
+*conservative*: with more headroom the rung would be valid and show the sibling ~**+3.7 µs** worse,
+not recovering.
+
+On the rungs that *are* valid (`waited-fraction 0.92–0.99`, so the p50 latency is genuinely
+queue-free), you can see the loss is on-core contention and not queueing. `backpressure` stays 0
+throughout — but that's a weak signal on its own (it only trips when the queue hits its 4096-slot
+cap, which never happens); the real evidence is the clean waited-fraction on the sub-saturation
+rungs. So the honest rule has two halves:
+
+- **Pace them apart** (bounded rate, or one side mostly waiting) and the sibling wins for work under
+  ~2 µs whether one *or both* sides are busy — pacing turns a busy producer back into a polite one.
+- **Let them overlap** (both grinding at a rate the gap can't separate) and the sibling loses *early
+  and hard* — crossover below ~0.5 µs, then a cliff — well before the queue saturates. That's the
+  regime Step 2's on-core contention (up to 1.8× for a full-time tenant) governs.
+
+> **Why the numbers here have moved twice.** First pass: the both-busy line looked *identical* to
+> polite because `--both-busy` had a wiring bug — the flag parsed but the producer workload never
+> reached the sweep, so it silently ran the polite experiment. Second pass (after fixing that): the
+> line was genuinely busy but still ≈ polite, and this section wrongly credited a "momentary overlap
+> tax on the sibling" for the high-end divergence — a fable review showed the sibling's numbers
+> never moved and the paced gap makes overlap *impossible* by construction. Both are now corrected,
+> and `--both-busy-overlap` was added so the real overlap regime is measured rather than argued.
 
 **Scope, so this isn't over-read:** the message source is an in-memory ring, *by design* — a
 real socket's `recv()` is microseconds and would swamp this nanosecond-scale placement signal
@@ -320,6 +367,8 @@ cmake -B build && cmake --build build && ctest --test-dir build   # builds all 4
 ./sibling_noise           # busy-sibling contention (tenant on the SMT sibling)
 ./sibling_noise --same-ccx  # control: tenant on a same-CCX core instead
 ./spsc_pipeline           # the placement × processing-weight crossover (Step 4)
+./spsc_pipeline --both-busy          # producer as busy as consumer, PACED apart (stays ~= polite)
+./spsc_pipeline --both-busy-overlap  # producer as busy as consumer, OVERLAPPING (sibling loses below ~0.5us)
 ./sibling_analyze t.cpp --profile p   # STATIC: predict placement for marked threads (Step 5)
 ./sibling_analyze --calibrate 1.81    # derive calib_scale from a measured busy-sibling ratio
 <tool> --test             # pure-logic self-checks, no timing hardware needed

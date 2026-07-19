@@ -446,6 +446,16 @@ proc_sweep_cells(const std::vector<double> &calibrated_proc_ns,
   return gaps;
 }
 
+// Producer rounds to run at one sweep level. --both-busy makes the producer
+// match the consumer's rounds at THAT level (symmetric sweep); otherwise it's
+// the fixed --producer-rounds N (0 = polite, PAUSE-waiting producer). This is
+// the seam that was missing: without it, --both-busy fell through to the fixed
+// (0) path and silently ran the polite experiment.
+static inline int proc_sweep_producer_rounds(int level_rounds, int fixed_rounds,
+                                             bool both_busy) {
+  return both_busy ? level_rounds : fixed_rounds;
+}
+
 // find_crossover: pure bracket search over (proc_ns, delta_ns) points,
 // SORTED ascending by proc_ns, where delta_ns = sibling_p50 - sameccx_p50 at
 // that processing level. Cases:
@@ -746,13 +756,30 @@ struct CliArgs {
   // default) is harmless to combine with --both-busy since it's
   // indistinguishable from not passing the flag at all.
   bool both_busy = false;
+  // --both-busy-overlap (genuine-overlap both-busy sweep, see the
+  // file-header "SHAPE OF THE EXPERIMENT" note): like --both-busy, the
+  // producer runs process_msg_lanes for the SAME rounds as the consumer's
+  // level at each sweep step (a real port-hungry tenant, not a polite
+  // pacer) — but UNLIKE --both-busy, the pacing gap is sized from the
+  // CONSUMER'S cost alone (the single-argument proc_sweep_cells form), not
+  // the folded-in two-argument form. --both-busy widens the gap to fit both
+  // threads' work, which makes their execution windows disjoint by
+  // construction (see run_proc_sweep's comment on the gap selection) — so it
+  // can never show genuine mutual contention. --both-busy-overlap keeps the
+  // consumer-only gap so the busy producer's work genuinely overlaps the
+  // consumer's window: this is the "both threads are victims of each other"
+  // regime. Mutually exclusive with --both-busy and with an explicit
+  // non-zero --producer-rounds N (all three set producer rounds by
+  // different, conflicting rules); --both-busy-overlap --producer-rounds 0
+  // is harmless/accepted, same carve-out as --both-busy.
+  bool both_busy_overlap = false;
   bool ok = true;
   std::string error;
 };
 
 static const char *const kUsage =
     "usage: %s [--test | [--proc-sweep] [--producer-rounds N] "
-    "[--both-busy]]\n";
+    "[--both-busy | --both-busy-overlap]]\n";
 
 static CliArgs parse_cli_args(int argc, char **argv) {
   CliArgs a;
@@ -764,6 +791,8 @@ static CliArgs parse_cli_args(int argc, char **argv) {
       a.proc_sweep = true;
     } else if (arg == "--both-busy") {
       a.both_busy = true;
+    } else if (arg == "--both-busy-overlap") {
+      a.both_busy_overlap = true;
     } else if (arg == "--producer-rounds") {
       if (i + 1 >= argc) {
         a.ok = false;
@@ -796,28 +825,45 @@ static CliArgs parse_cli_args(int argc, char **argv) {
     }
   }
   // No-arg and --proc-sweep are aliases (this binary now runs exactly one
-  // experiment, see the file-scope comment); a bare --producer-rounds N or
-  // --both-busy with neither --test nor --proc-sweep also implies
-  // --proc-sweep.
+  // experiment, see the file-scope comment); a bare --producer-rounds N,
+  // --both-busy, or --both-busy-overlap with neither --test nor --proc-sweep
+  // also implies --proc-sweep.
   if (!a.test && !a.proc_sweep)
     a.proc_sweep = true;
-  if (a.test && (a.proc_sweep || a.producer_rounds != 0 || a.both_busy)) {
+  if (a.test && (a.proc_sweep || a.producer_rounds != 0 || a.both_busy ||
+                 a.both_busy_overlap)) {
     a.ok = false;
-    a.error = "--test cannot be combined with "
-              "--proc-sweep/--producer-rounds/--both-busy";
+    a.error = "--test cannot be combined with --proc-sweep/--producer-rounds/"
+              "--both-busy/--both-busy-overlap";
     return a;
   }
-  // --both-busy sets producer_rounds PER LEVEL (matching the consumer's
-  // rounds at each sweep step, see run_proc_sweep) — an explicit, non-zero
-  // fixed --producer-rounds N would silently be ignored by that per-level
-  // override, which is exactly the kind of "flag that silently did nothing"
-  // parse_cli_args already refuses to allow elsewhere (see the
-  // --producer-rounds overflow-narrowing comment above).
+  // --both-busy and --both-busy-overlap both set producer_rounds PER LEVEL
+  // (matching the consumer's rounds at each sweep step, see run_proc_sweep)
+  // — an explicit, non-zero fixed --producer-rounds N would silently be
+  // ignored by that per-level override, which is exactly the kind of "flag
+  // that silently did nothing" parse_cli_args already refuses to allow
+  // elsewhere (see the --producer-rounds overflow-narrowing comment above).
   if (a.both_busy && a.producer_rounds != 0) {
     a.ok = false;
     a.error = "--both-busy cannot be combined with an explicit non-zero "
               "--producer-rounds N (--both-busy sets producer rounds "
               "per-level automatically)";
+    return a;
+  }
+  if (a.both_busy_overlap && a.producer_rounds != 0) {
+    a.ok = false;
+    a.error = "--both-busy-overlap cannot be combined with an explicit "
+              "non-zero --producer-rounds N (--both-busy-overlap sets "
+              "producer rounds per-level automatically)";
+    return a;
+  }
+  // --both-busy and --both-busy-overlap set the pacing gap by DIFFERENT,
+  // conflicting rules (two-arg folded-in gap vs. consumer-only gap) — they
+  // cannot both apply to the same run.
+  if (a.both_busy && a.both_busy_overlap) {
+    a.ok = false;
+    a.error = "--both-busy cannot be combined with --both-busy-overlap "
+              "(they select different, conflicting pacing-gap rules)";
     return a;
   }
   return a;
@@ -976,6 +1022,24 @@ static void run_self_tests() {
         exit(1);
       }
       prev2 = g;
+    }
+  }
+
+  // proc_sweep_producer_rounds (--both-busy wiring): the seam whose absence
+  // made --both-busy silently run the polite experiment. both_busy must select
+  // the per-level consumer rounds; otherwise it must pass the fixed N through.
+  {
+    if (proc_sweep_producer_rounds(512, 0, true) != 512 ||
+        proc_sweep_producer_rounds(512, 99, true) != 512) {
+      fprintf(stderr, "FAIL proc_sweep_producer_rounds: both_busy must use "
+                      "the per-level consumer rounds\n");
+      exit(1);
+    }
+    if (proc_sweep_producer_rounds(512, 0, false) != 0 ||
+        proc_sweep_producer_rounds(512, 128, false) != 128) {
+      fprintf(stderr, "FAIL proc_sweep_producer_rounds: polite/fixed path must "
+                      "pass the fixed rounds through\n");
+      exit(1);
     }
   }
 
@@ -1338,6 +1402,69 @@ static void run_self_tests() {
               "FAIL parse_cli_args: --test + --both-busy must be rejected\n");
       exit(1);
     }
+
+    // Bare --both-busy-overlap (no --proc-sweep) implies --proc-sweep, sets
+    // both_busy_overlap, leaves producer_rounds at 0 (per-level override,
+    // not a fixed value).
+    {
+      CliArgs a = parse({"spsc_pipeline", "--both-busy-overlap"});
+      if (!a.ok || a.test || !a.proc_sweep || !a.both_busy_overlap ||
+          a.both_busy || a.producer_rounds != 0) {
+        fprintf(stderr,
+                "FAIL parse_cli_args: bare --both-busy-overlap wrong (ok=%d "
+                "proc_sweep=%d both_busy_overlap=%d producer_rounds=%d)\n",
+                a.ok, a.proc_sweep, a.both_busy_overlap, a.producer_rounds);
+        exit(1);
+      }
+    }
+    // --both-busy-overlap + --both-busy -> rejected (conflicting pacing-gap
+    // rules: two-arg folded-in gap vs. consumer-only gap).
+    if (parse({"spsc_pipeline", "--both-busy-overlap", "--both-busy"}).ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --both-busy-overlap + "
+                      "--both-busy must be rejected\n");
+      exit(1);
+    }
+    // Order shouldn't matter for the same rejection.
+    if (parse({"spsc_pipeline", "--both-busy", "--both-busy-overlap"}).ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --both-busy + "
+                      "--both-busy-overlap (reversed order) must be "
+                      "rejected\n");
+      exit(1);
+    }
+    // --both-busy-overlap + non-zero --producer-rounds -> rejected (both
+    // orders).
+    if (parse({"spsc_pipeline", "--both-busy-overlap", "--producer-rounds",
+               "512"})
+            .ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --both-busy-overlap + non-zero "
+                      "--producer-rounds must be rejected\n");
+      exit(1);
+    }
+    if (parse({"spsc_pipeline", "--producer-rounds", "512",
+               "--both-busy-overlap"})
+            .ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --producer-rounds + "
+                      "--both-busy-overlap (reversed order) must be "
+                      "rejected\n");
+      exit(1);
+    }
+    // --both-busy-overlap --producer-rounds 0: explicit-zero is harmless,
+    // accepted (mirrors the --both-busy carve-out).
+    {
+      CliArgs a = parse(
+          {"spsc_pipeline", "--both-busy-overlap", "--producer-rounds", "0"});
+      if (!a.ok || !a.both_busy_overlap || a.producer_rounds != 0) {
+        fprintf(stderr, "FAIL parse_cli_args: --both-busy-overlap + "
+                        "--producer-rounds 0 should be accepted\n");
+        exit(1);
+      }
+    }
+    // --test combined with --both-busy-overlap -> rejected.
+    if (parse({"spsc_pipeline", "--test", "--both-busy-overlap"}).ok) {
+      fprintf(stderr, "FAIL parse_cli_args: --test + --both-busy-overlap "
+                      "must be rejected\n");
+      exit(1);
+    }
     // Unknown flag -> rejected.
     if (parse({"spsc_pipeline", "--bogus"}).ok) {
       fprintf(stderr, "FAIL parse_cli_args: unknown flag must be rejected\n");
@@ -1413,7 +1540,8 @@ static void print_proc_sweep_cell(const ProcSweepCellResult &r) {
 }
 
 static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring,
-                           int producer_rounds = 0) {
+                           int producer_rounds = 0, bool both_busy = false,
+                           bool both_busy_overlap = false) {
   // Fail-fast: both a sibling and a same-CCX peer are required, or the
   // headline question ("where does sibling vs same-CCX cross over?") has
   // nothing to compare and is unanswerable on this box.
@@ -1443,38 +1571,75 @@ static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring,
   // only ~3%, so crossover ~= 40ns/0.03). This sweep's ladder (see
   // PipeCfg::PROC_SWEEP_ROUNDS) brackets both.
   //
-  // This POLITE-producer prediction only holds when producer_rounds == 0
-  // (the default, PAUSE-waiting producer). With producer_rounds > 0
-  // (BOTH-BUSY variant, see below) the producer is a genuine port-hungry
-  // tenant instead, so this banner is stale/wrong for that run (nit fix:
-  // it used to always claim POLITE pacing even under --producer-rounds N) —
-  // print the mutual-contention framing instead.
-  if (producer_rounds > 0)
-    printf("note: BOTH THREADS BUSY (producer_rounds=%d) — the producer "
-           "runs a port-bound kernel on every message instead of "
-           "PAUSE-waiting, so this run is mutual contention between two "
-           "busy tenants, not the POLITE-producer regime the README's "
-           "\"Step 4\" ~50ns/~1.3us crossover prediction assumes; expect "
-           "the sibling's advantage to shrink or invert.\n\n",
-           producer_rounds);
+  // This POLITE-producer prediction only holds in the polite regime (the
+  // default, PAUSE-waiting producer). Under --both-busy, --both-busy-overlap
+  // (producer matches the consumer's rounds PER LEVEL, either mode), or a
+  // fixed --producer-rounds N, the producer is a genuine port-hungry tenant
+  // instead, so print a busy-mode framing — and the three busy modes are NOT
+  // interchangeable: --both-busy widens the pacing gap to fit both threads'
+  // work (see the gap-selection comment below), which makes their execution
+  // windows DISJOINT by construction — the two threads INTERLEAVE rather
+  // than truly overlap, so it mostly just re-measures the polite prediction
+  // under a symmetric-work relabeling (expect proc_ratio ~= 1.0, delta_ns to
+  // track the polite line). --both-busy-overlap instead sizes the gap from
+  // the consumer's cost ALONE, so the busy producer's work genuinely
+  // overlaps the consumer's window — this is real mutual contention (expect
+  // proc_ratio > 1 and the sibling's advantage to shrink/collapse well
+  // before any queue saturation; backpressure should stay 0). A fixed
+  // --producer-rounds N is unpaced busy-producer contention, distinct from
+  // both symmetric sweeps.
+  const bool busy = both_busy || both_busy_overlap || producer_rounds > 0;
+  if (both_busy)
+    printf("note: BOTH THREADS BUSY, PACED/DISJOINT (--both-busy) — the "
+           "producer matches the consumer's per-level work, but the pacer "
+           "widens the gap to fit both threads' windows, so the two INTERLEAVE "
+           "rather than truly overlap (disjoint execution windows by "
+           "construction); this measures whether symmetric work moves the "
+           "crossover UNDER MATCHED PACING — expect proc_ratio ~= 1.0 and "
+           "delta_ns to track the polite prediction (it mostly doesn't move "
+           "the crossover). Use --both-busy-overlap for genuine mutual "
+           "contention.\n\n");
+  else if (both_busy_overlap)
+    printf("note: BOTH THREADS BUSY, GENUINE OVERLAP (--both-busy-overlap) — "
+           "the producer matches the consumer's per-level work, and the "
+           "pacing gap is sized from the CONSUMER'S cost alone, so the busy "
+           "producer's work genuinely overlaps the consumer's window: this is "
+           "real mutual contention, not the POLITE-producer regime the "
+           "README's \"Step 4\" ~50ns/~1.3us crossover prediction assumes; "
+           "expect proc_ratio > 1 and the sibling's advantage to shrink or "
+           "collapse well before any queue saturation (backpressure should "
+           "stay 0).\n\n");
+  else if (busy)
+    printf(
+        "note: BOTH THREADS BUSY (fixed --producer-rounds) — the producer "
+        "runs a port-bound kernel on every message instead of PAUSE-waiting, "
+        "so this run is mutual contention between two busy tenants, not the "
+        "POLITE-producer regime the README's \"Step 4\" ~50ns/~1.3us "
+        "crossover prediction assumes; expect the sibling's advantage to "
+        "shrink or invert.\n\n");
   else
     printf("prediction: crossover between ~50ns (producer ran HOT: ~81%% "
            "sibling-contention tax, crossover ~= 40ns/0.81) and ~1.3us "
            "(producer stays POLITE under this sweep's matched pacing: ~3%% "
            "tax, crossover ~= 40ns/0.03). See the README (\"Step 4\") for "
            "the derivation.\n\n");
-  // BOTH-BUSY variant marker: producer_rounds > 0 means the producer runs
-  // process_msg_lanes(producer_rounds) on every message before publishing
-  // (see run_pass's doc comment) instead of idly PAUSE-waiting — a genuine
-  // port-hungry tenant, so proc_insitu_ratio in the SUMMARY below is
-  // expected to rise well above 1 (mutual contention) and the sibling's
-  // advantage to shrink/invert vs. the default polite-producer sweep.
-  printf(producer_rounds > 0
-             ? "producer-rounds: %d (BOTH-BUSY variant — producer runs the "
-               "port-bound kernel before every publish)\n\n"
-             : "producer-rounds: %d (default — polite, mostly PAUSE-waiting "
-               "producer)\n\n",
-         producer_rounds);
+  if (both_busy)
+    printf("producer-rounds: per level = consumer rounds (BOTH-BUSY "
+           "paced/disjoint sweep — producer runs the same port-bound kernel "
+           "as the consumer before every publish, gap widened to fit both)"
+           "\n\n");
+  else if (both_busy_overlap)
+    printf("producer-rounds: per level = consumer rounds (BOTH-BUSY-OVERLAP "
+           "sweep — producer runs the same port-bound kernel as the "
+           "consumer before every publish, gap sized from consumer cost "
+           "alone so the two genuinely overlap)\n\n");
+  else
+    printf(producer_rounds > 0
+               ? "producer-rounds: %d (BOTH-BUSY variant — producer runs the "
+                 "port-bound kernel before every publish)\n\n"
+               : "producer-rounds: %d (default — polite, mostly PAUSE-waiting "
+                 "producer)\n\n",
+           producer_rounds);
 
   // Calibration: solo, contention-free, on the pinned consumer CPU.
   printf("rounds -> calibrated processing ns (solo, on cpu%d):\n", topo.base);
@@ -1487,7 +1652,46 @@ static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring,
   }
   printf("\n");
 
-  const std::vector<uint64_t> gaps = proc_sweep_cells(calibrated);
+  // Gap selection, per mode (NOT about preventing backpressure/overrun — the
+  // single-argument gap 1.5*(consumer_ns + 225) never overruns a producer
+  // whose own work is consumer_ns or less, since consumer_ns < 1.5*
+  // (consumer_ns + 225) for every consumer_ns >= 0; that headroom is exactly
+  // why --both-busy-overlap can safely use the single-arg gap on purpose,
+  // below):
+  //   * --both-busy: folds the producer's OWN per-level cost into the gap
+  //     (proc_sweep_cells's two-argument form) so the gap widens to fit BOTH
+  //     threads' work. This keeps the two threads' execution windows
+  //     DISJOINT by construction — producer occupies [d, d+C], consumer
+  //     [d+C+h, d+2C+h], next producer starts at d+3C+225 — preserving the
+  //     matched-pacing/interleaved methodology so this mode measures "does
+  //     symmetric work move the crossover under matched pacing" (it mostly
+  //     doesn't; see the busy-mode banner above).
+  //   * --both-busy-overlap: uses the CONSUMER-ONLY single-argument gap on
+  //     purpose, so the arrival rate stays matched to the consumer alone —
+  //     the busy producer's work then genuinely overlaps the consumer's
+  //     window instead of being interleaved around it, which is exactly the
+  //     "both threads are victims of each other" regime this mode exists to
+  //     measure.
+  //   * polite / fixed --producer-rounds N: consumer-only single-arg gap,
+  //     unchanged.
+  //
+  // --both-busy's two-arg gap uses a PER-LEVEL producer-cost vector, not
+  // `calibrated` directly: proc_sweep_producer_rounds(0, ..., true) returns
+  // 0 rounds at the rounds=0 rung (see run_proc_sweep_cell's `if
+  // (producer_rounds > 0)` guard — the producer does no work there), so
+  // folding calibrated[0] into that rung's gap would fold in a producer cost
+  // the producer never actually pays. producer_cost_ns[i] is calibrated[i]
+  // only where the producer genuinely runs at level i.
+  std::vector<double> producer_cost_ns;
+  if (both_busy) {
+    producer_cost_ns.reserve(n_levels);
+    for (size_t i = 0; i < n_levels; i++)
+      producer_cost_ns.push_back(
+          PipeCfg::PROC_SWEEP_ROUNDS[i] > 0 ? calibrated[i] : 0.0);
+  }
+  const std::vector<uint64_t> gaps =
+      both_busy ? proc_sweep_cells(calibrated, producer_cost_ns)
+                : proc_sweep_cells(calibrated);
 
   struct TierRun {
     const char *label;
@@ -1507,9 +1711,16 @@ static void run_proc_sweep(const Topology &topo, const std::vector<Msg> &ring,
     std::vector<ProcSweepCellResult> tier_results;
     tier_results.reserve(n_levels);
     for (size_t i = 0; i < n_levels; i++) {
+      // Per-level producer rounds = consumer rounds when EITHER symmetric
+      // busy mode is active (--both-busy or --both-busy-overlap); the two
+      // modes differ only in the pacing-gap rule built above, not in how
+      // much work the producer does per level.
       ProcSweepCellResult r = run_proc_sweep_cell(
           PipeCfg::PROC_SWEEP_ROUNDS[i], calibrated[i], gaps[i], topo.base,
-          tier.producer_cpu, ring, producer_rounds);
+          tier.producer_cpu, ring,
+          proc_sweep_producer_rounds(PipeCfg::PROC_SWEEP_ROUNDS[i],
+                                     producer_rounds,
+                                     both_busy || both_busy_overlap));
       print_proc_sweep_cell(r);
       tier_results.push_back(std::move(r));
     }
@@ -1616,6 +1827,7 @@ int main(int argc, char **argv) {
 
   auto ring = build_source_ring();
 
-  run_proc_sweep(topo, ring, args.producer_rounds);
+  run_proc_sweep(topo, ring, args.producer_rounds, args.both_busy,
+                 args.both_busy_overlap);
   return 0;
 }

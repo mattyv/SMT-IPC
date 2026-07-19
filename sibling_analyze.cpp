@@ -816,8 +816,15 @@ static Profile load_profile(const std::string &path) {
     if (line.empty() || line[0] == '#')
       continue;
     auto eq = line.find('=');
-    if (eq == std::string::npos)
+    if (eq == std::string::npos) {
+      // A non-empty, non-comment line with no '=' is malformed (e.g. a missed
+      // separator, `presence_tax 0.03`) — same typo class as an unknown key, so
+      // warn rather than silently skip.
+      fprintf(stderr,
+              "warning: profile '%s': ignoring malformed line (no '='): '%s'\n",
+              path.c_str(), line.c_str());
       continue;
+    }
     std::string k = trim(line.substr(0, eq));
     double v = std::atof(trim(line.substr(eq + 1)).c_str());
     if (k == "freq_ghz")
@@ -838,6 +845,15 @@ static Profile load_profile(const std::string &path) {
       p.mca_mcpu = trim(line.substr(eq + 1));
     else if (k == "machine")
       p.machine = trim(line.substr(eq + 1));
+    else
+      // An unrecognized key is almost always a typo (e.g. `presence_taax`),
+      // which would otherwise silently retain the DEFAULT for the real key and
+      // emit a confident-but-wrong budget. Surface it loudly instead of
+      // dropping it on the floor.
+      fprintf(stderr,
+              "warning: profile '%s': ignoring unrecognized key '%s' "
+              "(typo? — the intended field keeps its default value)\n",
+              path.c_str(), k.c_str());
   }
   return p;
 }

@@ -8,6 +8,18 @@ build:
   script:
     - g++ -O3 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
     - g++ -O3 -std=c++23 -pthread sibling_noise.cpp -o sibling_noise
+    # spsc_pipeline carries the headline placement-vs-processing conclusion and
+    # its own pure-logic --test suite (including the --both-busy wiring). It was
+    # omitted here before, which is how a no-op --both-busy shipped past review.
+    # rigtorp/SPSCQueue is header-only and normally FetchContent'd by CMake;
+    # this plain-g++ job clones it at the SAME pinned commit spsc_pipeline.cpp
+    # documents, so the header can't drift under us either.
+    # rm -rf first: on a reused shell-executor workspace /tmp/spscqueue can
+    # already exist from a prior job, which makes a plain `git clone` fail.
+    - rm -rf /tmp/spscqueue
+    - git clone https://github.com/rigtorp/SPSCQueue.git /tmp/spscqueue
+    - git -C /tmp/spscqueue checkout 565a5149d54930463d58cb0f69b978d439555e66
+    - g++ -O3 -std=c++23 -pthread -I /tmp/spscqueue/include spsc_pipeline.cpp -o spsc_pipeline
     # sibling_analyze --test is pure-logic (no llvm-mca needed), so it runs in
     # this plain gcc image; the compile/mca driver path is exercised separately
     # on a box that has llvm-mca.
@@ -15,3 +27,4 @@ build:
     - ./smt_pingpong --test
     - ./sibling_noise --test
     - ./sibling_analyze --test
+    - ./spsc_pipeline --test
