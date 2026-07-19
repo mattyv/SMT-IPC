@@ -32,8 +32,15 @@ presence_tax = 0.03
 pacing_headroom = 1.5
 
 # Fixed per-message overhead outside the swept processing work (queue pop +
-# handoff detection), ns. Keeps duty(W) finite as W -> 0.
+# handoff detection), ns. Keeps duty(W) finite as W -> 0. Only the PACED
+# regime's duty(W) uses this one.
 allowance_ns = 40
+
+# Fixed ns folded into spsc_pipeline --both-busy-overlap's consumer-only
+# pacing gap (its PROC_SWEEP_HANDOFF_ALLOWANCE_NS constant — see
+# spsc_pipeline.cpp's PipeCfg). Only the OVERLAP regime's duty_overlap(W)
+# uses this one; it is NOT the same knob as allowance_ns above.
+gap_allowance_ns = 150
 
 # Calibration scale: maps mca's raw combined-demand C_raw onto a measured
 # busy-sibling multiplier. Run `sibling_analyze --calibrate <your measured

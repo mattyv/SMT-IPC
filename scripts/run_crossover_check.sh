@@ -15,15 +15,33 @@
 #      point in this repo's example, so (1) alone would pass even with a
 #      garbage parser.
 #
+# WHEN <measured_overlap.csv> is non-empty, also generates the OVERLAP-regime
+# model curve via --emit-model-overlap and passes it + <measured_overlap.csv>
+# to plot_crossover.py --check's optional second pass (--model-overlap /
+# --measured-overlap), which validates duty_overlap()'s W* band against the
+# measured overlap sign-change bracket with a much looser tolerance
+# (OVERLAP_REL_TOL in plot_crossover.py) — that regime only claims
+# order-of-magnitude/shape agreement, not a tight fit (see README). This was
+# hand-verified as a NEGATIVE control during development: feeding
+# plot_crossover.py a copy of docs/crossover_model_overlap.csv with every
+# w_ns value (and the wstar_lo/mid/hi header stamps) scaled ×4 produces a W*
+# band of [1496,1856] ns against the real measured bracket [130,451] ns —
+# DISJOINT, correctly FAILs. The real, unshifted CSV pair PASSes. That
+# shifted CSV was throwaway (not committed); rerun the same ×4 scaling
+# locally if you need to re-verify this check has teeth.
+#
 # IMPORTANT: this is only meaningful when the measured CSV was produced on the
 # SAME machine as this run (sibling_analyze's llvm-mca model is uarch-specific).
 # docs/crossover_data.csv ships this repo's Zen 5 numbers; regenerate it from
 # spsc_pipeline --proc-sweep on your box before trusting a pass elsewhere.
 #
-# args: <sibling_analyze> <example.cpp> <profile> <measured.csv> <plot.py> <mca_bin> [tol_ns]
+# args: <sibling_analyze> <example.cpp> <profile> <measured.csv> <plot.py> \
+#       <mca_bin> [tol_ns] [measured_overlap.csv]
 set -e
 SA="$1"; SRC="$2"; PROF="$3"; CSV="$4"; PLOT="$5"; MCA_BIN="$6"; TOL="${7:-130}"
+CSV_OVERLAP="${8:-}"
 MODEL="$(mktemp)"
+MODEL_OVERLAP="$(mktemp)"
 SELF_JSON="$(mktemp)"
 STDERR_LOG="$(mktemp)"
 # Build the --mca-bin flag as its own argv WORDS (via `set --`), not a single
@@ -45,11 +63,15 @@ fi
 # tell you the mca vector is untrustworthy. Capture to a file so it can still
 # be printed cleanly (not interleaved mid-write with the model CSV going to
 # stdout), and always show it on failure.
+cleanup() {
+  rm -f "$MODEL" "$MODEL_OVERLAP" "$SELF_JSON" "$STDERR_LOG"
+}
+
 if ! "$SA" "$SRC" --profile "$PROF" "$@" --emit-model \
     >"$MODEL" 2>"$STDERR_LOG"; then
   echo "sibling_analyze --emit-model failed; stderr:" >&2
   cat "$STDERR_LOG" >&2
-  rm -f "$MODEL" "$SELF_JSON" "$STDERR_LOG"
+  cleanup
   exit 1
 fi
 cat "$STDERR_LOG" >&2
@@ -62,12 +84,35 @@ if ! "$SA" "$SRC" --profile "$PROF" "$@" --producer consumer \
     --consumer consumer --json >"$SELF_JSON" 2>"$STDERR_LOG"; then
   echo "sibling_analyze self-overlay (--json) failed; stderr:" >&2
   cat "$STDERR_LOG" >&2
-  rm -f "$MODEL" "$SELF_JSON" "$STDERR_LOG"
+  cleanup
   exit 1
 fi
 cat "$STDERR_LOG" >&2
+
+# Optional overlap-regime pass (see module header): only run when a measured
+# overlap CSV was given.
+OVERLAP_FLAGS=""
+if [ -n "$CSV_OVERLAP" ]; then
+  if ! "$SA" "$SRC" --profile "$PROF" "$@" --emit-model-overlap \
+      >"$MODEL_OVERLAP" 2>"$STDERR_LOG"; then
+    echo "sibling_analyze --emit-model-overlap failed; stderr:" >&2
+    cat "$STDERR_LOG" >&2
+    cleanup
+    exit 1
+  fi
+  cat "$STDERR_LOG" >&2
+  OVERLAP_FLAGS="--model-overlap $MODEL_OVERLAP --measured-overlap $CSV_OVERLAP"
+fi
 rm -f "$STDERR_LOG"
 
+# Disable -e around the check itself: a FAIL is a normal, expected exit code
+# from plot_crossover.py (not a script-level error), and cleanup must still
+# run either way. shellcheck disable=SC2086 (OVERLAP_FLAGS is intentionally
+# word-split: 0 or 2 tokens, both fixed by this script, never user input).
+set +e
 python3 "$PLOT" --measured "$CSV" --model "$MODEL" --check --tol "$TOL" \
-  --self-overlay-json "$SELF_JSON"
-rm -f "$MODEL" "$SELF_JSON"
+  --self-overlay-json "$SELF_JSON" $OVERLAP_FLAGS
+STATUS=$?
+set -e
+cleanup
+exit $STATUS

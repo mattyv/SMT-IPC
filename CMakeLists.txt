@@ -58,6 +58,17 @@ add_test(NAME sibling_analyze_f1_residual_probe
     ${CMAKE_SOURCE_DIR}/examples/f1_residual_latency_bound.mca
     ${CMAKE_SOURCE_DIR}/examples/f1_residual_latency_bound.profile)
 
+# --emit-model-overlap CLI-parse regression probe (WP3 of the overlap-regime
+# plan): flag recognition + --emit-model/--emit-model-overlap mutual
+# exclusion live in main()'s argv loop, which --test's pure SECTION 6 never
+# reaches. See scripts/check_emit_model_overlap_cli.sh for the full
+# rationale; needs only sh/grep and a canned --mca-file dump, no llvm-mca.
+add_test(NAME sibling_analyze_emit_model_overlap_cli_probe
+  COMMAND sh ${CMAKE_SOURCE_DIR}/scripts/check_emit_model_overlap_cli.sh
+    $<TARGET_FILE:sibling_analyze>
+    ${CMAKE_SOURCE_DIR}/examples/f1_residual_latency_bound.mca
+    ${CMAKE_SOURCE_DIR}/examples/f1_residual_latency_bound.profile)
+
 # Optional: end-to-end crossover check (static model vs measured curve). Needs
 # llvm-mca (the analysis engine) and python3, so it is registered ONLY when both
 # are present — the plain gcc CI image skips it and runs just the pure --test
@@ -79,7 +90,12 @@ if(LLVM_MCA AND PYTHON3)
       ${CMAKE_SOURCE_DIR}/example.profile
       ${CMAKE_SOURCE_DIR}/docs/crossover_data.csv
       ${CMAKE_SOURCE_DIR}/scripts/plot_crossover.py
-      ${LLVM_MCA})
+      ${LLVM_MCA}
+      130 # tol_ns — same default the script itself uses when this arg is
+          # omitted; spelled out explicitly here since the trailing
+          # measured_overlap.csv positional arg (WP6) can't be passed
+          # without also filling this one in.
+      ${CMAKE_SOURCE_DIR}/docs/crossover_data_overlap.csv)
   set_tests_properties(crossover_check PROPERTIES WORKING_DIRECTORY
     ${CMAKE_SOURCE_DIR})
 endif()

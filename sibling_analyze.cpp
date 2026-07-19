@@ -124,6 +124,14 @@ struct Profile {
   // means "trust mca as-is"; --calibrate refines it against a measured busy-
   // sibling number for a known pair.
   double calib_scale = 1.0;
+  // Fixed ns folded into spsc_pipeline's consumer-only pacing gap (its
+  // PROC_SWEEP_HANDOFF_ALLOWANCE_NS): message period there is
+  // headroom*(work + gap_allowance_ns). Sizes the period the OVERLAP-regime
+  // duty model (duty_overlap(), Section 3) reconstructs from H, W, and this
+  // constant alone — that regime's producer has no fixed t_prod input, unlike
+  // the paced regime. NOT the same as allowance_ns below (40 — the paced
+  // duty's pop+detect floor, a different pacing regime); do not merge the two.
+  double gap_allowance_ns = 150.0;
   // The -mcpu model llvm-mca should use. "native" asks LLVM to detect the host,
   // but LLVM < 19 has no znver5 model, so on a Zen 5 box native silently falls
   // back to a generic/znver4 model; set this to a known-good model explicitly
@@ -148,6 +156,8 @@ static std::string validate_profile(const Profile &p) {
     return "allowance_ns must be >= 0";
   if (p.presence_tax < 0)
     return "presence_tax must be >= 0";
+  if (p.gap_allowance_ns < 0)
+    return "gap_allowance_ns must be >= 0";
   if (p.Dh() < 0)
     return "handoff_sameccx_ns < handoff_sibling_ns (Dh negative) — the "
            "sibling "
@@ -397,6 +407,18 @@ static Overlay overlay(const RegionProfile &producer,
 // SECTION 3 — duty(W) and the W* crossover (pure).
 // ===========================================================================
 
+// Which pacing regime g_of()/solve_wstar()/solve_budget() model:
+//   paced   — matched pacing (duty_of() below): producer politely waits for
+//             an absolute deadline sized to fit the CONTENDED consumer work;
+//             the two windows are disjoint by construction.
+//   overlap — spsc_pipeline --both-busy-overlap's CONSUMER-ONLY pacing gap:
+//             producer and consumer work windows genuinely overlap in time
+//             (duty_overlap() below). Producer work == consumer work == W by
+//             construction here, unlike paced's independent t_prod.
+// Threaded through as a defaulted trailing argument so every existing paced
+// call site compiles (and behaves) unchanged.
+enum class Regime { paced, overlap };
+
 // Producer busy-time per MESSAGE, ns: cycles-per-block * blocks-per-message,
 // converted to ns. blocks_per_msg comes from --producer-iters-per-msg (default
 // 1): one marked block need not be one message (mca's "iteration" is one repeat
@@ -431,10 +453,43 @@ static double duty_of(double W_ns, const Profile &prof, double C,
   return duty;
 }
 
+// duty_ov(W): first-order deadline-geometry closed form for the OVERLAP
+// regime. Producer paces to an absolute deadline every period
+// H*(W+gap_allowance_ns) (spsc_pipeline's consumer-only pacing gap), then
+// runs work W; the consumer starts one sibling-handoff after publish and
+// also runs W (symmetric by construction — this regime has no independent
+// t_prod). Within one period the busy spans overlap by
+//   L(W) = (2W + h_sib) - H*(W + A_gap)
+// so duty_ov(W) = clamp(L(W)/W, 0, 1) = clamp((2-H) + (h_sib-H*A_gap)/W, 0,1).
+// H = pacing_headroom, A_gap = gap_allowance_ns, h_sib = handoff_sibling_ns.
+// The `2` is the producer+consumer symmetric-window count (an identity
+// constant from the derivation, not a tunable — see the module header §1).
+// No fitting: H, A_gap, h_sib are all fixed independently of the overlap
+// data this formula is validated against (see README's calibration caveat).
+static double duty_overlap(double W_ns, const Profile &prof) {
+  // No producer window exists at or below zero work; guard the division so a
+  // future caller passing W<=0 can't get a NaN (0/0 when h_sib == H*A_gap) or
+  // an unclamped inf. All current callers pass W>=1 (solve_wstar lo, emit sweep
+  // from 10ns), so this is defensive, not reachable today.
+  if (W_ns <= 0.0)
+    return 0.0;
+  double H = prof.pacing_headroom;
+  double duty =
+      (2.0 - H) + (prof.handoff_sibling_ns - H * prof.gap_allowance_ns) / W_ns;
+  if (duty < 0.0)
+    duty = 0.0;
+  if (duty > 1.0)
+    duty = 1.0;
+  return duty;
+}
+
 // g(W) = W*(eps + duty(W)*(C-1)) - Dh. Sibling wins where g<0; W* is g==0.
-static double g_of(double W_ns, const Profile &prof, double C,
-                   double t_prod_ns) {
-  double duty = duty_of(W_ns, prof, C, t_prod_ns);
+// `regime` selects which duty(W) closed form applies; t_prod_ns is ignored
+// in the overlap regime (duty_overlap takes no producer-busy input).
+static double g_of(double W_ns, const Profile &prof, double C, double t_prod_ns,
+                   Regime regime = Regime::paced) {
+  double duty = (regime == Regime::overlap) ? duty_overlap(W_ns, prof)
+                                            : duty_of(W_ns, prof, C, t_prod_ns);
   return W_ns * (prof.presence_tax + duty * (C - 1.0)) - prof.Dh();
 }
 
@@ -443,16 +498,17 @@ static double g_of(double W_ns, const Profile &prof, double C,
 // duty term that saturates, there may be no crossover at all.
 static std::optional<double> solve_wstar(const Profile &prof, double C,
                                          double t_prod_ns, double lo = 1.0,
-                                         double hi = 1.0e6) {
-  double glo = g_of(lo, prof, C, t_prod_ns);
-  double ghi = g_of(hi, prof, C, t_prod_ns);
+                                         double hi = 1.0e6,
+                                         Regime regime = Regime::paced) {
+  double glo = g_of(lo, prof, C, t_prod_ns, regime);
+  double ghi = g_of(hi, prof, C, t_prod_ns, regime);
   if (glo > 0)
     return lo; // even trivial work already past budget (large eps/C)
   if (ghi < 0)
     return std::nullopt; // sibling wins across the whole range
   for (int it = 0; it < 100; it++) {
     double mid = 0.5 * (lo + hi);
-    double gm = g_of(mid, prof, C, t_prod_ns);
+    double gm = g_of(mid, prof, C, t_prod_ns, regime);
     if (gm < 0)
       lo = mid;
     else
@@ -487,20 +543,20 @@ struct Budget {
   double C = 1.0;
 };
 static Budget solve_budget(const Profile &prof, const Overlay &o,
-                           double t_prod_ns) {
+                           double t_prod_ns, Regime regime = Regime::paced) {
   Budget b;
   b.C = o.c;
-  b.mid = solve_wstar(prof, o.c, t_prod_ns);
+  b.mid = solve_wstar(prof, o.c, t_prod_ns, 1.0, 1.0e6, regime);
   // Low budget (sibling looks worse): stronger contention, bigger presence tax.
   Profile pw = prof;
   pw.presence_tax = prof.presence_tax * BudgetBandCfg::kLoPresenceTaxMul;
   double c_hi = 1.0 + BudgetBandCfg::kLoCExcessMul * (o.c - 1.0);
-  b.lo = solve_wstar(pw, c_hi, t_prod_ns);
+  b.lo = solve_wstar(pw, c_hi, t_prod_ns, 1.0, 1.0e6, regime);
   // High budget (sibling looks better): weaker contention, smaller tax.
   Profile pb = prof;
   pb.presence_tax = prof.presence_tax * BudgetBandCfg::kHiPresenceTaxMul;
   double c_lo = 1.0 + BudgetBandCfg::kHiCExcessMul * (o.c - 1.0);
-  b.hi = solve_wstar(pb, c_lo, t_prod_ns);
+  b.hi = solve_wstar(pb, c_lo, t_prod_ns, 1.0, 1.0e6, regime);
   return b;
 }
 
@@ -800,17 +856,15 @@ static double marked_function_perturbation(const std::string &asm_on,
                             mnemonic_histogram(off_marked));
 }
 
-// Load a key=value profile file over the defaults.
-static Profile load_profile(const std::string &path) {
+// Parse key=value profile TEXT (pure — no file I/O, so --test can exercise
+// it directly without touching the filesystem). Malformed lines (no '=') and
+// unrecognized keys are reported via `warnings` rather than fprintf'd
+// directly, so the caller decides how to surface them (load_profile below
+// prepends the path; a test can just inspect the list).
+static Profile parse_profile_text(const std::string &text,
+                                  std::vector<std::string> &warnings) {
   Profile p;
-  std::ifstream f(path);
-  if (!f) {
-    fprintf(stderr,
-            "warning: profile '%s' not readable — using placeholder "
-            "defaults (NOT your machine).\n",
-            path.c_str());
-    return p;
-  }
+  std::istringstream f(text);
   for (std::string line; std::getline(f, line);) {
     line = trim(line);
     if (line.empty() || line[0] == '#')
@@ -820,9 +874,7 @@ static Profile load_profile(const std::string &path) {
       // A non-empty, non-comment line with no '=' is malformed (e.g. a missed
       // separator, `presence_tax 0.03`) — same typo class as an unknown key, so
       // warn rather than silently skip.
-      fprintf(stderr,
-              "warning: profile '%s': ignoring malformed line (no '='): '%s'\n",
-              path.c_str(), line.c_str());
+      warnings.push_back("ignoring malformed line (no '='): '" + line + "'");
       continue;
     }
     std::string k = trim(line.substr(0, eq));
@@ -839,6 +891,8 @@ static Profile load_profile(const std::string &path) {
       p.pacing_headroom = v;
     else if (k == "allowance_ns")
       p.allowance_ns = v;
+    else if (k == "gap_allowance_ns")
+      p.gap_allowance_ns = v;
     else if (k == "calib_scale")
       p.calib_scale = v;
     else if (k == "mca_mcpu")
@@ -850,11 +904,30 @@ static Profile load_profile(const std::string &path) {
       // which would otherwise silently retain the DEFAULT for the real key and
       // emit a confident-but-wrong budget. Surface it loudly instead of
       // dropping it on the floor.
-      fprintf(stderr,
-              "warning: profile '%s': ignoring unrecognized key '%s' "
-              "(typo? — the intended field keeps its default value)\n",
-              path.c_str(), k.c_str());
+      warnings.push_back("ignoring unrecognized key '" + k +
+                         "' (typo? — the intended field keeps its default "
+                         "value)");
   }
+  return p;
+}
+
+// Load a key=value profile file over the defaults; wraps parse_profile_text
+// with the file I/O and the path-prefixed stderr warnings.
+static Profile load_profile(const std::string &path) {
+  std::ifstream f(path);
+  if (!f) {
+    fprintf(stderr,
+            "warning: profile '%s' not readable — using placeholder "
+            "defaults (NOT your machine).\n",
+            path.c_str());
+    return Profile();
+  }
+  std::stringstream ss;
+  ss << f.rdbuf();
+  std::vector<std::string> warnings;
+  Profile p = parse_profile_text(ss.str(), warnings);
+  for (auto &w : warnings)
+    fprintf(stderr, "warning: profile '%s': %s\n", path.c_str(), w.c_str());
   return p;
 }
 
@@ -1171,8 +1244,16 @@ static void print_json(const RegionProfile &prod, const RegionProfile &cons,
 // the picture can never drift from the tool's own math. Header comment lines
 // carry C, the W* band, and Dh so the plotter can render the band + zero line
 // without re-deriving anything.
+// `regime` defaults to Regime::paced so the original call site's output is
+// byte-identical to before this parameter existed (WP2's regression guard:
+// regenerating --emit-model must reproduce the committed
+// docs/crossover_model.csv exactly). The overlap regime additionally stamps
+// "# regime=overlap" and gap_allowance_ns instead of producer_ns (t_prod is
+// not a meaningful input there — duty_overlap() takes no producer-busy
+// argument, see its comment above).
 static void emit_model(const RegionProfile &prod, const Profile &prof,
-                       const Overlay &o, const Budget &b, const Iters &it) {
+                       const Overlay &o, const Budget &b, const Iters &it,
+                       Regime regime = Regime::paced) {
   double t_prod = producer_busy_ns(prod, prof, it.prod);
   // "none" (not "nan"): Python's float("nan") parses successfully, so a "nan"
   // sentinel would silently pass an isinstance(float) guard and poison the
@@ -1184,10 +1265,18 @@ static void emit_model(const RegionProfile &prod, const Profile &prof,
   printf("# machine=%s mca_mcpu=%s\n",
          prof.machine.empty() ? "unspecified" : prof.machine.c_str(),
          prof.mca_mcpu.c_str());
-  printf("# C=%.4f calib_scale=%.4f dh_ns=%.2f presence_tax=%.4f "
-         "producer_ns=%.2f freq_ghz=%.3f\n",
-         o.c, prof.calib_scale, prof.Dh(), prof.presence_tax, t_prod,
-         prof.freq_ghz);
+  if (regime == Regime::overlap) {
+    printf("# regime=overlap\n");
+    printf("# C=%.4f calib_scale=%.4f dh_ns=%.2f presence_tax=%.4f "
+           "gap_allowance_ns=%.2f freq_ghz=%.3f\n",
+           o.c, prof.calib_scale, prof.Dh(), prof.presence_tax,
+           prof.gap_allowance_ns, prof.freq_ghz);
+  } else {
+    printf("# C=%.4f calib_scale=%.4f dh_ns=%.2f presence_tax=%.4f "
+           "producer_ns=%.2f freq_ghz=%.3f\n",
+           o.c, prof.calib_scale, prof.Dh(), prof.presence_tax, t_prod,
+           prof.freq_ghz);
+  }
   printf("# wstar_mid=%s wstar_lo=%s wstar_hi=%s\n", opt(b.mid).c_str(),
          opt(b.lo).c_str(), opt(b.hi).c_str());
   printf("w_ns,delta_ns\n");
@@ -1197,7 +1286,7 @@ static void emit_model(const RegionProfile &prod, const Profile &prof,
   for (int i = 0; i < N; i++) {
     double f = (double)i / (N - 1);
     double W = loW * std::pow(hiW / loW, f);
-    printf("%.3f,%.4f\n", W, g_of(W, prof, o.c, t_prod));
+    printf("%.3f,%.4f\n", W, g_of(W, prof, o.c, t_prod, regime));
   }
 }
 
@@ -1615,6 +1704,105 @@ Resource pressure per iteration:
           "duty in [0,1] at C=3");
   }
 
+  // parse_profile_text (WP1): gap_allowance_ns populates; unknown keys still
+  // warn; negative values still validate-reject downstream.
+  {
+    std::vector<std::string> warnings;
+    Profile p = parse_profile_text("gap_allowance_ns = 150\n", warnings);
+    check(std::fabs(p.gap_allowance_ns - 150.0) < 1e-9,
+          "gap_allowance_ns populates from profile text");
+    check(warnings.empty(), "recognized key produces no warning");
+
+    std::vector<std::string> w2;
+    Profile p2 = parse_profile_text("gap_alowance_ns = 999\n", w2);
+    check(std::fabs(p2.gap_allowance_ns - Profile().gap_allowance_ns) < 1e-9,
+          "typo'd key keeps the default, does not silently apply");
+    check(!w2.empty(), "unrecognized key still warns");
+
+    std::vector<std::string> w3;
+    Profile p3 = parse_profile_text("gap_allowance_ns = -5\n", w3);
+    check(p3.gap_allowance_ns < 0, "negative value parses through (rejected "
+                                   "by validate_profile, not the parser)");
+    check(!validate_profile(p3).empty(),
+          "negative gap_allowance_ns rejected by validate_profile");
+  }
+
+  // duty_overlap (WP2): flat -Dh-ish region below turn-on.
+  {
+    Profile prof; // defaults: H=1.5, A_gap=150, h_sib=50 -> turn-on at W=350
+    check(duty_overlap(50.0, prof) == 0.0,
+          "duty_ov==0 at W=50 (below turn-on)");
+    check(duty_overlap(130.0, prof) == 0.0,
+          "duty_ov==0 at W=130 (below turn-on)");
+  }
+
+  // duty_overlap: turn-on boundary sits exactly at the analytic root.
+  {
+    Profile prof;
+    double H = prof.pacing_headroom;
+    double turn_on =
+        (H * prof.gap_allowance_ns - prof.handoff_sibling_ns) / (2.0 - H);
+    check(duty_overlap(turn_on - 1.0, prof) == 0.0,
+          "duty_ov==0 just below turn-on");
+    check(duty_overlap(turn_on + 1.0, prof) > 0.0,
+          "duty_ov>0 just above turn-on");
+  }
+
+  // duty_overlap: monotone nondecreasing in W, always in [0,1], asymptotes to
+  // (2-H) at large W.
+  {
+    Profile prof;
+    double prevD = duty_overlap(100.0, prof);
+    double Ws[] = {200.0, 500.0, 1000.0, 5000.0, 20000.0, 100000.0, 1.0e6};
+    for (double w : Ws) {
+      double d = duty_overlap(w, prof);
+      check(d >= prevD - 1e-9, "duty_ov nondecreasing in W");
+      check(d >= 0.0 && d <= 1.0, "duty_ov in [0,1]");
+      prevD = d;
+    }
+    check(std::fabs(duty_overlap(1.0e6, prof) - (2.0 - prof.pacing_headroom)) <
+              1e-3,
+          "duty_ov asymptotes to 2-H at large W");
+  }
+
+  // duty_overlap: H>=2.0 degenerates to duty_ov==0 everywhere (graceful, not
+  // a NaN/negative-domain crash).
+  {
+    Profile prof;
+    prof.pacing_headroom = 2.0;
+    check(duty_overlap(100.0, prof) == 0.0 &&
+              duty_overlap(10000.0, prof) == 0.0 &&
+              duty_overlap(1.0e6, prof) == 0.0,
+          "H=2.0 degenerates duty_ov to 0 everywhere");
+  }
+
+  // Overlap-regime W* collapse: with C=1.8 and the example.profile-shaped
+  // constants (h_sib=70, h_ccx=120 -> Dh=50), the overlap crossover must land
+  // far below the paced crossover — the whole point of this regime (README
+  // Step 4: "crossover collapses from ~2us to below ~0.5us"). Bounds/factor
+  // pinned against the closed-form solve (see plan §4): W*_overlap ~ 405 ns,
+  // W*_paced ~ 1334 ns.
+  {
+    Profile prof;
+    prof.handoff_sibling_ns = 70.0;
+    prof.handoff_sameccx_ns = 120.0;
+    prof.presence_tax = 0.03;
+    prof.pacing_headroom = 1.5;
+    prof.allowance_ns = 40.0;
+    prof.gap_allowance_ns = 150.0;
+    double C = 1.8;
+    auto w_paced = solve_wstar(prof, C, 20.0, 1.0, 1.0e6, Regime::paced);
+    auto w_overlap = solve_wstar(prof, C, 20.0, 1.0, 1.0e6, Regime::overlap);
+    check(w_paced.has_value() && w_overlap.has_value(),
+          "both regimes have a finite W*");
+    if (w_paced && w_overlap) {
+      check(*w_overlap > 250.0 && *w_overlap < 900.0,
+            "overlap W* lands in [250,900] ns");
+      check(*w_overlap * 3.0 <= *w_paced,
+            "overlap W* is at least 3x below paced W* (collapse)");
+    }
+  }
+
   if (fails == 0)
     printf("all tests passed\n");
   return fails ? 1 : 0;
@@ -1707,7 +1895,7 @@ static void usage(const char *a0) {
           "  %s <source.cpp> [--producer NAME] [--consumer NAME] "
           "[--profile FILE] [--cflags TOK]... [--consumer-iters-per-msg N] "
           "[--producer-iters-per-msg N] [--mca-bin PATH] [--cxx PATH] "
-          "[--json|--emit-model]\n"
+          "[--json|--emit-model|--emit-model-overlap]\n"
           "  %s --mca-file <llvm-mca-dump.txt> [--producer NAME] "
           "[--consumer NAME] [--profile FILE] [--json]\n"
           "  %s --calibrate [MEASURED_MULTIPLIER] [--profile FILE] "
@@ -1730,7 +1918,8 @@ int main(int argc, char **argv) {
   std::string source, mca_file, profile_path;
   std::string producer = "producer", consumer = "consumer";
   std::vector<std::string> cflags{"-I."};
-  bool as_json = false, emit_model_csv = false, calibrate = false;
+  bool as_json = false, emit_model_csv = false, emit_model_overlap_csv = false,
+       calibrate = false;
   double calib_measured = 1.81;
   Iters iters;
   // Defaults for the mca binary / compiler driver: an explicit --flag wins
@@ -1778,12 +1967,20 @@ int main(int argc, char **argv) {
       as_json = true;
     else if (a == "--emit-model")
       emit_model_csv = true;
+    else if (a == "--emit-model-overlap")
+      emit_model_overlap_csv = true;
     else if (a[0] == '-') {
       fprintf(stderr, "unknown flag %s\n", a.c_str());
       usage(argv[0]);
       return 1;
     } else
       source = a;
+  }
+  if (emit_model_csv && emit_model_overlap_csv) {
+    fprintf(stderr,
+            "fatal: --emit-model and --emit-model-overlap are two different "
+            "regimes' curves — pass one at a time.\n");
+    return 1;
   }
 
   Profile prof = profile_path.empty() ? Profile() : load_profile(profile_path);
@@ -1945,7 +2142,20 @@ int main(int argc, char **argv) {
 
   if (emit_model_csv)
     emit_model(*prod, prof, o, b, iters);
-  else if (as_json)
+  else if (emit_model_overlap_csv) {
+    // duty_overlap() assumes symmetric producer/consumer work by
+    // construction (see its comment in Section 3) — a self-overlay (the
+    // consumer against itself) is the only C that regime's formula is
+    // consistent with, so --producer's value is not used for this dispatch.
+    fprintf(stderr,
+            "note: --emit-model-overlap computes C from a SELF-overlay "
+            "(consumer vs itself) since duty_overlap() assumes symmetric "
+            "producer/consumer work; --producer is ignored for this "
+            "regime.\n");
+    Overlay o_ov = overlay(*cons, *cons, prof);
+    Budget b_ov = solve_budget(prof, o_ov, 0.0, Regime::overlap);
+    emit_model(*cons, prof, o_ov, b_ov, iters, Regime::overlap);
+  } else if (as_json)
     print_json(*prod, *cons, prof, o, b, iters);
   else
     print_report(*prod, *cons, prof, o, b, iters, lint_warnings);

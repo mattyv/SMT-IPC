@@ -33,7 +33,7 @@ L1." The folklore is half right, and chasing down the other half is what this re
 is. Three small x86-64 Linux microbenchmarks, run on an AMD Zen 5 box, that build to one
 measured answer:
 
-![Sibling vs same-CCX placement crossover: sibling−same-CCX latency as consumer work grows, for three producer regimes. Polite and paced-both-busy track each other and cross zero in a ~2–3.7 µs band (sibling wins below it). The overlapping-both-busy line crosses below ~0.5 µs and shoots off the top (+781 ns at 1.7 µs, then saturates). The dashed line is sibling_analyze's static estimate; its W* band is shaded.](docs/crossover.svg)
+![Sibling vs same-CCX placement crossover: sibling−same-CCX latency as consumer work grows, for three producer regimes. Polite and paced-both-busy track each other and cross zero in a ~2–3.7 µs band (sibling wins below it). The overlapping-both-busy line crosses below ~0.5 µs and shoots off the top (+781 ns at 1.7 µs, then saturates). Two dashed lines are sibling_analyze's static estimates — purple for the polite/paced regime (its W* band is shaded) and red for the overlap regime.](docs/crossover.svg)
 
 *Reading the three measured lines:* the x-axis is a ladder of per-message work from ~20 ns to
 ~7 µs; the y-axis is how much slower the SMT-sibling placement is than a same-CCX core (below zero
@@ -350,6 +350,50 @@ numerically — but since the model's `C` barely moves the curve, that check mos
 Δh/ε constants line up, not that the port model is right. It's same-machine only (the mca model is
 µarch-specific), so regenerate `docs/crossover_data.csv` from `spsc_pipeline --proc-sweep` on your
 own box first.
+
+**Two dashed lines, two different jobs.** The purple line above is the PACED regime just
+described — `--emit-model`'s `duty(W)` assumes the producer politely waits for a matched-pacing
+deadline, so the two threads' work windows stay disjoint. `--emit-model-overlap` draws the second,
+red line: the OVERLAP regime (`spsc_pipeline --both-busy-overlap`), where the pacing gap is sized
+for the *consumer alone* — `1.5·(W + 150 ns)`, the same `PROC_SWEEP_HEADROOM`/
+`PROC_SWEEP_HANDOFF_ALLOWANCE_NS` constants as the paced gap, just without the producer's work
+folded in — so producer and consumer work genuinely overlap once `W` is big enough. Its `duty`
+comes from a first-order deadline-geometry closed form (`duty_overlap`, no fixed point, no
+fitting): `duty_ov(W) = clamp((2−H) + (h_sib − H·A_gap)/W, 0, 1)`, H = pacing headroom, A_gap = 150,
+h_sib = the sibling handoff edge. Unlike the paced line, where plugging in `C` moves the curve
+by under 1%, here `duty` *grows* with `W` — from 0 below a ~310 ns turn-on to a 0.5 asymptote —
+so `duty·(C−1)` dominates and the crossover is genuinely set by the port-contention term `C`, not
+by the two measured constants alone. On this box: `C_ov ≈ 1.80`, predicted `W* ≈ 405 ns`
+(range 374–464 ns), which lands inside the coarse measured **rung bracket [130, 451] ns** (the
+adjacent sweep rungs that straddle zero). The linearly-interpolated crossing wanders run-to-run —
+~400 ns on the committed session, ~450–470 ns on repeats — because the rising rung sits one ~10 ns
+`rdtsc` quantum from zero, so the interpolated point is noise-limited and sometimes falls just
+outside the predicted band. Don't read it as a bullseye; read it as "the predicted sub-µs collapse
+is confirmed, and the location agrees to within the measurement's resolution." That collapse is
+~4× relative to the paced `W*` (~1.65 µs) — the whole point: overlap turns a multi-µs budget into a
+sub-µs one.
+
+**The calibration caveat, stated plainly.** `duty_overlap`'s *shape* — where it turns on, how it
+grows, that it saturates at `2−H` — comes only from `H`, `A_gap`, and `h_sib`, all fixed
+independently of the overlap measurements it's checked against. Its *scale* does not: `C_ov`'s
+magnitude rides on `calib_scale`, which is fit against `sibling_noise`'s busy-sibling ratio (1.81×)
+— an experiment that has nothing to do with `spsc_pipeline --both-busy-overlap`. So this is an
+honest out-of-sample test of the *mechanism* (does a duty-growing-with-`W` model predict the right
+order of magnitude and the right collapse direction?), not an independently-predicted *number*.
+**Never re-run `--calibrate` against the overlap ladder** — that would fit the answer to the
+question instead of checking it, and silently turn this from a validation into a tautology.
+`scripts/run_crossover_check.sh`'s overlap pass keeps the tolerance deliberately loose
+(`OVERLAP_REL_TOL`, a factor-of-2 bar) for exactly this reason — it is not, and doesn't claim to
+be, a tight fit.
+
+**Scope: sub-saturation only.** Both dashed lines stop being meaningful once the queue itself
+saturates — the 6.9 µs rung on the overlap measured series is EXCLUDED from
+`docs/crossover_data_overlap.csv` for that reason (waited-fraction ~0.13, well outside the
+queue-free band the other rungs sit in): a pacing-headroom *methodology* boundary, not a
+contention number. The model has its own echo of that boundary: as `W` grows, `duty_overlap`'s
+`2W` term approaches its `H·(W+A_gap)` period, and the clamp to 1 stops being a meaningful
+prediction near there too — the formula is a first-order geometry, not a queueing model, and was
+never meant to reach into saturation.
 
 **It's a screening linter, not an oracle — and the limits are load-bearing.** `llvm-mca` sees
 execution ports and front-end dispatch and *nothing else*: it assumes perfect caches and store

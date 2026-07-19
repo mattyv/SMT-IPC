@@ -58,6 +58,24 @@ DEFAULT_MEASURED_MULTIPLIER = 1.81
 # can never drift apart.
 DEFAULT_C_REL_TOL = 0.20
 
+# Relative residual tolerance for the OPTIONAL overlap-regime check pass
+# (--model-overlap/--measured-overlap). The overlap prediction (duty_overlap,
+# see sibling_analyze.cpp Section 3) only claims order-of-magnitude/shape
+# agreement — same "~2x" framing the README already uses for the paced W*
+# vs measured crossover — so its tolerance is deliberately much looser than
+# the paced pass's --rel-tol default (0.15). 1.0 == "factor-of-2 bar": a residual up to the full
+# magnitude of the measured value still passes. Named here, not inline, so
+# the looseness (and its justification) is visible in one place rather than
+# buried in a call site.
+#
+# Consequence to keep in mind: at this tolerance the overlap residual sub-check
+# is near-vacuous — a deliberately 4x-wrong (W-shifted) model still scores a
+# residual ~0.98 and "passes" that line. The DISCRIMINATING teeth of the
+# overlap pass are entirely in the W*-band-vs-measured-bracket assertion below;
+# do not read a low "residual/tol worst" number in the overlap PASS output as
+# independent evidence the location is right.
+OVERLAP_REL_TOL = 1.0
+
 
 def read_measured(path):
     """CSV: work_ns,sibling_p50_ns,sameccx_p50_ns -> ([(work_ns, delta_ns)],
@@ -400,7 +418,23 @@ def main():
                     "assertion — generous by default because the self-"
                     "overlaid region need not be the exact kernel shape "
                     "--calibrate was run against")
+    ap.add_argument("--model-overlap",
+                    help="OPTIONAL: sibling_analyze --emit-model-overlap CSV "
+                    "for the overlap regime (spsc_pipeline "
+                    "--both-busy-overlap). Must be given together with "
+                    "--measured-overlap, or not at all. When given, --check "
+                    "runs a SECOND pass over this pair with a much looser "
+                    "tolerance (OVERLAP_REL_TOL) — the overlap prediction "
+                    "only claims order-of-magnitude/shape agreement.")
+    ap.add_argument("--measured-overlap",
+                    help="OPTIONAL: measured overlap-regime CSV (same shape "
+                    "as --measured). See --model-overlap.")
     a = ap.parse_args()
+
+    if bool(a.model_overlap) != bool(a.measured_overlap):
+        print("--model-overlap and --measured-overlap must be given "
+              "together (both or neither)", file=sys.stderr)
+        return 2
 
     measured, m_machine = read_measured(a.measured)
     curve, meta = read_model(a.model)
@@ -421,6 +455,23 @@ def main():
                               a.measured_multiplier, a.c_rel_tol)
         print("\n".join(lines))
         print("CHECK:", "PASS" if ok else "FAIL")
+
+        if a.model_overlap:
+            measured_ov, m_machine_ov = read_measured(a.measured_overlap)
+            curve_ov, meta_ov = read_model(a.model_overlap)
+            if len(measured_ov) < 2 or len(curve_ov) < 2:
+                print("need >=2 measured and >=2 model points (overlap)",
+                     file=sys.stderr)
+                return 2
+            ok_ov, lines_ov = run_check(measured_ov, curve_ov, m_machine_ov,
+                                        meta_ov, a.tol, OVERLAP_REL_TOL,
+                                        a.force)
+            print("--- overlap regime (loose tolerance:"
+                 f" rel_tol={OVERLAP_REL_TOL:.0%}) ---")
+            print("\n".join(lines_ov))
+            print("CHECK (overlap):", "PASS" if ok_ov else "FAIL")
+            ok = ok and ok_ov
+
         return 0 if ok else 1
     return 0
 

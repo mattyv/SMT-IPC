@@ -2,7 +2,15 @@
 """Regenerate docs/crossover.svg — the three-regime placement×work figure (README Step 4).
 
 Inputs, all committed so the headline image is auditable and regenerable:
-  * docs/crossover_model.csv   — sibling_analyze's static prediction (dashed line).
+  * docs/crossover_model.csv         — sibling_analyze's static PACED-regime
+    prediction (purple dashed line): --emit-model against the matched-pacing
+    duty(W) closed form.
+  * docs/crossover_model_overlap.csv — sibling_analyze's static OVERLAP-regime
+    prediction (red dashed line): --emit-model-overlap against duty_overlap(W),
+    the closed form for spsc_pipeline --both-busy-overlap's consumer-only
+    pacing gap. See README Step 5's overlap-regime section for what is and
+    isn't predicted here (short version: duty_overlap's shape/turn-on/scale
+    are fixed independently; its C is calibrated, not predicted).
   * the three measured series below, inline — each is the MEDIAN of 5
     `spsc_pipeline` runs on this repo's Zen 5 box (delta = sibling_p50 - sameccx_p50):
       polite  : ./spsc_pipeline --proc-sweep
@@ -23,6 +31,7 @@ import os
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_CSV = os.path.join(REPO, "docs", "crossover_model.csv")
+MODEL_OVERLAP_CSV = os.path.join(REPO, "docs", "crossover_model_overlap.csv")
 OUT_SVG = os.path.join(REPO, "docs", "crossover.svg")
 
 # --- measured, median of 5 runs each (see module docstring) ---
@@ -33,6 +42,15 @@ OVERLAP_SERIES = [(50, -50), (130, -50), (451, 10), (1743, 781)]  # 6933 rung dr
 # --- model W* band (from crossover_model.csv header) ---
 WSTAR_LO, WSTAR_HI = 1100, 3315
 OVERLAP_SAT_NOTE = "saturates (INVALID) by 7µs"
+# --- overlap-regime model W* (from crossover_model_overlap.csv header) ---
+OVERLAP_WSTAR_MID = 405
+
+# Style for the overlap-regime prediction line: a TIGHTER dash than the
+# paced prediction's "6 4" so the two dashed lines stay visually distinct
+# where they run close together, and slightly transparent so it doesn't
+# fight the (also red) OVERLAP measured series for attention.
+OVERLAP_MODEL_DASH = "3 3"
+OVERLAP_MODEL_OPACITY = 0.75
 
 # theme-safe palette (legible on GitHub light #fff and dark #0d1117)
 MUTED = "#8b949e"
@@ -76,7 +94,7 @@ def clip(v, a, b):
     return max(a, min(b, v))
 
 
-def build_svg(model):
+def build_svg(model, model_overlap):
     s = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
          f'font-family="ui-monospace,SFMono-Regular,Menlo,monospace" role="img" '
          f'aria-label="Sibling minus same-CCX placement latency vs consumer work, for a polite '
@@ -109,6 +127,10 @@ def build_svg(model):
     pts = [f'{X(w):.1f} {clip(Yv(d),top,bot):.1f}' for w, d in model if 35 <= w <= 9000]
     s.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="{MODEL}" stroke-width="2" stroke-dasharray="6 4" opacity="0.9"/>')
 
+    pts_ov = [f'{X(w):.1f} {clip(Yv(d),top,bot):.1f}' for w, d in model_overlap if 35 <= w <= 9000]
+    s.append(f'<polyline points="{" ".join(pts_ov)}" fill="none" stroke="{OVERLAP}" stroke-width="2" '
+             f'stroke-dasharray="{OVERLAP_MODEL_DASH}" opacity="{OVERLAP_MODEL_OPACITY}"/>')
+
     def series(data, color):
         path = " ".join(f'{"M" if i==0 else "L"}{X(w):.1f} {clip(Yv(d),top,bot):.1f}' for i, (w, d) in enumerate(data))
         s.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.2"/>')
@@ -123,27 +145,30 @@ def build_svg(model):
     s.append(f'<text x="{ox+6:.1f}" y="{oy+22:.1f}" font-size="10" font-weight="700" fill="{OVERLAP}">&#8593; +781 ns, {OVERLAP_SAT_NOTE}</text>')
 
     lx, ly = MARGIN_LEFT + IW + 14, top + 8
-    legend = [("prediction (llvm-mca)", MODEL, True),
-              ("measured: polite producer", POLITE, False),
-              ("measured: both busy, paced apart", PACED, False),
-              ("measured: both busy, OVERLAPPING", OVERLAP, False)]
+    legend = [("prediction (llvm-mca)", MODEL, "5 3"),
+              ("prediction (overlap, llvm-mca)", OVERLAP, OVERLAP_MODEL_DASH),
+              ("measured: polite producer", POLITE, None),
+              ("measured: both busy, paced apart", PACED, None),
+              ("measured: both busy, OVERLAPPING", OVERLAP, None)]
     for i, (lbl, col, dash) in enumerate(legend):
         yy = ly + i * 21
         if dash:
-            s.append(f'<line x1="{lx}" y1="{yy}" x2="{lx+20}" y2="{yy}" stroke="{col}" stroke-width="2.2" stroke-dasharray="5 3"/>')
+            s.append(f'<line x1="{lx}" y1="{yy}" x2="{lx+20}" y2="{yy}" stroke="{col}" stroke-width="2.2" stroke-dasharray="{dash}"/>')
         else:
             s.append(f'<line x1="{lx}" y1="{yy}" x2="{lx+20}" y2="{yy}" stroke="{col}" stroke-width="2.2"/><circle cx="{lx+10}" cy="{yy}" r="4" fill="{col}"/>')
         s.append(f'<text x="{lx+26}" y="{yy+3.5}" font-size="10.5" fill="{MUTED}">{lbl}</text>')
-    cy0 = ly + 4 * 21 + 12
+    cy0 = ly + 5 * 21 + 12
     s.append(f'<text x="{lx}" y="{cy0}" font-size="10" fill="{MUTED}">crossover (sibling stops winning):</text>')
     s.append(f'<text x="{lx}" y="{cy0+16}" font-size="10" fill="{POLITE}">polite / paced: ~2&#8211;3.7µs</text>')
     s.append(f'<text x="{lx}" y="{cy0+31}" font-size="10" fill="{OVERLAP}">overlapping: below ~0.5µs (then off scale)</text>')
     s.append(f'<text x="{lx}" y="{cy0+46}" font-size="10" fill="{MODEL}">model W*: ~1.7µs</text>')
+    s.append(f'<text x="{lx}" y="{cy0+61}" font-size="10" fill="{OVERLAP}">model overlap W*: ~{OVERLAP_WSTAR_MID/1000:.1f}µs</text>')
 
     s.append('</svg>')
     return "\n".join(s) + "\n"
 
 
 if __name__ == "__main__":
-    open(OUT_SVG, "w").write(build_svg(load_model(MODEL_CSV)))
+    open(OUT_SVG, "w").write(
+        build_svg(load_model(MODEL_CSV), load_model(MODEL_OVERLAP_CSV)))
     print(f"wrote {OUT_SVG}")

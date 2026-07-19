@@ -1,0 +1,34 @@
+# Measured end-to-end p50 latency, sibling vs same-CCX placement, OVERLAP
+# regime: `./spsc_pipeline --both-busy-overlap` on this repo's AMD Zen 5 box.
+# Median of 5 runs per rung (same session as docs/crossover_data.csv), delta =
+# sibling_p50 - sameccx_p50; source values are scripts/gen_crossover_svg.py's
+# OVERLAP_SERIES, transcribed here so plot_crossover.py --check can read them
+# without re-deriving them from the SVG generator.
+#
+# The 6933 ns rung is EXCLUDED (not just clipped): at that work level the
+# queue is driving into saturation under this regime's consumer-only pacing
+# gap (waited-fraction ~0.13, well outside the "queue-free" band the other
+# rungs sit in) — a pacing-headroom METHODOLOGY boundary, not a measurement
+# of contention. Including it would silently swap what's being measured.
+#
+# Regenerate on your target: run `./spsc_pipeline --both-busy-overlap
+# --proc-sweep`, read the SUMMARY table's rounds / sibling_p50 / sameccx_p50
+# columns, and transcribe the calibrated per-message work ns (from the
+# "rounds -> calibrated processing ns" block printed just above) into
+# work_ns here — same recipe as docs/crossover_data.csv, one machine, one
+# session, do not mix rows from different boxes.
+#
+# machine: AMD Zen 5 (README box); no core isolation (p50 wanders run-to-run;
+# the robust signal is the sign-change bracket, not the exact point).
+# The `machine=` tag below must match the profile's `machine=` (and the model
+# CSV's stamp) or plot_crossover.py --check refuses the overlay as a mismatch.
+# same-CCX placement latency depends only on the work per message, not on
+# which producer regime drives it, so sameccx_p50_ns here reuses the exact
+# per-work values already measured in docs/crossover_data.csv (same box, same
+# session); sibling_p50_ns = sameccx_p50_ns + OVERLAP_SERIES's delta.
+# machine=zen5
+work_ns,sibling_p50_ns,sameccx_p50_ns
+50,70,120
+130,180,230
+451,571,561
+1743,2644,1863
