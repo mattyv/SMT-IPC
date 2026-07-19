@@ -343,12 +343,6 @@ dependency-light: its `--test` needs only a C++ compiler, and its analysis path 
 needs `g++` and `llvm-mca` (report format validated against LLVM 18–20) on `PATH`; edit `example.profile`
 into your own machine's numbers first.
 
-*(An earlier, larger `spsc_pipeline` also carried a wait-strategy study — spin vs pause vs
-futex-blocking consumers under steady and bursty arrival. It answered a different question
-(latency vs core-utilization) and lives on the
-[`full-wait-strategy-study`](https://github.com/mattyv/SMT-IPC/tree/full-wait-strategy-study)
-branch to keep this one focused on placement.)*
-
 ## Caveats
 
 - **No core isolation on this box:** absolute tails (p99.9+) are OS-jitter-sensitive; compare
