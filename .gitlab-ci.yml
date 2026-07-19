@@ -8,5 +8,10 @@ build:
   script:
     - g++ -O3 -std=c++23 -pthread smt_pingpong.cpp -o smt_pingpong
     - g++ -O3 -std=c++23 -pthread sibling_noise.cpp -o sibling_noise
+    # sibling_analyze --test is pure-logic (no llvm-mca needed), so it runs in
+    # this plain gcc image; the compile/mca driver path is exercised separately
+    # on a box that has llvm-mca.
+    - g++ -O3 -std=c++23 sibling_analyze.cpp -o sibling_analyze
     - ./smt_pingpong --test
     - ./sibling_noise --test
+    - ./sibling_analyze --test
