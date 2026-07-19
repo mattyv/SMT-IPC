@@ -264,14 +264,6 @@ rungs. So the honest rule has two halves:
   and hard* — crossover below ~0.5 µs, then a cliff — well before the queue saturates. That's the
   regime Step 2's on-core contention (up to 1.8× for a full-time tenant) governs.
 
-> **Why the numbers here have moved twice.** First pass: the both-busy line looked *identical* to
-> polite because `--both-busy` had a wiring bug — the flag parsed but the producer workload never
-> reached the sweep, so it silently ran the polite experiment. Second pass (after fixing that): the
-> line was genuinely busy but still ≈ polite, and this section wrongly credited a "momentary overlap
-> tax on the sibling" for the high-end divergence — a fable review showed the sibling's numbers
-> never moved and the paced gap makes overlap *impossible* by construction. Both are now corrected,
-> and `--both-busy-overlap` was added so the real overlap regime is measured rather than argued.
-
 **Scope, so this isn't over-read:** the message source is an in-memory ring, *by design* — a
 real socket's `recv()` is microseconds and would swamp this nanosecond-scale placement signal
 entirely. This answers "given a message already in hand, does placement or processing weight
