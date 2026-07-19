@@ -41,10 +41,11 @@
 // sides: it hard-errors on a marked region that ends up with zero compute
 // instructions (the total-hoist case), and it builds your TU twice — with
 // markers and with them compiled out (-DSIBLING_MARKERS_OFF) — warning if the
-// compute instruction mix of the marked functions differs (the partial-hoist /
-// blocked-vectorisation case). The other perturbation to know about: a volatile
-// asm INSIDE a loop body can defeat autovectorisation, which is the main reason
-// markers belong around the loop, not in it.
+// marked functions' compute instruction mix differs. That catches only
+// marker-INDUCED codegen changes (chiefly blocked autovectorisation), NOT a
+// hoist that happens identically with and without the markers. A volatile asm
+// INSIDE a loop body is the usual cause of such a change, which is the main
+// reason markers belong around the loop, not in it.
 //
 // x86 only (the markers are assembler comments; the concept is x86 SMT). Header
 // is dependency-free and safe to include anywhere.

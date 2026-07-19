@@ -639,6 +639,10 @@ static RegionAsm extract_regions_asm(const std::string &asm_text) {
 // actual arithmetic — changes the COMPUTE mnemonics (scalar imul vs packed
 // vpmuludq, etc.), which are kept.
 static bool is_data_movement(const std::string &op) {
+  // popcnt/lzcnt/tzcnt start with letters that would trip the "pop"/"..."
+  // prefixes below but are real ALU ops — exclude them explicitly.
+  if (op.rfind("popcnt", 0) == 0)
+    return false;
   static const char *prefixes[] = {
       "mov",        "vmov",    "cmov",    "kmov",     "lea",    "push",
       "pop",        "vzero",   "vinsert", "vextract", "vpinsr", "vpextr",
@@ -884,7 +888,8 @@ static std::string validate_region(const RegionProfile &r) {
 // work) rather than printing a near-unconditional "sibling wins".
 struct Iters {
   double cons = 1.0, prod = 1.0;
-  bool explicit_msg = false;
+  bool explicit_msg = false;  // --consumer-iters-per-msg given
+  bool prod_explicit = false; // --producer-iters-per-msg given
 };
 
 static void print_report(const RegionProfile &prod, const RegionProfile &cons,
@@ -939,6 +944,10 @@ static void print_report(const RegionProfile &prod, const RegionProfile &cons,
   show("      ", b.hi);
   printf("  (W* is an UPPER BOUND: every unmodelled effect — caches, MSHRs, "
          "front-end sharing — only lowers it.)\n");
+  if (!it.prod_explicit)
+    printf("  (producer assumed 1 block/msg — if its marked span is one loop "
+           "iteration, pass --producer-iters-per-msg N; too low under-counts "
+           "duty and INFLATES W*.)\n");
 
   // The bottom-line recommendation compares the consumer's PER-MESSAGE work to
   // W*. That requires knowing blocks-per-message; without --consumer-iters-per-
@@ -1233,8 +1242,12 @@ Resource pressure per iteration:
   {
     Lint bad = lint_region("r", "  imulq %rax, %rdx\n  call foo\n");
     check(!bad.errors.empty(), "call flagged as a lint error");
-    Lint lk = lint_region("r", "  lock incq (%rdi)\n");
-    check(bad.errors.size() && lk.warnings.size(), "lock flagged as warning");
+    // A lock op WARNS (not errors), given the region also has real compute so
+    // the zero-compute hard error doesn't fire. Assert lk's own state, not
+    // bad's (the prior sloppy re-check of bad.errors is what this replaces).
+    Lint lk = lint_region("r", "  imulq %rax, %rdx\n  lock incq (%rdi)\n");
+    check(!lk.warnings.empty() && lk.errors.empty(),
+          "lock flagged as warning, not error");
     Lint ok = lint_region("r", "  imulq %rax, %rdx\n  addq (%rdi), %rdx\n");
     check(ok.errors.empty() && ok.warnings.empty(), "clean region is clean");
   }
@@ -1470,9 +1483,10 @@ int main(int argc, char **argv) {
     else if (a == "--consumer-iters-per-msg") {
       iters.cons = std::atof(next("--consumer-iters-per-msg").c_str());
       iters.explicit_msg = true;
-    } else if (a == "--producer-iters-per-msg")
+    } else if (a == "--producer-iters-per-msg") {
       iters.prod = std::atof(next("--producer-iters-per-msg").c_str());
-    else if (a == "--json")
+      iters.prod_explicit = true;
+    } else if (a == "--json")
       as_json = true;
     else if (a == "--emit-model")
       emit_model_csv = true;
@@ -1494,8 +1508,19 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (calibrate)
+  if (calibrate) {
+    // A busy-sibling multiplier is >1 by construction (contention slows you
+    // down). A non-numeric optional arg (e.g. a stray filename) atof's to 0 and
+    // would print a nonsensical negative scale — reject it.
+    if (!(calib_measured > 1.0)) {
+      fprintf(stderr,
+              "fatal: --calibrate multiplier must be > 1.0 (measured busy / "
+              "idle ratio); got %g\n",
+              calib_measured);
+      return 1;
+    }
     return run_calibrate(calib_measured, prof.mca_mcpu);
+  }
 
   if (source.empty() && mca_file.empty()) {
     usage(argv[0]);
@@ -1510,6 +1535,12 @@ int main(int argc, char **argv) {
 
   std::string mca_text, tmpdir;
   if (!mca_file.empty()) {
+    // A pre-saved dump has no source asm, so the region lint (call/atomic/
+    // empty-region checks) and the perturbation diff cannot run — only the
+    // post-parse validate_region below applies. Note it so the weaker guarantee
+    // is explicit.
+    fprintf(stderr, "note: --mca-file skips the asm lint and perturbation "
+                    "check (no source); only region validation applies.\n");
     mca_text = slurp_file(mca_file);
   } else {
     tmpdir = make_tmpdir();
