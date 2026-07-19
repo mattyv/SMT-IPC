@@ -1,46 +1,49 @@
 # SMT-IPC — where do you put two threads that talk to each other?
 
-> *Heads up: this is a weekend rabbit hole, not a best-practices guide. I got curious about where
-> you should put two threads that talk to each other on a big modern AMD chip, and chased it further
-> than was strictly reasonable. It only really matters when nanoseconds of thread-to-thread handoff
-> are on your critical path — HFT, market-data decoders, lock-free pipelines — and for normal code
-> the answer here is lost in the noise. Read it for the "huh, neat," not as a checklist. Half the
-> fun was seeing how well a static model could call the result before running anything.*
+> *This is me being inquisitive over a weekend after an interesting discussion with an LLM. So please take this work with a grain of salt. None of this has been verified beyond me running it locally on my laptop with some toy experiments. 
+Its also quite niece. What I've found is potentialy some small uses cases where this may be something worth investigating further. 
+Having said that its quite interesting. So please enjoy...*
 >
 > **TL;DR — for two threads that pass messages to each other, the fastest place is the *same
-> physical core* (its two SMT siblings), as long as the sibling stays *quiet*.** A sibling that's
+> physical core* (its two SMT siblings), as long as the sibling stays *quiet* (no pun intended).** A sibling that's
 > only cooperating — mostly `pause`-waiting for its partner — costs about **3%**, and in exchange
 > you get the ~50 ns shared-L1/L2 handoff, **~2× faster** (≈1.8× measured) than putting the two
-> threads on separate cores in the same CCX. That holds for realistic per-message work (up to a
-> couple of µs), and — measured, and it surprised me — it holds whether *one or both* threads are
-> busy, **as long as they're paced so they never execute at the same instant** (a paced pipeline's
+> threads on separate cores in the same CCX. That holds for my simulated per-message work (up to a
+> couple of µs which may be more than enough for some cases),
+> and — measured, and it surprised me — it holds whether *one or both* threads are
+> busy, **as long as they're paced so they generally don't execute at the same instant** (a paced pipeline's
 > consumer waits ~98% of the time, so the two just alternate). The one thing that kills it is
-> genuine **overlap** — the two threads grinding on the shared core at the same instant. That
-> happens when an *independent* port-hungry tenant (hungry for the core's *execution* ports — the
+> genuine heavy **overlap** — the two threads grinding on the shared core at the same instant using same CPU ports (not TCP ports btw).
+> That happens when an *independent* port-hungry tenant (hungry for the core's *execution* ports — the
 > CPU's instruction-issue slots, not network ports; see Step 2) lands on the sibling (another
 > process, an IRQ) —
-> the full-time, worst case, up to **~1.8×** slower compute (Step 2) — or when your own two threads
+> the full-time, worst case, is obvous... up to **~1.8×** slower compute (Step 2) — or when your own two threads
 > run hot enough that pacing can no longer keep their work windows apart, a milder **~1.45×** at the
 > partial duty a paced pipeline reaches (measured). Either way the sibling stops being worth it, and
 > it bites at **overlap** — well before the queue ever *saturates*.
 > Keeping the sibling *quiet* — only your cooperating, mostly-waiting partner on it — is the trick.
 >
-> **How to milk it in your design:**
+> What might be intesting to try is bursty workloads like we tend to see in capital markts... something for another rainy
+> weekend maybe. 
+>
+> **How to milk this in your design if you want it:**
+> 0. **Keep SMT on in the boot params
 > 1. **Pin your producer and consumer to the two SMT threads of one physical core** — that buys the shared-L1/L2 handoff.
 > 2. **Keep everything else off that core.** Pinning steers *your* threads only; the kernel still lands IRQs and other work on the sibling. Isolate it (`isolcpus` + `nohz_full` + `irqaffinity`) or offline the neighbours — a quiet sibling *is* the trick.
-> 3. **Don't let them execute at the same instant.** Under matched pacing the two threads alternate, so *both-busy is fine below the crossover* — the sibling still wins even when the producer works as hard as the consumer, because the pacer keeps their work windows *disjoint* (measured: the paced both-busy line lands right on polite). You lose it the moment they actually **overlap** — grind at the same instant because the load outpaces the gap — and that hits *well before* the queue saturates (in the overlap measurement the crossover collapses from ~2 µs to below ~0.5 µs, on rungs the tool confirms are queue-free). Pace the feed, or keep one side mostly waiting, so they never grind simultaneously.
+> 3. **'Aim' for them to now execute at the same instant.** Under matched pacing the two threads alternate, so *both-busy is fine below the crossover* — the sibling still wins even when the producer works as hard as the consumer, because the pacer keeps their work windows *disjoint* (measured: the paced both-busy line lands right on polite). You lose it the moment they actually **overlap** — grind at the same instant because the load outpaces the gap — and that hits *well before* the queue saturates (in the overlap measurement the crossover collapses from ~2 µs to below ~0.5 µs, on rungs the tool confirms are queue-free). Pace the feed, or keep one side mostly waiting, so they never grind simultaneously.
 > 4. **Stay under a few µs of work per message.** Past the crossover — or whenever the two must **overlap** (both grinding with no gap to interleave in) — step out to a *same-CCX* core instead (~40 ns slower handoff, but immune to on-core contention).
-> 5. **Check before you commit:** `sibling_analyze` predicts, statically from your compiled loops, whether your two specific threads will collide or fit — no timing rig required.
+> 5. **Check before you commit:** I let my LLM come up with this `sibling_analyze` based some pior work I had done in this space. Idea is t
+> it can do static analysis using LLVN mca on both working sides of your SPSC setup.
 
-If one thread hands messages to another — a reader feeding a processor, a market-data
-decoder feeding a strategy — you get to choose where those two threads run on a modern
+If one thread hands messages to another — a reader feeding a processor, a socket consumer feeding
+a decoder and or a strategy — you get to choose where those two threads run on a modern
 many-core chip. Same physical core (the two SMT threads of one core)? Two cores sharing
 an L3 slice? Further apart still? The folklore says "siblings are fastest, they share
-L1." The folklore is half right, and chasing down the other half is what this repository
+L1." The folklore is sort of right, and chasing down the other half is what this repository
 is. Three small x86-64 Linux microbenchmarks, run on an AMD Zen 5 box, that build to one
 measured answer:
 
-![Sibling vs same-CCX placement crossover: sibling−same-CCX latency as consumer work grows, for three producer regimes. Polite and paced-both-busy track each other and cross zero in a ~2–3.7 µs band (sibling wins below it). The overlapping-both-busy line crosses below ~0.5 µs and shoots off the top (+781 ns at 1.7 µs, then saturates). Two dashed lines are sibling_analyze's static estimates — purple for the polite/paced regime (its W* band is shaded) and red for the overlap regime. The shaded band around each measured line is the run-to-run spread (min–max over 9 runs), widest right at the crossovers.](docs/crossover.svg)
+![Sibling vs same-CCX placement crossover: sibling−same-CCX latency as consumer work grows, for three producer regimes. Polite and paced-both-busy track each other and cross zero in a ~2–3.7 µs band (sibling wins below it). The overlapping-both-busy line crosses below ~0.5 µs and shoots off the top (+781 ns at 1.7 µs, then saturates). Two dashed lines are the sibling_analyze's static estimates — purple for the polite/paced regime (its W* band is shaded) and red for the overlap regime. The shaded band around each measured line is the run-to-run spread (min–max over 9 runs), widest right at the crossovers.](docs/crossover.svg)
 
 *Reading the three measured lines:* the x-axis is a ladder of per-message work from ~20 ns to
 ~7 µs; the y-axis is how much slower the SMT-sibling placement is than a same-CCX core (below zero
