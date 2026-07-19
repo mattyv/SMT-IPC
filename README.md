@@ -58,19 +58,18 @@ but the gap is sized for the consumer alone, so the producer's work genuinely *o
 consumer's — the real "both threads are victims of each other" case. That one crosses below ~0.5 µs
 and rockets up. See Step 4 for the full story.
 
-The **shaded bands** are the honest part: they're the run-to-run spread of each measured line (min–max
-over 9 runs on an un-isolated box), and they fatten right where each line crosses zero. At the
-crossover the delta straddles zero *inside its own band* — which is exactly why "where does the
-sibling stop winning?" only ever has a fuzzy, few-hundred-ns answer, not a crisp one. (The line is
-the *mean* of the 9 runs; where a band looks lopsided, that's real — the p50 delta is quantized to
-~10 ns and often skewed, so most runs cluster near one edge with a stray run forming the tail on the
-other side.)
+The **shaded bands** are the honest part: the run-to-run spread of each measured line (min–max over
+9 runs on an un-isolated box), fattening right where each line crosses zero. At the crossover the
+delta straddles zero *inside its own band* — which is why "where does the sibling stop winning?"
+only ever gets a fuzzy, few-hundred-ns answer, not a crisp one. (The line is the *mean* of the
+9 runs; lopsided bands are real — the p50 delta is quantized to ~10 ns and often skewed, so most
+runs cluster near one edge with a stray run forming the tail on the other side.)
 
 **A processing consumer is faster on the producer's SMT sibling — but only up to a couple
 of microseconds of work per message. Past that, a separate core in the same CCX wins.** For
-most real pipelines, which do well under a few µs of work per message, the sibling wins —
-*if* you keep everything else off that core. Everything below is me poking at that one sentence
-from four angles, one little experiment each.
+most real pipelines — well under a few µs of work per message — the sibling wins, *if* you keep
+everything else off that core. Everything below is me poking at that one sentence from four
+angles, one little experiment each.
 
 ## Step 1 — siblings really do give the fastest handoff
 
@@ -186,11 +185,10 @@ is invisible.
 ## Step 4 — but a real partner is polite, so who actually wins?
 
 So far the sibling looks like a trap — but Steps 2 and 3 loaded it with an *independent* hog,
-which is the wrong picture. Your real partner isn't independent: the producer spends most of its
-life *waiting* for the consumer, and a polite `pause`-waiter costs only ~3% (Step 2's middle row),
-not 1.8×. The scary case mostly doesn't fire. So the real question isn't "is the sibling risky,"
-it's **how much consumer work does it take before the sibling's ~40 ns handoff edge gets eaten by
-the contention on that work?**
+which is the wrong picture. Your real partner isn't independent — the producer mostly *waits* for
+the consumer — and a polite `pause`-waiter costs only ~3% (Step 2's middle row), not 1.8×; the
+scary case mostly doesn't fire. So the real question isn't "is the sibling risky," it's **how much
+consumer work before the sibling's ~40 ns handoff edge gets eaten by the contention on that work?**
 
 `spsc_pipeline --proc-sweep` measures it directly: a producer paces messages through a real
 [SPSC queue](https://github.com/rigtorp/SPSCQueue) to a consumer doing a tunable, port-bound
@@ -217,46 +215,44 @@ nanoseconds you'd guess from the 1.8× busy-sibling figure. The practical readin
 doing less than a couple of µs of work per message — the common case — is faster on the SMT
 sibling, provided the producer stays polite and nothing else runs on that core.
 
-**Does that survive *both* threads being busy?** This is the "both threads are victims of each
-other" question, and the answer turns entirely on one thing: **do they actually run at the same
-instant?** Both `--both-busy` variants make the producer do the *same* per-message work as the
-consumer at every rung (a symmetric sweep — at the 2 µs rung both spend ~2 µs, at the 500 ns rung
-both spend ~500 ns). They differ only in the pacing gap, and that difference is the whole story.
+**Does that survive *both* threads being busy?** The answer turns entirely on one thing: **do they
+actually run at the same instant?** Both `--both-busy` variants give the producer the *same*
+per-message work as the consumer at every rung (a symmetric sweep — at the 2 µs rung both spend
+~2 µs, at the 500 ns rung ~500 ns). The only difference is the pacing gap, and that difference is
+the whole story.
 
 **Paced apart (`--both-busy`, the amber line).** The arrival gap is widened to fit *both* threads'
-work (visible in the tool's `gap` column — roughly double the polite gap). That is enough to keep
-the two work windows **disjoint**: the producer works during the gap while the consumer waits, and
-they never execute simultaneously (`waited-fraction ≈ 0.99`, `proc_ratio ≈ 1.0`). Result: the line
-lands right on top of polite — sibling still wins below the ~2–3 µs crossover. This isn't luck, it's
-the schedule: if you space two busy threads so their compute never overlaps, they don't contend,
-full stop. (The amber and teal lines *do* pull apart slightly at the 6.9 µs rung — +170 ns vs
-+50 ns — but not because the sibling suffers: its latency there is identical to the polite run to
-within the ~10 ns measurement quantum. The gap comes from the *same-CCX* line getting ~110 ns
-**faster** than its own solo baseline when the neighbouring core is grinding — a CPU-boost/residency
-quirk on the other tier, not a sibling contention tax. Don't read it as "busy producer hurts the
-sibling.")
+work (the tool's `gap` column — roughly double the polite gap), enough to keep the two work windows
+**disjoint**: the producer works during the gap while the consumer waits, never simultaneously
+(`waited-fraction ≈ 0.99`, `proc_ratio ≈ 1.0`). The line lands right on top of polite — sibling
+still wins below the ~2–3 µs crossover. Not luck, schedule: space two busy threads so their compute
+never overlaps and they don't contend, full stop. (Amber and teal *do* pull apart slightly at the
+6.9 µs rung — +170 ns vs +50 ns — but not because the sibling suffers: its latency there matches
+the polite run to within the ~10 ns measurement quantum. The gap is the *same-CCX* line running
+~110 ns **faster** than its own solo baseline while the neighbouring core grinds — a
+CPU-boost/residency quirk on the other tier, not a sibling contention tax. Don't read it as "busy
+producer hurts the sibling.")
 
 **Overlapping (`--both-busy-overlap`, the red line).** Same symmetric work, but the gap is sized for
-the consumer *alone*, so the producer's compute genuinely overlaps the consumer's. Now the two
-grind on the same physical core's execution ports at the same instant — and the sibling falls apart:
-the crossover collapses from ~2 µs to **below ~0.5 µs**, and the sibling runs **+781 ns slower** at
+the consumer *alone*, so the producer's compute genuinely overlaps the consumer's. Now the two grind
+on the same physical core's execution ports at the same instant — and the sibling falls apart: the
+crossover collapses from ~2 µs to **below ~0.5 µs**, and the sibling runs **+781 ns slower** at
 1.7 µs. That +781 is genuine on-core port contention, measured directly: the consumer's own compute
-(`proc-insitu`, timed around just the kernel — no queue wait in the bracket) runs `proc_ratio ≈ 1.45`,
-i.e. ~45 % slower than solo. That's the *same mechanism* as Step 2's busy-sibling tax but at partial
-duty — the producer only occupies the core ~55–65 % of each gap — so it's milder than Step 2's
-**1.8×**, which is what a *full-time* independent tenant costs. (In other words the red line isn't
-even the worst case; a continuously-busy neighbour is worse.) By the 6.9 µs rung the contention
-(~1.54×) exceeds the sweep's 1.5× pacing headroom (`PROC_SWEEP_HEADROOM`), so the queue can no longer
-be kept empty and end-to-end latency becomes queue-drift dominated (tens to hundreds of µs,
-run-dependent) — the tool flags that rung `INVALID` and it's dropped from the graph. That drop is
-*conservative*: with more headroom the rung would be valid and show the sibling ~**+3.7 µs** worse,
-not recovering.
+(`proc-insitu`, timed around just the kernel — no queue wait in the bracket) runs
+`proc_ratio ≈ 1.45`, ~45 % slower than solo. Same mechanism as Step 2's busy-sibling tax, at partial
+duty — the producer occupies the core only ~55–65 % of each gap — so milder than Step 2's **1.8×**,
+the *full-time* independent-tenant cost. (So the red line isn't even the worst case; a
+continuously-busy neighbour is worse.) By the 6.9 µs rung the contention (~1.54×) exceeds the
+sweep's 1.5× pacing headroom (`PROC_SWEEP_HEADROOM`), the queue can no longer be kept empty, and
+end-to-end latency goes queue-drift dominated (tens to hundreds of µs, run-dependent) — the tool
+flags that rung `INVALID` and it's dropped from the graph. That drop is *conservative*: with more
+headroom the rung would be valid and show the sibling ~**+3.7 µs** worse, not recovering.
 
 On the rungs that *are* valid (`waited-fraction 0.92–0.99`, so the p50 latency is genuinely
-queue-free), you can see the loss is on-core contention and not queueing. `backpressure` stays 0
-throughout — but that's a weak signal on its own (it only trips when the queue hits its 4096-slot
-cap, which never happens); the real evidence is the clean waited-fraction on the sub-saturation
-rungs. So the honest rule has two halves:
+queue-free), the loss is on-core contention, not queueing. `backpressure` stays 0 throughout — a
+weak signal on its own (it only trips when the queue hits its 4096-slot cap, which never happens);
+the real evidence is the clean waited-fraction on the sub-saturation rungs. So the honest rule has
+two halves:
 
 - **Pace them apart** (bounded rate, or one side mostly waiting) and the sibling wins for work under
   ~2 µs whether one *or both* sides are busy — pacing turns a busy producer back into a polite one.
@@ -291,11 +287,11 @@ If you're in the small world where nanoseconds of handoff matter, here's what I'
 
 ## Step 5 — predicting it for *your* threads, without running anything
 
-Measuring the crossover (Steps 1–4) is a chore — you build the timing rig and run a sweep on the
-real hardware for every workload you're curious about. So here's the fun shortcut, and honestly the
-part I was most curious about: can you just *read* the answer off the compiled loops, before running
-anything? `sibling_analyze` tries. Given your actual producer and consumer loops, it guesses — from
-the instructions alone — whether they'll be faster as SMT siblings or on separate cores. Basically a
+Measuring the crossover (Steps 1–4) is a chore — a timing rig and a real-hardware sweep for every
+workload you're curious about. So here's the fun shortcut — honestly the part I was most curious
+about: can you just *read* the answer off the compiled loops, before running anything?
+`sibling_analyze` tries. Given your actual producer and consumer loops, it guesses — from the
+instructions alone — whether they'll be faster as SMT siblings or on separate cores. Basically a
 linter for thread placement. (This is the piece I had my LLM build off some earlier work, so it's
 the most experimental part of all this — grain of salt very much applies.)
 
@@ -346,14 +342,14 @@ as `detail:` lines, and any lint warning rides right next to the verdict. *(One 
 recommendation rather than guess.)*
 
 **A quick honesty note on that budget number.** For the paced case, `W*` is barely the llvm-mca
-model at all. It's `W* = Δh / (ε + duty·(C−1))`, and at the crossover the `duty` term is tiny, so it
-basically collapses to **Δh/ε ≈ 50 ns / 3% ≈ 1.67 µs** — the *measured* handoff edge (Step 1) over
-the *measured* presence tax (Step 2). The model's contention term `C` only nudges that by **~0.8%**
-(13 ns), and `calib_scale` is *fit* to reproduce Step 2's 1.81× anyway, so that magnitude agrees by
-construction. What the tool genuinely *predicts* is the **verdict** — does a specific execution port
-oversubscribe when these two loops run at once, and which one — read straight off llvm-mca on your
-compiled code. So trust the `COLLIDES`/`fit` call and the named port, and take `W*` as a ballpark:
-roughly the same crossover Steps 1–4 already give you.
+model at all: `W* = Δh / (ε + duty·(C−1))`, and at the crossover the `duty` term is tiny, so it
+collapses to **Δh/ε ≈ 50 ns / 3% ≈ 1.67 µs** — the *measured* handoff edge (Step 1) over the
+*measured* presence tax (Step 2). The contention term `C` nudges that by only **~0.8%** (13 ns),
+and `calib_scale` is *fit* to reproduce Step 2's 1.81× anyway, so the magnitude agrees by
+construction. What the tool genuinely *predicts* is the **verdict** — does a specific execution
+port oversubscribe when these two loops run at once, and which one — read straight off llvm-mca on
+your compiled code. Trust the `COLLIDES`/`fit` call and the named port; take `W*` as a ballpark,
+roughly the crossover Steps 1–4 already give you.
 
 **How close is `W*` to the measured crossover?** ~1.65 µs predicted vs ~2.4–3.7 µs measured (it
 wanders run-to-run): same order of magnitude, within a factor of ~2 — all a compile-time screen
@@ -364,26 +360,25 @@ numerically — but since the model's `C` barely moves the curve, that check mos
 µarch-specific), so regenerate `docs/crossover_data.csv` from `spsc_pipeline --proc-sweep` on your
 own box first.
 
-**Two dashed lines, two different jobs.** The purple line above is the PACED regime just
-described — `--emit-model`'s `duty(W)` assumes the producer politely waits for a matched-pacing
-deadline, so the two threads' work windows stay disjoint. `--emit-model-overlap` draws the second,
-red line: the OVERLAP regime (`spsc_pipeline --both-busy-overlap`), where the pacing gap is sized
-for the *consumer alone* — `1.5·(W + 150 ns)`, the same `PROC_SWEEP_HEADROOM`/
-`PROC_SWEEP_HANDOFF_ALLOWANCE_NS` constants as the paced gap, just without the producer's work
-folded in — so producer and consumer work genuinely overlap once `W` is big enough. Its `duty`
-comes from a first-order deadline-geometry closed form (`duty_overlap`, no fixed point, no
-fitting): `duty_ov(W) = clamp((2−H) + (h_sib − H·A_gap)/W, 0, 1)`, H = pacing headroom, A_gap = 150,
-h_sib = the sibling handoff edge. Unlike the paced line, where plugging in `C` moves the curve
-by under 1%, here `duty` *grows* with `W` — from 0 below a ~310 ns turn-on to a 0.5 asymptote —
-so `duty·(C−1)` dominates and the crossover is genuinely set by the port-contention term `C`, not
-by the two measured constants alone. On this box: `C_ov ≈ 1.80`, predicted `W* ≈ 405 ns`
-(range 374–464 ns), which lands inside the coarse measured **rung bracket [130, 451] ns** (the
+**Two dashed lines, two different jobs.** Purple is the PACED regime just described —
+`--emit-model`'s `duty(W)` assumes the producer politely waits for a matched-pacing deadline, so
+the work windows stay disjoint. `--emit-model-overlap` draws the red OVERLAP line
+(`spsc_pipeline --both-busy-overlap`), where the pacing gap is sized for the *consumer alone* —
+`1.5·(W + 150 ns)`, the same `PROC_SWEEP_HEADROOM`/`PROC_SWEEP_HANDOFF_ALLOWANCE_NS` constants as
+the paced gap, just without the producer's work folded in — so the two genuinely overlap once `W`
+is big enough. Its `duty` is a first-order deadline-geometry closed form (`duty_overlap`, no fixed
+point, no fitting): `duty_ov(W) = clamp((2−H) + (h_sib − H·A_gap)/W, 0, 1)`, H = pacing headroom,
+A_gap = 150, h_sib = the sibling handoff edge. Unlike the paced line, where plugging in `C` moves
+the curve by under 1%, here `duty` *grows* with `W` — from 0 below a ~310 ns turn-on to a 0.5
+asymptote — so `duty·(C−1)` dominates and the crossover is genuinely set by the port-contention
+term `C`, not by the two measured constants alone. On this box: `C_ov ≈ 1.80`, predicted
+`W* ≈ 405 ns` (range 374–464 ns), inside the coarse measured **rung bracket [130, 451] ns** (the
 adjacent sweep rungs that straddle zero). The linearly-interpolated crossing wanders run-to-run —
-~400 ns on the committed session, ~450–470 ns on repeats — because the rising rung sits one ~10 ns
-`rdtsc` quantum from zero, so the interpolated point is noise-limited and sometimes falls just
-outside the predicted band. Not a bullseye, then — but the predicted sub-µs collapse is confirmed
-and the location agrees to within the measurement's resolution. That collapse is ~4× relative to the
-paced `W*` (~1.65 µs), which is the whole point: overlap turns a multi-µs budget into a sub-µs one.
+~400 ns on the committed session, ~450–470 ns on repeats — the rising rung sits one ~10 ns `rdtsc`
+quantum from zero, so the interpolated point is noise-limited and sometimes falls just outside the
+predicted band. Not a bullseye — but the predicted sub-µs collapse is confirmed and the location
+agrees to within the measurement's resolution. That collapse is ~4× the paced `W*` (~1.65 µs),
+which is the whole point: overlap turns a multi-µs budget into a sub-µs one.
 
 **One honest catch on the overlap line.** Its *shape* — the turn-on, the growth, the `2−H` ceiling
 — comes only from `H`, `A_gap`, and `h_sib`, all fixed before the overlap experiment ever ran. Its
@@ -394,14 +389,14 @@ direction?), not a from-scratch number. Which is also why you should never re-ru
 against the overlap ladder — that'd just fit the answer to the question. The `--check` tolerance is
 loose on purpose (`OVERLAP_REL_TOL`, a factor-of-2 bar) for the same reason.
 
-**Scope: sub-saturation only.** Both dashed lines stop being meaningful once the queue itself
+**Scope: sub-saturation only.** Both dashed lines stop meaning anything once the queue itself
 saturates — the 6.9 µs rung on the overlap measured series is EXCLUDED from
 `docs/crossover_data_overlap.csv` for that reason (waited-fraction ~0.13, well outside the
 queue-free band the other rungs sit in): a pacing-headroom *methodology* boundary, not a
-contention number. The model has its own echo of that boundary: as `W` grows, `duty_overlap`'s
-`2W` term approaches its `H·(W+A_gap)` period, and the clamp to 1 stops being a meaningful
-prediction near there too — the formula is a first-order geometry, not a queueing model, and was
-never meant to reach into saturation.
+contention number. The model echoes that boundary: as `W` grows, `duty_overlap`'s `2W` term
+approaches its `H·(W+A_gap)` period and the clamp to 1 stops being a meaningful prediction there
+too — the formula is first-order geometry, not a queueing model, and was never meant to reach into
+saturation.
 
 **It's a screening linter, not an oracle.** `llvm-mca` sees execution ports and front-end dispatch
 and *nothing else*: it assumes perfect caches and store
