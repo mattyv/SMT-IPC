@@ -28,7 +28,14 @@ L1." The folklore is half right, and chasing down the other half is what this re
 is. Three small x86-64 Linux microbenchmarks, run on an AMD Zen 5 box, that build to one
 measured answer:
 
-![Sibling vs same-CCX placement crossover: end-to-end latency difference as consumer work grows. The two measured curves — a polite producer and a both-busy-but-paced producer — nearly coincide (both cross ~2.5–3 µs), because matched pacing stops the threads from overlapping. The dashed line is sibling_analyze's static estimate; its W* band is shaded.](docs/crossover.svg)
+![Sibling vs same-CCX placement crossover: end-to-end latency difference as consumer work grows. The two measured curves nearly coincide (both cross ~2.5–3 µs): "polite producer" is the producer doing almost nothing per message, "producer works as hard as consumer" has the producer matching the consumer's per-message work at every level of the sweep — yet still fed on a schedule, so the two threads interleave rather than overlap. The dashed line is sibling_analyze's static estimate; its W* band is shaded.](docs/crossover.svg)
+
+*Reading the two solid lines:* the x-axis is a ladder of per-message work from ~20 ns to ~7 µs.
+On the **polite-producer** line the producer just stamps and pushes each message (near-zero work);
+on the **producer-works-as-hard-as-consumer** line the producer does the *same* work as the
+consumer at every point on the ladder — so at the "2 µs" mark, both threads are doing ~2 µs per
+message. Both lines are still *paced* (the producer is released roughly once per message rather
+than blasting them out), which is why even the both-busy case doesn't collide — see Step 4.
 
 **A processing consumer is faster on the producer's SMT sibling — but only up to a couple
 of microseconds of work per message. Past that, a separate core in the same CCX wins.** For
@@ -179,8 +186,10 @@ nanoseconds you'd guess from the 1.8× busy-sibling figure. The practical readin
 doing less than a couple of µs of work per message — the common case — is faster on the SMT
 sibling, provided the producer stays polite and nothing else runs on that core.
 
-**Does that survive *both* threads being busy?** Make the producer do the same per-message work
-as the consumer (`--both-busy`) and — this surprised me — the crossover barely moves (~2.5 µs,
+**Does that survive *both* threads being busy?** `--both-busy` reruns the same ladder but makes
+the producer do the *same* per-message work as the consumer at every level — so at the 2 µs rung
+both threads spend ~2 µs per message, at the 500 ns rung both spend ~500 ns, and so on (a symmetric
+sweep, not a fixed number). This surprised me — the crossover barely moves (~2.5 µs,
 `proc_ratio ≈ 1.0`): the two solid lines in the graph nearly coincide. The reason is **overlap**.
 Matched pacing keeps the queue near-empty (`waited-fraction ≈ 0.98`), so the two threads
 *alternate* — the producer works during the gap while the consumer waits — rather than execute at
