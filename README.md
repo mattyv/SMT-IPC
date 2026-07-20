@@ -345,7 +345,7 @@ into your own machine's numbers first.
 
 ## Caveats
 
-- **No core isolation on this box:** absolute tails (p99.9+) are OS-jitter-sensitive; compare
+- **No core isolation on my box (dev machine):** absolute tails (p99.9+) are OS-jitter-sensitive; compare
   within one run, not across runs or machines. Metrics derived from the pacing schedule
   (`waited-fraction`, `late-publish`) are the robust cross-run signals.
 - **TSC** calibrated against `steady_clock`, assumes invariant TSC (`constant_tsc nonstop_tsc`).
